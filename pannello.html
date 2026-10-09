@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <link rel="manifest" href="/manifest.json">
 <meta name="theme-color" content="#1b1718">
+<link rel="icon" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <title>Branch</title>
 <style>
 :root{--bg:#1b1718;--pn:#262122;--in:#120f10;--fg:#ece6e2;--mu:#9a8f8b;--ro:#c8372d;--ok:#2ecc71;--wa:#f1c40f;--er:#e74c3c;--ln:#3a3234}
@@ -278,6 +280,7 @@ for(const k of ["p","t"])$("#n-"+k).onclick=()=>{
 setInterval(()=>{LP.salva(true);LT.salva(true);},30000);
 setInterval(bots,3000);
 editorP(false);
+if("serviceWorker"in navigator)navigator.serviceWorker.register("/sw.js").catch(()=>{});
 api("/api/bots/start",{}).then(bots);   // aprire l'app accende i bot che non girano
 pollP();pollT();
 </script>

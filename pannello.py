@@ -6,6 +6,7 @@ Uso:  python pannello.py     poi apri  http://localhost:8080  in Chrome.
 
 Riusa bot_manager.py (avvio/arresto dei bot, aggiornamento da GitHub) e org_bot.py (liste, canali,
 invio Telegram): la logica è quella di Branch, qui cambia solo l'interfaccia.
+  - avvio del server -> se nessun bot gira crea il flag di arresto: i bot partono solo quando apri l'app
   - apri la pagina  -> accende i bot che non girano (e toglie il flag di arresto)
   - chiudi la pagina -> i bot restano accesi
   - clic sul led     -> spegne i bot (crea bots_fermi.flag, lo stesso di avvia_bots.py stop)
@@ -324,11 +325,13 @@ def r_t_ferma(_):
 
 # ------------------------------------------------------------ HTTP
 MANIFEST = json.dumps({
-    "name": "Branch", "short_name": "Branch", "start_url": "/", "display": "standalone",
-    "background_color": "#1b1718", "theme_color": "#1b1718",
-    "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"}]})
-ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="22" '
-        'fill="#1b1718"/><circle cx="50" cy="50" r="24" fill="#2ecc71"/></svg>')
+    "name": "Branch", "short_name": "Branch", "start_url": "/", "scope": "/", "display": "standalone",
+    "background_color": "#000000", "theme_color": "#1b1718",
+    "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+              {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"}]})
+# service worker minimo: Chrome lo vuole per considerare la pagina installabile (non memorizza nulla)
+SW = "self.addEventListener('fetch',()=>{});"
+ICONE = {"/icon-192.png": BM.BASE / "icon-192.png", "/icon-512.png": BM.BASE / "icon-512.png"}
 
 GET = {"/api/bots": r_bots, "/api/persone": r_persone, "/api/persona": r_persona, "/api/tg": r_tg}
 POST = {"/api/bots/start": r_bots_start, "/api/bots/stop": r_bots_stop, "/api/righe": r_righe,
@@ -366,8 +369,10 @@ class H(BaseHTTPRequestHandler):
                 return self._send(500, {"errore": str(e)[:150]})
         if u.path == "/manifest.json":
             return self._send(200, MANIFEST, "application/manifest+json")
-        if u.path == "/icon.svg":
-            return self._send(200, ICON, "image/svg+xml")
+        if u.path in ICONE and ICONE[u.path].exists():
+            return self._send(200, ICONE[u.path].read_bytes(), "image/png")
+        if u.path == "/sw.js":
+            return self._send(200, SW, "text/javascript")
         self._send(200, HTML.read_bytes(), "text/html; charset=utf-8")
 
     def do_POST(self):
@@ -392,6 +397,9 @@ if __name__ == "__main__":
         srv = ThreadingHTTPServer(("127.0.0.1", PORTA), H)
     except OSError:
         raise SystemExit(f"Porta {PORTA} occupata: il pannello è probabilmente già in esecuzione.")
+    if not FLAG.exists() and not any(g.stato().values()):
+        # il server parte a bot spenti: li accende l'apertura dell'app (e il ciclo non li tocca prima)
+        FLAG.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
     threading.Thread(target=ciclo, daemon=True).start()
     log(f"Branch su http://localhost:{PORTA}  (Ctrl+C per uscire: i bot restano accesi)")
     try:
