@@ -117,6 +117,7 @@ import asyncio
 import contextlib
 import json
 import os
+import queue
 import random
 import re
 import tempfile
@@ -1572,6 +1573,70 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
             "invio_in_corso": lambda: st["invio"] is not None, "ferma": ferma}
 
 
+# ---------------------------------------------------------------- aggiornamento da GitHub (pulsante)
+# stessa logica del pulsante ⟳ di pannello.py: git pull --ff-only, poi si riavvia solo ciò che è cambiato
+FILE_GUI = {"org_bot.py", "bot_manager.py", "bot_log.py", "branch_tema.py", "sendbot_tema.py"}
+FILE_BOT = {"telegram_bot.py", "discord_bot.py", "org_bot.py", "bot_log.py"}
+_HEAD_AVVIO: Optional[str] = None     # commit al momento dell'apertura della GUI (per accorgersi di update già scaricati)
+
+
+def _git(*args, timeout: int = 90):
+    import subprocess
+    extra = {"creationflags": 0x08000000} if os.name == "nt" else {}      # niente finestra console su Windows
+    r = subprocess.run(["git", *args], cwd=BM.BASE, capture_output=True, text=True, timeout=timeout,
+                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, **extra)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def ricorda_head_avvio():
+    global _HEAD_AVVIO
+    try:
+        c, h = _git("rev-parse", "HEAD")
+        if not c:
+            _HEAD_AVVIO = h
+    except Exception:
+        pass
+
+
+def git_pull() -> dict:
+    """git pull --ff-only. Ritorna {ok, output} se fallisce, altrimenti {ok, cambiati, gui, bot}.
+    I file cambiati si contano dal commit di apertura della GUI: se l'aggiornamento automatico ha già
+    scaricato qualcosa, il codice in esecuzione è comunque vecchio e il riavvio viene proposto."""
+    global _HEAD_AVVIO
+    import subprocess
+    try:
+        c, _o = _git("rev-parse", "--is-inside-work-tree")
+        if c:
+            return {"ok": False, "output": "Questa cartella non è una repo git."}
+        _c, prima = _git("rev-parse", "HEAD")
+        c, out = _git("pull", "--ff-only")
+        if c:
+            return {"ok": False, "output": out[-500:]}
+        _c, dopo = _git("rev-parse", "HEAD")
+        base = _HEAD_AVVIO or prima
+        cambiati = []
+        if dopo != base:
+            _c, d = _git("diff", "--name-only", base, dopo)
+            cambiati = d.splitlines()
+        _HEAD_AVVIO = dopo
+    except FileNotFoundError:
+        return {"ok": False, "output": "git non è installato."}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "output": "Timeout: GitHub non risponde (rete?)."}
+    nomi = {os.path.basename(x) for x in cambiati}
+    _log_gui(f"git pull: {len(cambiati)} file cambiati")
+    return {"ok": True, "cambiati": cambiati, "gui": bool(nomi & FILE_GUI), "bot": bool(nomi & FILE_BOT)}
+
+
+def riavvia_processo():
+    """Rilancia questa stessa GUI (da chiamare dopo root.destroy())."""
+    if os.name == "nt":
+        import subprocess
+        subprocess.Popen([sys.executable] + sys.argv, cwd=BM.BASE)     # su Windows execv non è affidabile
+    else:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def crea_barra_bot(root, tk):
     """Barra sotto l'intestazione: un led che mostra lo stato dei due bot (Telegram + Discord).
     Verde = entrambi accesi, rosso = spenti, arancione = uno solo / in corso.
@@ -1580,8 +1645,10 @@ def crea_barra_bot(root, tk):
     gestore = BM.GestoreBot(log=_log_gui)
     barra = tk.Frame(root, bg=T.BG)
     barra.pack(fill="x")
+    bt_git = tk.Button(barra, text="⟳ Aggiorna da GitHub")
+    bt_git.pack(side="right", padx=(0, 10))
     cv = tk.Canvas(barra, height=34, bg=T.BG, highlightthickness=0, cursor="hand2")
-    cv.pack(fill="x", padx=10)
+    cv.pack(side="left", fill="x", expand=True, padx=10)
     ultimo = {"firma": None, "stato": {}, "occupato": False, "msg": ""}
 
     def disegna(stato: dict, occupato: bool, msg: str):
@@ -1646,12 +1713,73 @@ def crea_barra_bot(root, tk):
         else:
             in_thread(gestore.avvia_mancanti, "AVVIO…")
 
+    # ---- pulsante «Aggiorna da GitHub»
+    from tkinter import messagebox
+    esiti = queue.SimpleQueue()
+    hook = {"riavvia": None}          # lo imposta avvia_gui: salva le liste, controlla gli invii, riavvia
+
+    def lavoro_git():
+        try:
+            esiti.put(git_pull())
+        except Exception as e:
+            esiti.put({"ok": False, "output": repr(e)})
+
+    def aggiorna_ora():
+        if gestore.occupato:
+            return
+        bt_git.config(state="disabled")
+        in_thread(lavoro_git, "AGGIORNAMENTO…")
+
+    def riavvia_bot():
+        if any(gestore.stato().values()):          # riaccendo solo se giravano
+            gestore.ferma_tutti()
+            gestore.avvia_mancanti()
+
+    def esito_git(r):
+        if gestore.occupato:                       # il thread del pull non ha ancora finito
+            root.after(200, lambda: esito_git(r))
+            return
+        bt_git.config(state="normal")
+        if not r["ok"]:
+            messagebox.showwarning("Aggiornamento", r.get("output") or "git pull non riuscito.")
+            return
+        if not r["cambiati"]:
+            messagebox.showinfo("Aggiornamento", "Già all'ultima versione.")
+            return
+        testo = f"Aggiornati {len(r['cambiati'])} file."
+        if r["bot"]:
+            in_thread(riavvia_bot, "RIAVVIO BOT…")
+            testo += "\nI bot vengono riavviati con il codice nuovo."
+        if r["gui"] and hook["riavvia"]:
+            if messagebox.askyesno("Aggiornamento", testo + "\n\nPer applicare le modifiche a Branch serve "
+                                   "riavviarlo.\nRiavviare ora?"):
+                hook["riavvia"]()
+        else:
+            messagebox.showinfo("Aggiornamento", testo)
+
+    def poll_esiti():
+        try:
+            r = esiti.get_nowait()
+        except queue.Empty:
+            r = None
+        if r is not None:
+            try:
+                esito_git(r)
+            except Exception as e:
+                _log_gui(f"aggiornamento: errore {e!r}")
+                bt_git.config(state="normal")
+        root.after(300, poll_esiti)
+
+    bt_git.config(command=aggiorna_ora)
+    root.after(300, poll_esiti)
+
     cv.bind("<Button-1>", clic)
     cv.bind("<Configure>", lambda e: (ultimo.update(firma=None), disegna(gestore.stato(), gestore.occupato,
                                                                         ultimo["msg"])))
 
     # all'apertura: prima controlla GitHub, poi accende i bot che non girano già
     def avvio_con_update():
+        ricorda_head_avvio()
         gestore.aggiorna()
         gestore.avvia_mancanti()
     root.after(400, lambda: in_thread(avvio_con_update, "AGGIORNAMENTO…"))
@@ -1662,7 +1790,7 @@ def crea_barra_bot(root, tk):
         root.after(30 * 60 * 1000, controllo_periodico)
     root.after(30 * 60 * 1000, controllo_periodico)
     root.after(1500, aggiorna)
-    return {"gestore": gestore, "clic": clic}
+    return {"gestore": gestore, "clic": clic, "imposta_riavvio": lambda f: hook.update(riavvia=f)}
 
 
 def avvia_gui():
@@ -1684,7 +1812,7 @@ def avvia_gui():
         testa.pack(fill="x")
         tk.Label(testa, text="BRANCH", font=T.F_LOGO, fg=T.ROSSO).pack(side="left", padx=(14, 8), pady=(6, 2))
     tk.Frame(root, height=2, bg=T.ROSSO).pack(fill="x")
-    crea_barra_bot(root, tk)                   # led di stato dei bot (si avviano da soli all'apertura)
+    barra_bot = crea_barra_bot(root, tk)       # led di stato dei bot (si avviano da soli all'apertura)
 
     nb = ttk.Notebook(root)
     nb.pack(fill="both", expand=True)
@@ -2000,21 +2128,34 @@ def avvia_gui():
             _log_gui(f"salvataggio automatico: errore {e!r}")
         root.after(int(AUTOSAVE_SEC * 1000), autosalva)
 
-    def chiudi():
+    def prepara_chiusura() -> bool:
+        """Salvataggi, conferma se c'è un invio in corso, tolgo il segnale GUI. False = l'utente annulla."""
         if not chiedi_salvataggio() or not tg["chiedi_salvataggio"]():
-            return
+            return False
         if tg["invio_in_corso"]():
             if not messagebox.askyesno(
                     "Invio in corso",
                     "È in corso un invio su Telegram: chiudendo si interrompe\n"
                     "(quello che è già partito è già stato tolto dalla lista).\n\nChiudere comunque?"):
-                return
+                return False
             tg["ferma"]()
         try:
             GUI_VIVA.unlink()
         except OSError:
             pass
-        root.destroy()
+        return True
+
+    def chiudi():
+        if prepara_chiusura():
+            root.destroy()
+
+    def riavvia():
+        """Usato dopo un aggiornamento da GitHub: chiude come chiudi() e rilancia la GUI."""
+        if prepara_chiusura():
+            root.destroy()
+            riavvia_processo()
+
+    barra_bot["imposta_riavvio"](riavvia)
 
     def aggiorna_progresso():
         """Ogni secondo: se il bot sta inviando la lista della persona selezionata, mostra la barra."""
