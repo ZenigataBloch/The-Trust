@@ -323,6 +323,42 @@ def r_t_ferma(_):
     return 200, {}
 
 
+# ------------------------------------------------------------ log
+LOG_RE = re.compile(r"[\w.\-]+\.log(\.\d+)?$")
+
+
+def _file_log():
+    """File di log nella cartella dei bot (org_bot.log, discord_bot.log, pannello.log...), i più recenti prima."""
+    try:
+        fs = [p for p in BM.BASE.iterdir() if p.is_file() and LOG_RE.fullmatch(p.name)]
+    except OSError:
+        return []
+    return sorted(fs, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def r_log(q):
+    fs = _file_log()
+    elenco = [{"nome": p.name, "kb": round(p.stat().st_size / 1024, 1), "mtime": p.stat().st_mtime} for p in fs]
+    nome = q.get("file") or (elenco[0]["nome"] if elenco else "")
+    if not nome:
+        return 200, {"file": [], "nome": "", "testo": ""}
+    p = next((x for x in fs if x.name == nome), None)      # solo i file dell'elenco: niente percorsi liberi
+    if p is None:
+        return 404, {"errore": "Log non trovato"}
+    try:
+        kb = max(1, min(int(q.get("kb") or 60), 500))
+    except ValueError:
+        kb = 60
+    size = p.stat().st_size
+    with open(p, "rb") as f:
+        f.seek(max(0, size - kb * 1024))
+        dati = f.read()
+    testo = dati.decode("utf-8", errors="replace")
+    if size > kb * 1024 and "\n" in testo:
+        testo = testo.split("\n", 1)[1]                    # scarto la prima riga, tagliata a metà
+    return 200, {"file": elenco, "nome": nome, "testo": testo, "kb": round(size / 1024, 1)}
+
+
 # ------------------------------------------------------------ HTTP
 MANIFEST = json.dumps({
     "name": "Branch", "short_name": "Branch", "start_url": "/", "scope": "/", "display": "standalone",
@@ -333,7 +369,7 @@ MANIFEST = json.dumps({
 SW = "self.addEventListener('fetch',()=>{});"
 ICONE = {"/icon-192.png": BM.BASE / "icon-192.png", "/icon-512.png": BM.BASE / "icon-512.png"}
 
-GET = {"/api/bots": r_bots, "/api/persone": r_persone, "/api/persona": r_persona, "/api/tg": r_tg}
+GET = {"/api/bots": r_bots, "/api/persone": r_persone, "/api/persona": r_persona, "/api/tg": r_tg, "/api/log": r_log}
 POST = {"/api/bots/start": r_bots_start, "/api/bots/stop": r_bots_stop, "/api/righe": r_righe,
         "/api/persona/salva": r_p_salva, "/api/persona/nuova": r_p_nuova, "/api/persona/elimina": r_p_elimina,
         "/api/persona/scollega": r_p_scollega, "/api/tg/salva": r_t_salva, "/api/tg/toggle": r_t_toggle,

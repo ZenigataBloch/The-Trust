@@ -43,6 +43,8 @@ textarea:disabled{background:var(--pn)}
 .bar{height:8px;background:var(--pn);border-radius:4px;overflow:hidden}
 .bar i{display:block;height:100%;width:0;background:var(--ok);transition:width .4s}
 .prog small{color:var(--mu)}
+#log{flex:1;min-height:50vh;margin:0;overflow:auto;background:var(--in);border:1px solid var(--ln);border-radius:6px;padding:10px;font:12px/1.45 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
+select.b{max-width:100%}
 </style>
 </head>
 <body>
@@ -53,6 +55,7 @@ textarea:disabled{background:var(--pn)}
 <nav>
   <button id="n-p" class="sel">Discord</button>
   <button id="n-t">Telegram</button>
+  <button id="n-l">Log</button>
 </nav>
 <main>
 <section id="s-p" class="sel">
@@ -86,6 +89,13 @@ textarea:disabled{background:var(--pn)}
     <button class="b" id="ferma" disabled>Ferma</button>
     <button class="b p" id="invia">Invia ora</button>
   </div>
+</section>
+<section id="s-l">
+  <div class="row wrap"><select class="b grow" id="log-f"></select>
+    <label class="mu"><input type="checkbox" id="log-auto" checked> Aggiorna</label>
+    <button class="b" id="log-r">Ricarica</button><button class="b" id="log-c">Copia</button></div>
+  <div class="mu" id="log-i"></div>
+  <pre id="log"></pre>
 </section>
 </main>
 <script>
@@ -274,9 +284,27 @@ $("#agg").onclick=()=>{const t=prompt("Incolla ID (-100…), @username o link t.
 $("#nomi").onclick=()=>canaliOp("/api/tg/nomi",{},"Aggiorno i nomi…");
 
 /* ---------- schede, avvio, salvataggio automatico ---------- */
-for(const k of ["p","t"])$("#n-"+k).onclick=()=>{
-  for(const j of ["p","t"]){$("#n-"+j).classList.toggle("sel",j===k);$("#s-"+j).classList.toggle("sel",j===k);}
+const SCHEDE=["p","t","l"];
+for(const k of SCHEDE)$("#n-"+k).onclick=()=>{
+  for(const j of SCHEDE){$("#n-"+j).classList.toggle("sel",j===k);$("#s-"+j).classList.toggle("sel",j===k);}
+  if(k==="l")caricaLog(true);
 };
+/* ---------- log ---------- */
+const G={file:""};
+async function caricaLog(giu){
+  const r=await api("/api/log?kb=80"+(G.file?"&file="+encodeURIComponent(G.file):""));
+  if(r.errore){$("#log-i").textContent="⚠ "+r.errore;return;}
+  const f=$("#log-f"),sig=JSON.stringify(r.file.map(x=>x.nome));
+  if(f.dataset.sig!==sig){f.dataset.sig=sig;f.replaceChildren(...r.file.map(x=>{const o=el("option",0,x.nome+" ("+x.kb+" KB)");o.value=x.nome;return o;}));}
+  G.file=r.nome;f.value=r.nome;
+  const box=$("#log"),fondo=box.scrollHeight-box.scrollTop-box.clientHeight<40;
+  if(box.textContent!==r.testo){box.textContent=r.testo||"(vuoto)";if(giu||fondo)box.scrollTop=box.scrollHeight;}
+  $("#log-i").textContent=r.nome?"Ultime righe di "+r.nome+" · aggiornato "+hhmm():"Nessun file .log nella cartella.";
+}
+$("#log-f").onchange=e=>{G.file=e.target.value;caricaLog(true);};
+$("#log-r").onclick=()=>caricaLog(true);
+$("#log-c").onclick=async()=>{try{await navigator.clipboard.writeText($("#log").textContent);$("#log-i").textContent="Log copiato negli appunti.";}catch(e){$("#log-i").textContent="Copia non riuscita: tieni premuto sul testo per selezionarlo.";}};
+setInterval(()=>{if($("#s-l").classList.contains("sel")&&$("#log-auto").checked)caricaLog(false);},3000);
 setInterval(()=>{LP.salva(true);LT.salva(true);},30000);
 setInterval(bots,3000);
 editorP(false);
