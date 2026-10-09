@@ -255,7 +255,9 @@ def setup_temp():
     try:
         BASE_TMP.mkdir(parents=True, exist_ok=True)
         for d in BASE_TMP.iterdir():
-            if d.is_dir() and d.name.isdigit() and not _pid_vivo(int(d.name)):
+            if (d.is_dir() and d.name.isdigit() and int(d.name) != os.getpid()
+                    and not _pid_vivo(int(d.name))
+                    and time.time() - d.stat().st_mtime > 3600):   # solo se abbandonata da piu' di un'ora
                 shutil.rmtree(d, ignore_errors=True)
                 log(f"Pulizia: eliminata la cartella temporanea residua {d.name}")
         MY_TMP.mkdir(exist_ok=True)
@@ -263,6 +265,15 @@ def setup_temp():
         log(f"Cartella temporanea dedicata non creata ({e}): uso quella di sistema")
         return
     tempfile.tempdir = str(MY_TMP)   # da qui TemporaryDirectory() lavora qui dentro
+
+    # se la cartella sparisce (pulizia di un altro processo, Android...) la ricreo al volo
+    _mkdtemp_orig = tempfile.mkdtemp
+
+    def _mkdtemp_sicuro(*a, **k):
+        MY_TMP.mkdir(parents=True, exist_ok=True)
+        return _mkdtemp_orig(*a, **k)
+
+    tempfile.mkdtemp = _mkdtemp_sicuro
     atexit.register(_cleanup_tmp)    # chiusura normale e Ctrl+C
     if sys.platform == "win32":      # chiusura della finestra / tab, logoff, spegnimento
         try:
@@ -426,11 +437,8 @@ def download_ytdlp(url: str, folder: str, sorgente: tuple[str, str] | None = Non
     return collect_files(folder)
 
 
-def download_gallerydl(url: str, folder: str, sorgente: tuple[str, str] | None = None,
-                       verifica_ssl: bool = True) -> list[Path]:
+def download_gallerydl(url: str, folder: str, sorgente: tuple[str, str] | None = None) -> list[Path]:
     cmd = [_python_console(), "-m", "gallery_dl", "-d", folder]
-    if not verifica_ssl:
-        cmd.append("--no-check-certificate")
     if sorgente:
         tipo, valore = sorgente
         cmd += ["--cookies", valore] if tipo == "file" else ["--cookies-from-browser", valore]
@@ -474,24 +482,6 @@ def normalizza_url(url: str) -> str:
     return url
 
 
-# ---------- certificati SSL non validi (es. nhentai) ----------
-# Se gallery-dl fallisce con CERTIFICATE_VERIFY_FAILED, per i siti elencati qui si riprova UNA volta
-# senza verifica del certificato. Variabile SSL_SENZA_VERIFICA: host separati da virgola
-# (default nhentai.net; vuota = mai). Vale anche per i sottodomini (i.nhentai.net, ...).
-SSL_SENZA_VERIFICA = tuple(x.strip().lower() for x in
-                           os.environ.get("SSL_SENZA_VERIFICA", "nhentai.net").split(",") if x.strip())
-
-
-def _errore_certificato(testo: str) -> bool:
-    t = testo.lower()
-    return "certificate_verify_failed" in t or "certificate verify failed" in t
-
-
-def _ssl_senza_verifica(url: str) -> bool:
-    host = urlsplit(url.strip()).netloc.lower().removeprefix("www.")
-    return any(host == h or host.endswith("." + h) for h in SSL_SENZA_VERIFICA)
-
-
 def _scarica(url: str, folder: str, sorgente: tuple[str, str] | None) -> list[Path]:
     """Un tentativo con una sola sorgente di cookie: prima yt-dlp, poi gallery-dl."""
     err_yt = ""
@@ -511,18 +501,6 @@ def _scarica(url: str, folder: str, sorgente: tuple[str, str] | None) -> list[Pa
     try:
         return download_gallerydl(url, folder, sorgente)
     except Exception as e:
-        if _errore_certificato(str(e)) and _ssl_senza_verifica(url):
-            host = urlsplit(url).netloc.lower().removeprefix("www.")
-            log(f"  gallery-dl: certificato non valido per {host}: riprovo UNA volta senza verifica SSL")
-            try:
-                return download_gallerydl(url, folder, sorgente, verifica_ssl=False)
-            except Exception as e2:
-                extra = ""
-                if _errore_certificato(str(e2)):
-                    extra = (f" Il sito {host} presenta un certificato non valido anche senza verifica: "
-                             "di solito è un blocco del provider o la scansione HTTPS dell'antivirus. "
-                             "Prova a cambiare DNS (es. 1.1.1.1), una VPN, o a disattivare la scansione HTTPS.")
-                raise DownloadError(str(e2) + extra, dettagli=f"{err_yt}\n{e2}") from None
         raise DownloadError(str(e), dettagli=f"{err_yt}\n{e}") from None
 
 
