@@ -9,14 +9,20 @@ invio Telegram): la logica è quella di Branch, qui cambia solo l'interfaccia.
   - avvio del server -> se nessun bot gira crea il flag di arresto: i bot partono solo quando apri l'app
   - apri la pagina  -> accende i bot che non girano (e toglie il flag di arresto)
   - chiudi la pagina -> i bot restano accesi
+  - scheda Cookie    -> incolla i cookie dagli appunti (JSON o cookies.txt), li controlla e aggiorna cookies.txt
+  - pulsante ⟳       -> git pull e, se serve, riavvio di bot e pannello
   - clic sul led     -> spegne i bot (crea bots_fermi.flag, lo stesso di avvia_bots.py stop)
 """
 import contextlib
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path, PurePath
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -323,6 +329,253 @@ def r_t_ferma(_):
     return 200, {}
 
 
+# ------------------------------------------------------------ cookie
+# Siti tenuti (gli altri cookie dell'export vengono scartati). Modificabili con COOKIE_DOMINI in bots.env.
+COOKIE_DOMINI = [d.strip().lower().lstrip(".") for d in
+                 os.environ.get("COOKIE_DOMINI", "tiktok.com,instagram.com,reddit.com,x.com").split(",") if d.strip()]
+# cookie che provano il login: se mancano, probabilmente non eri loggato quando hai esportato
+COOKIE_LOGIN = {"tiktok.com": ("sessionid", "sid_tt"), "instagram.com": ("sessionid",),
+                "reddit.com": ("reddit_session", "token_v2"), "x.com": ("auth_token",)}
+HTTPONLY = "#HttpOnly_"
+HEADER_COOKIE = "# Netscape HTTP Cookie File"
+_HOST_RE = re.compile(r"[A-Za-z0-9._\-]+")
+
+
+def cookie_file() -> Path:
+    f = os.environ.get("COOKIES_FILE")
+    return Path(f).expanduser() if f else BM.BASE / "cookies.txt"
+
+
+def _dominio(campo: str) -> str:
+    return campo.removeprefix(HTTPONLY).lstrip(".").lower()
+
+
+def _sito(dominio: str):
+    for s in COOKIE_DOMINI:
+        if dominio == s or dominio.endswith("." + s):
+            return s
+    return None
+
+
+def _campi_valido(c):
+    """I 7 campi Netscape normalizzati, oppure None se la riga non è un cookie."""
+    if len(c) < 7:
+        return None
+    c = c[:6] + ["\t".join(c[6:])] if len(c) > 7 else list(c)
+    dom = _dominio(c[0])
+    if not dom or "." not in dom or not _HOST_RE.fullmatch(dom):
+        return None
+    if c[1].upper() not in ("TRUE", "FALSE") or c[3].upper() not in ("TRUE", "FALSE"):
+        return None
+    if not re.fullmatch(r"\d+", c[4].strip()) or not c[2].startswith("/") or not c[5].strip():
+        return None
+    return [c[0], c[1].upper(), c[2], c[3].upper(), c[4].strip(), c[5], c[6]]
+
+
+def _da_json(testo: str):
+    """Export JSON (Cookie-Editor...) -> (cookie in campi Netscape, quanti elementi scartati)."""
+    dati = json.loads(testo)
+    if isinstance(dati, dict):
+        dati = dati["cookies"] if isinstance(dati.get("cookies"), list) else [dati]
+    if not isinstance(dati, list):
+        raise ValueError("json")
+    ok, scartati = [], 0
+    for c in dati:
+        try:
+            dom, nome = str(c["domain"]), str(c["name"])
+            solo_host = bool(c.get("hostOnly", not dom.startswith(".")))
+            if not solo_host and not dom.startswith("."):
+                dom = "." + dom
+            scad = 0 if c.get("session") else max(0, int(float(c.get("expirationDate") or c.get("expires") or 0)))
+            riga = _campi_valido([(HTTPONLY if c.get("httpOnly") else "") + dom, "FALSE" if solo_host else "TRUE",
+                                  str(c.get("path") or "/"), "TRUE" if c.get("secure") else "FALSE",
+                                  str(scad), nome, str(c.get("value", ""))])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            riga = None
+        if riga:
+            ok.append(riga)
+        else:
+            scartati += 1
+    return ok, scartati
+
+
+def _da_netscape(testo: str):
+    ok, scartati = [], 0
+    for riga in testo.splitlines():
+        r = riga.rstrip("\r\n")
+        s = r.lstrip()
+        if not s or (s.startswith("#") and not s.startswith(HTTPONLY)):
+            continue                                   # righe vuote e commenti non contano
+        c = _campi_valido(r.split("\t")) or _campi_valido(re.split(r"\s+", s, maxsplit=6))   # tab persi negli appunti
+        if c:
+            ok.append(c)
+        else:
+            scartati += 1
+    return ok, scartati
+
+
+def cookie_analizza(testo: str) -> dict:
+    """Controlla che il testo siano cookie (JSON o cookies.txt) e tiene solo i siti di COOKIE_DOMINI.
+    Non restituisce mai il contenuto dei cookie negli errori."""
+    testo = (testo or "").lstrip("\ufeff").strip()
+    res = {"formato": None, "validi": 0, "altri": 0, "scartati": 0, "siti": {}, "righe": [], "errore": None}
+    if not testo:
+        res["errore"] = "Gli appunti sono vuoti."
+        return res
+    if testo[0] in "[{":
+        res["formato"] = "JSON"
+        try:
+            campi, res["scartati"] = _da_json(testo)
+        except ValueError:
+            res["errore"] = "Sembra JSON ma non è valido: la copia è incompleta? Riesporta e riprova."
+            return res
+    else:
+        res["formato"] = "Netscape (cookies.txt)"
+        campi, res["scartati"] = _da_netscape(testo)
+    res["validi"] = len(campi)
+    if not campi:
+        res["errore"] = "Non sono cookie: il testo non è un export di cookie (né JSON né cookies.txt)."
+        return res
+    ora, nomi = time.time(), {}
+    for c in campi:
+        s = _sito(_dominio(c[0]))
+        if not s:
+            res["altri"] += 1
+            continue
+        d = res["siti"].setdefault(s, {"n": 0, "scaduti": 0, "avviso": ""})
+        d["n"] += 1
+        if 0 < int(c[4]) < ora:
+            d["scaduti"] += 1
+        nomi.setdefault(s, set()).add(c[5])
+        res["righe"].append("\t".join(c))
+    if not res["siti"]:
+        res["errore"] = (f"{len(campi)} cookie riconosciuti, ma nessuno dei siti supportati "
+                         f"({', '.join(COOKIE_DOMINI)}). Hai esportato dal sito giusto?")
+        return res
+    for s, d in res["siti"].items():
+        if s in COOKIE_LOGIN and not (set(COOKIE_LOGIN[s]) & nomi.get(s, set())):
+            d["avviso"] = f"manca il cookie di accesso ({COOKIE_LOGIN[s][0]}): forse non eri loggato"
+        elif d["scaduti"] == d["n"]:
+            d["avviso"] = "sono tutti scaduti"
+    return res
+
+
+def cookie_applica(testo: str) -> dict:
+    """Sostituisce in cookies.txt i cookie dei siti presenti nell'export e lascia intatti gli altri.
+    Il vecchio file resta come cookies.txt.bak."""
+    res = cookie_analizza(testo)
+    if res["errore"]:
+        return res
+    out = cookie_file()
+    tenute = []
+    if out.exists():
+        vecchio = out.read_text(encoding="utf-8-sig")
+        shutil.copy2(out, out.with_name(out.name + ".bak"))
+        for r in vecchio.splitlines():
+            c = _campi_valido(r.split("\t"))
+            if c and _sito(_dominio(c[0])) not in res["siti"]:
+                tenute.append(r.rstrip("\r\n"))
+    O.scrivi_atomico(out, HEADER_COOKIE + "\n" + "\n".join(tenute + res["righe"]) + "\n")
+    try:
+        os.chmod(out, 0o600)                           # i cookie sono sessioni: solo tu
+    except OSError:
+        pass
+    log("cookie: aggiornati " + ", ".join(f"{s} ({d['n']})" for s, d in res["siti"].items()))
+    return res
+
+
+def r_cookie(_):
+    out = cookie_file()
+    siti = {s: {"n": 0, "scaduti": 0} for s in COOKIE_DOMINI}
+    if out.exists():
+        ora = time.time()
+        for r in out.read_text(encoding="utf-8-sig").splitlines():
+            c = _campi_valido(r.split("\t"))
+            s = _sito(_dominio(c[0])) if c else None
+            if s:
+                siti[s]["n"] += 1
+                if 0 < int(c[4]) < ora:
+                    siti[s]["scaduti"] += 1
+    return 200, {"esiste": out.exists(), "file": out.name, "siti": siti,
+                 "mtime": out.stat().st_mtime if out.exists() else 0}
+
+
+def r_c_analizza(b):
+    res = cookie_analizza(str(b.get("testo", "")))
+    res.pop("righe")
+    return 200, res
+
+
+def r_c_applica(b):
+    res = cookie_applica(str(b.get("testo", "")))
+    if res["errore"]:
+        return 400, {"errore": res["errore"]}
+    res.pop("righe")
+    res["riepilogo"] = ("Aggiornati: " + ", ".join(f"{s.split('.')[0]} ({d['n']})" for s, d in res["siti"].items())
+                        + f". Salvato in {cookie_file().name} (copia precedente in .bak): "
+                          "i bot lo rileggono al prossimo download.")
+    return 200, res
+
+
+# ------------------------------------------------------------ git pull
+FILE_SERVER = {"pannello.py", "org_bot.py", "bot_manager.py", "bot_log.py", "sendbot_tema.py"}
+FILE_BOT = {"telegram_bot.py", "discord_bot.py", "org_bot.py", "bot_log.py"}
+
+
+def _git(*args, timeout=90):
+    r = subprocess.run(["git", *args], cwd=BM.BASE, capture_output=True, text=True, timeout=timeout,
+                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def r_git_pull(_):
+    try:
+        c, _o = _git("rev-parse", "--is-inside-work-tree")
+        if c:
+            return 400, {"errore": "Questa cartella non è una repo git."}
+        _c, prima = _git("rev-parse", "HEAD")
+        c, out = _git("pull", "--ff-only")
+        if c:
+            return 200, {"ok": False, "output": out[-500:]}
+        _c, dopo = _git("rev-parse", "HEAD")
+        cambiati = []
+        if dopo != prima:
+            _c, d = _git("diff", "--name-only", prima, dopo)
+            cambiati = d.splitlines()
+    except FileNotFoundError:
+        return 400, {"errore": "git non è installato (pkg install git)."}
+    except subprocess.TimeoutExpired:
+        return 200, {"ok": False, "output": "Timeout: GitHub non risponde (rete?)."}
+    nomi = {PurePath(x).name for x in cambiati}
+    log(f"git pull: {len(cambiati)} file cambiati")
+    return 200, {"ok": True, "cambiati": cambiati, "server": bool(nomi & FILE_SERVER), "bot": bool(nomi & FILE_BOT)}
+
+
+def _riavvia(server: bool, bot: bool):
+    g.occupato = True
+    try:
+        if bot and not FLAG.exists() and any(g.stato().values()):   # riaccendo solo se giravano
+            g.ferma_tutti()
+            g.avvia_mancanti()
+    except Exception as e:
+        log(f"riavvio bot: errore {e!r}")
+    finally:
+        g.occupato = False
+    if server:
+        time.sleep(1)                                   # lascio finire la risposta HTTP
+        log("Riavvio del pannello per applicare l'aggiornamento")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def r_git_riavvia(b):
+    if inv.get("attivo") or any((d := O.leggi_progresso(n)) and not d.get("fine") for n in O.nomi_persone()):
+        return 409, {"errore": "C'è un invio in corso: riavvia quando è finito."}
+    if g.occupato:
+        return 409, {"errore": "I bot sono occupati, riprova tra un attimo."}
+    threading.Thread(target=_riavvia, args=(bool(b.get("server")), bool(b.get("bot"))), daemon=True).start()
+    return 200, {}
+
+
 # ------------------------------------------------------------ log
 LOG_RE = re.compile(r"[\w.\-]+\.log(\.\d+)?$")
 
@@ -369,12 +622,14 @@ MANIFEST = json.dumps({
 SW = "self.addEventListener('fetch',()=>{});"
 ICONE = {"/icon-192.png": BM.BASE / "icon-192.png", "/icon-512.png": BM.BASE / "icon-512.png"}
 
-GET = {"/api/bots": r_bots, "/api/persone": r_persone, "/api/persona": r_persona, "/api/tg": r_tg, "/api/log": r_log}
+GET = {"/api/bots": r_bots, "/api/persone": r_persone, "/api/persona": r_persona, "/api/tg": r_tg, "/api/log": r_log, "/api/cookie": r_cookie}
 POST = {"/api/bots/start": r_bots_start, "/api/bots/stop": r_bots_stop, "/api/righe": r_righe,
         "/api/persona/salva": r_p_salva, "/api/persona/nuova": r_p_nuova, "/api/persona/elimina": r_p_elimina,
         "/api/persona/scollega": r_p_scollega, "/api/tg/salva": r_t_salva, "/api/tg/toggle": r_t_toggle,
         "/api/tg/rimuovi": r_t_rimuovi, "/api/tg/aggiungi": r_t_aggiungi, "/api/tg/nomi": r_t_nomi,
-        "/api/tg/invia": r_t_invia, "/api/tg/ferma": r_t_ferma}
+        "/api/tg/invia": r_t_invia, "/api/tg/ferma": r_t_ferma,
+        "/api/cookie/analizza": r_c_analizza, "/api/cookie/applica": r_c_applica,
+        "/api/git/pull": r_git_pull, "/api/git/riavvia": r_git_riavvia}
 
 
 class H(BaseHTTPRequestHandler):

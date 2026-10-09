@@ -45,16 +45,23 @@ textarea:disabled{background:var(--pn)}
 .prog small{color:var(--mu)}
 #log{flex:1;min-height:50vh;margin:0;overflow:auto;background:var(--in);border:1px solid var(--ln);border-radius:6px;padding:10px;font:12px/1.45 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
 select.b{max-width:100%}
+[hidden]{display:none!important}
+#stato{flex:1;min-width:0}
+#gitmsg{padding:6px 14px;border-bottom:1px solid var(--ln);white-space:pre-wrap;word-break:break-word}
+#ck-rep div{padding:2px 0}
 </style>
 </head>
 <body>
 <header>
   <button id="led" aria-label="Accendi o spegni i bot"></button>
   <div id="stato"><b>Connessione…</b></div>
+  <button class="b" id="git" aria-label="Aggiorna da GitHub (git pull)" title="Aggiorna da GitHub">⟳</button>
 </header>
+<div id="gitmsg" class="msg" hidden></div>
 <nav>
   <button id="n-p" class="sel">Discord</button>
   <button id="n-t">Telegram</button>
+  <button id="n-c">Cookie</button>
   <button id="n-l">Log</button>
 </nav>
 <main>
@@ -89,6 +96,15 @@ select.b{max-width:100%}
     <button class="b" id="ferma" disabled>Ferma</button>
     <button class="b p" id="invia">Invia ora</button>
   </div>
+</section>
+<section id="s-c">
+  <div class="mu" id="ck-stato">…</div>
+  <div class="mu">Esporta i cookie dal browser (JSON o cookies.txt), premi Copia, poi qui «Incolla dagli appunti». Controllo che siano cookie, tengo solo i siti dei bot e scarto il resto.</div>
+  <div class="row wrap"><button class="b p" id="ck-inc">Incolla dagli appunti</button><button class="b" id="ck-ap" disabled>Applica a cookies.txt</button></div>
+  <div id="ck-man" hidden><textarea id="ck-ta" spellcheck="false" autocapitalize="off" style="min-height:90px;flex:none" placeholder="Incolla qui i cookie"></textarea>
+    <div class="row" style="margin-top:6px"><button class="b" id="ck-man-ok">Controlla</button></div></div>
+  <div id="ck-rep"></div>
+  <div id="msg-c" class="msg"></div>
 </section>
 <section id="s-l">
   <div class="row wrap"><select class="b grow" id="log-f"></select>
@@ -284,10 +300,74 @@ $("#agg").onclick=()=>{const t=prompt("Incolla ID (-100…), @username o link t.
 $("#nomi").onclick=()=>canaliOp("/api/tg/nomi",{},"Aggiorno i nomi…");
 
 /* ---------- schede, avvio, salvataggio automatico ---------- */
-const SCHEDE=["p","t","l"];
+const SCHEDE=["p","t","c","l"];
 for(const k of SCHEDE)$("#n-"+k).onclick=()=>{
   for(const j of SCHEDE){$("#n-"+j).classList.toggle("sel",j===k);$("#s-"+j).classList.toggle("sel",j===k);}
   if(k==="l")caricaLog(true);
+  if(k==="c")ckStato();
+};
+/* ---------- cookie ---------- */
+const CK={testo:""};
+function ckSay(t,c){const m=$("#msg-c");m.textContent=t;m.className="msg "+(c||"");}
+async function ckStato(){
+  const r=await api("/api/cookie");if(!r.siti)return;
+  $("#ck-stato").textContent=(r.esiste?r.file+": ":"cookies.txt non esiste ancora. ")+Object.entries(r.siti).map(([s,v])=>s.split(".")[0]+" "+(v.n?v.n+(v.scaduti===v.n?" (scaduti)":v.scaduti?" ("+v.scaduti+" scaduti)":""):"—")).join(" · ")+(r.esiste?" · modificato "+new Date(r.mtime*1000).toLocaleString("it-IT"):"");
+}
+function ckReport(r){
+  const b=$("#ck-rep");b.replaceChildren();
+  const add=(t,c)=>b.append(el("div",c,t));
+  if(r.errore){add("⚠ "+r.errore,"err");$("#ck-ap").disabled=true;return;}
+  add("✓ Formato "+r.formato+": "+r.validi+" cookie riconosciuti.","ok");
+  for(const [s,v] of Object.entries(r.siti))add((v.avviso?"⚠ ":"✓ ")+s+": "+v.n+" cookie"+(v.scaduti?", "+v.scaduti+" scaduti":"")+(v.avviso?" — "+v.avviso:""),v.avviso?"warn":"ok");
+  if(r.altri)add("Scartati "+r.altri+" cookie di altri siti.","mu");
+  if(r.scartati)add("Ignorate "+r.scartati+" righe che non sono cookie.","mu");
+  $("#ck-ap").disabled=false;
+}
+async function ckAnalizza(t){
+  ckSay("");CK.testo=t;
+  ckReport(await api("/api/cookie/analizza",{testo:t}));
+}
+$("#ck-inc").onclick=async()=>{
+  let t="";
+  try{t=await navigator.clipboard.readText();}
+  catch(e){$("#ck-man").hidden=false;ckSay("Chrome non ha dato accesso agli appunti: incolla a mano qui sotto.","warn");return;}
+  $("#ck-man").hidden=true;ckAnalizza(t);
+};
+$("#ck-man-ok").onclick=()=>ckAnalizza($("#ck-ta").value);
+$("#ck-ap").onclick=async()=>{
+  const r=await api("/api/cookie/applica",{testo:CK.testo});
+  if(r.errore){ckSay("⚠ "+r.errore,"err");return;}
+  ckSay("✓ "+r.riepilogo,"ok");
+  CK.testo="";$("#ck-ta").value="";$("#ck-man").hidden=true;$("#ck-rep").replaceChildren();$("#ck-ap").disabled=true;
+  try{await navigator.clipboard.writeText("");}catch(e){}   // i cookie sono sessioni: svuoto gli appunti
+  ckStato();
+};
+/* ---------- git pull ---------- */
+function gitMsg(t,c){const m=$("#gitmsg");m.hidden=!t;m.textContent=t;m.className="msg "+(c||"");}
+async function attendiServer(){
+  gitMsg("Riavvio in corso…","info");
+  await new Promise(r=>setTimeout(r,3000));
+  for(let i=0;i<40;i++){const s=await api("/api/bots");if(s.bot)return location.reload();await new Promise(r=>setTimeout(r,1500));}
+  gitMsg("⚠ Il server non risponde: riavvialo da Termux.","err");
+}
+$("#git").onclick=async()=>{
+  const b=$("#git");b.disabled=true;gitMsg("Scarico gli aggiornamenti da GitHub…","info");
+  const r=await api("/api/git/pull",{});b.disabled=false;
+  if(r.errore){gitMsg("⚠ "+r.errore,"err");return;}
+  if(!r.ok){gitMsg("⚠ git pull non riuscito:\n"+r.output,"err");return;}
+  if(!r.cambiati.length){gitMsg("Già aggiornato.","ok");setTimeout(()=>gitMsg(""),4000);return;}
+  const elenco=r.cambiati.slice(0,6).join(", ")+(r.cambiati.length>6?"…":"");
+  const cosa=[r.server&&"il pannello",r.bot&&"i bot"].filter(Boolean).join(" e ");
+  if(!cosa){
+    gitMsg("Aggiornati "+r.cambiati.length+" file: "+elenco,"ok");
+    if(r.cambiati.some(x=>x.endsWith("pannello.html")))setTimeout(()=>location.reload(),1200);
+    return;
+  }
+  gitMsg("Scaricati "+r.cambiati.length+" file: "+elenco,"ok");
+  if(!confirm("Aggiornamento scaricato.\nRiavvio "+cosa+" per applicarlo?"))return gitMsg("Aggiornati "+r.cambiati.length+" file. Riavvia "+cosa+" per applicarli.","warn");
+  const q=await api("/api/git/riavvia",{server:r.server,bot:r.bot});
+  if(q.errore)return gitMsg("⚠ "+q.errore,"err");
+  if(r.server)attendiServer();else gitMsg("Bot riavviati.","ok");
 };
 /* ---------- log ---------- */
 const G={file:""};
