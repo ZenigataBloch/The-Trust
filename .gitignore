@@ -1,0 +1,25 @@
+# segreti e sessioni
+bots.env
+cookies.txt
+cookies.txt.bak
+tutti.txt
+
+# script di avvio
+*.bat
+*.vbs
+
+# dati e impostazioni utente (avatar, backup, chat, canali Telegram, progressi)
+invii/
+
+# stato runtime
+bots_pid.json
+instagram_uso.json
+*.tmp
+
+# log e backup
+*.log
+*.log.*
+*.bak
+
+# varie
+__pycache__/
