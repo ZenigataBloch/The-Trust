@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#1b1718">
+<title>Branch</title>
+<style>
+:root{--bg:#1b1718;--pn:#262122;--in:#120f10;--fg:#ece6e2;--mu:#9a8f8b;--ro:#c8372d;--ok:#2ecc71;--wa:#f1c40f;--er:#e74c3c;--ln:#3a3234}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--fg);font:15px/1.4 "Avenir Next","Segoe UI",system-ui,sans-serif;display:flex;flex-direction:column;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+header{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:2px solid var(--ro)}
+#led{width:40px;height:40px;border-radius:50%;border:0;flex:none;background:var(--er);box-shadow:0 0 16px var(--er);cursor:pointer}
+#led.on{background:var(--ok);box-shadow:0 0 16px var(--ok)}
+#led.mid{background:var(--wa);box-shadow:0 0 16px var(--wa)}
+#stato b{display:block}
+#stato small{color:var(--mu);white-space:pre-line}
+nav{display:flex;border-bottom:1px solid var(--ln)}
+nav button{flex:1;padding:11px;background:none;border:0;border-bottom:3px solid transparent;color:var(--mu);font:inherit;cursor:pointer}
+nav button.sel{color:var(--fg);border-color:var(--ro)}
+main{flex:1;min-height:0;overflow:auto;padding:12px 14px}
+section{display:none;flex-direction:column;gap:8px;min-height:100%}
+section.sel{display:flex}
+textarea{flex:1;min-height:38vh;width:100%;background:var(--in);color:var(--fg);border:1px solid var(--ln);border-radius:6px;padding:10px;font:13px/1.5 ui-monospace,Consolas,monospace;resize:vertical}
+textarea:disabled{background:var(--pn)}
+.row{display:flex;gap:6px;align-items:center}.wrap{flex-wrap:wrap}.grow{flex:1}
+.b{background:var(--pn);color:var(--fg);border:1px solid var(--ln);border-radius:6px;padding:8px 12px;font:inherit;cursor:pointer}
+.b.p{background:var(--ro);border-color:var(--ro);font-weight:600}
+.b:disabled{opacity:.4;cursor:default}
+.mu{color:var(--mu)}
+.msg{min-height:1.4em}.ok{color:var(--ok)}.warn{color:var(--wa)}.err{color:var(--er)}.info{color:#6cb4ee}
+.chips{display:flex;gap:6px;overflow-x:auto;flex:1;padding-bottom:4px}
+.chip{flex:none;white-space:nowrap}
+.chip.sel{background:var(--ro);border-color:var(--ro)}
+.canale{display:flex;align-items:center;gap:10px;padding:8px 10px;background:var(--pn);border:1px solid var(--ln);border-radius:6px;margin-bottom:6px}
+.canale input{width:20px;height:20px;accent-color:var(--ro)}
+.canale span{flex:1}.canale small{color:var(--mu)}
+.canale button{background:none;border:0;color:var(--mu);font-size:18px;padding:4px 8px}
+.bar{height:8px;background:var(--pn);border-radius:4px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--ok);transition:width .4s}
+.prog small{color:var(--mu)}
+</style>
+</head>
+<body>
+<header>
+  <button id="led" aria-label="Accendi o spegni i bot"></button>
+  <div id="stato"><b>Connessione…</b></div>
+</header>
+<nav>
+  <button id="n-p" class="sel">Discord</button>
+  <button id="n-t">Telegram</button>
+</nav>
+<main>
+<section id="s-p" class="sel">
+  <div class="row"><div class="chips" id="chips"></div><button class="b" id="nuova">+ Nuova</button></div>
+  <div id="info-p" class="mu">Scegli una persona o creane una nuova.</div>
+  <textarea id="ta-p" spellcheck="false" autocapitalize="off" disabled></textarea>
+  <div id="pr-p" class="prog" hidden><div class="bar"><i></i></div><small></small></div>
+  <div id="msg-p" class="msg"></div>
+  <div class="row wrap">
+    <button class="b pp" id="inc-p">Incolla</button>
+    <button class="b pp" id="inc1-p">Incolla in 1 riga</button>
+    <button class="b pp p" id="sal-p">Salva</button>
+    <span class="grow"></span>
+    <button class="b pp" id="scol">Scollega chat</button>
+    <button class="b pp" id="elim">Elimina</button>
+  </div>
+</section>
+<section id="s-t">
+  <div id="tok" class="err"></div>
+  <div id="canali"></div>
+  <div class="row"><button class="b" id="agg">Aggiungi ID…</button><button class="b" id="nomi">Aggiorna nomi</button></div>
+  <div id="info-t" class="mu"></div>
+  <textarea id="ta-t" spellcheck="false" autocapitalize="off"></textarea>
+  <div id="pr-t" class="prog" hidden><div class="bar"><i></i></div><small></small></div>
+  <div id="msg-t" class="msg"></div>
+  <div class="row wrap">
+    <button class="b" id="inc-t">Incolla</button>
+    <button class="b" id="inc1-t">Incolla in 1 riga</button>
+    <button class="b" id="sal-t">Salva</button>
+    <span class="grow"></span>
+    <button class="b" id="ferma" disabled>Ferma</button>
+    <button class="b p" id="invia">Invia ora</button>
+  </div>
+</section>
+</main>
+<script>
+const $=s=>document.querySelector(s), hhmm=()=>new Date().toLocaleTimeString("it-IT");
+async function api(p,b){
+  try{
+    const r=await fetch(p,{method:b===undefined?"GET":"POST",headers:{"X-Panel":"1","Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)});
+    const j=await r.json().catch(()=>({}));j._s=r.status;return j;
+  }catch(e){return{errore:"Server non raggiungibile",_s:0};}
+}
+function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;}
+function bar(id,n,tot,txt){
+  const p=$("#pr-"+id);
+  if(n==null){p.hidden=true;return;}
+  p.hidden=false;p.querySelector("i").style.width=(tot?Math.min(100,n/tot*100):0)+"%";p.querySelector("small").textContent=txt;
+}
+
+/* ---------- led dei bot ---------- */
+async function bots(){
+  const s=await api("/api/bots"),led=$("#led"),st=$("#stato");
+  if(!s.bot){led.className="";st.replaceChildren(el("b",0,"Server non raggiungibile"));return;}
+  const k=Object.values(s.bot),up=k.filter(x=>x.acceso).length;
+  led.className=s.occupato||(up&&up<k.length)?"mid":up?"on":"";
+  const t=s.occupato?"IN CORSO…":up===k.length?"BOT ATTIVI":up?"BOT PARZIALI":"BOT SPENTI";
+  st.replaceChildren(el("b",0,t),el("small",0,k.map(x=>(x.acceso?"● ":"○ ")+x.nome).join("   ")+k.filter(x=>x.errore).map(x=>"\n"+x.nome+": "+x.errore).join("")));
+}
+$("#led").onclick=async()=>{
+  const s=await api("/api/bots");if(!s.bot||s.occupato)return;
+  await api(Object.values(s.bot).some(x=>x.acceso)?"/api/bots/stop":"/api/bots/start",{});
+  setTimeout(bots,300);
+};
+
+/* ---------- editor di lista (comune a Discord e Telegram) ---------- */
+function Lista(id,url,extra){
+  const ta=$("#ta-"+id),msg=$("#msg-"+id);
+  const L={mtime:0,dirty:false,ta,ricarica:null,
+    say(t,c){msg.textContent=t;msg.className="msg "+(c||"");},
+    set(testo,mt){ta.value=testo;L.mtime=mt;L.dirty=false;},
+    async salva(auto,forza){
+      if(auto&&!L.dirty)return true;
+      const r=await api(url,{...extra(),testo:ta.value,mtime:L.mtime,forza:!!forza});
+      if(r._s==409){
+        if(auto){L.say("⚠ La lista è cambiata nel frattempo: salva a mano per decidere.","err");return false;}
+        if(confirm("La lista è cambiata nel frattempo (sono partiti dei link).\nSovrascrivere con quello che vedi?\n\nAnnulla = ricarica la lista aggiornata."))return L.salva(false,true);
+        L.dirty=false;if(L.ricarica)await L.ricarica();return false;
+      }
+      if(r.errore){L.say("⚠ "+r.errore,"err");return false;}
+      L.mtime=r.mtime;L.dirty=false;
+      L.say((auto?"Salvataggio automatico":"Salvato")+" ("+hhmm()+"): "+r.link+" link, "+r.testi+" messaggi"+(r.ignorate?", "+r.ignorate+" righe ignorate (senza link né >).":"."),r.ignorate?"warn":"ok");
+      return true;
+    },
+    async incolla(unisci){
+      let clip="";
+      try{clip=await navigator.clipboard.readText();}catch(e){clip=prompt("Incolla qui il testo:")||"";}
+      if(!clip.trim())return L.say("Negli appunti non c'è niente da aggiungere.","warn");
+      const r=await api("/api/righe",{testo:clip,unisci});
+      if(!r.righe||!r.righe.length)return L.say("Niente da aggiungere.","warn");
+      ta.value+=(ta.value&&!ta.value.endsWith("\n")?"\n":"")+r.righe.join("\n")+"\n";
+      L.dirty=true;ta.scrollTop=ta.scrollHeight;L.say("Aggiunte "+r.righe.length+" righe: ricorda di salvare.","warn");
+    }};
+  ta.addEventListener("input",()=>L.dirty=true);
+  $("#inc-"+id).onclick=()=>L.incolla(false);
+  $("#inc1-"+id).onclick=()=>L.incolla(true);
+  $("#sal-"+id).onclick=()=>L.salva(false);
+  return L;
+}
+
+/* ---------- Discord: persone ---------- */
+const P={nome:null,sig:""};
+const LP=Lista("p","/api/persona/salva",()=>({nome:P.nome}));
+LP.ricarica=()=>caricaP(P.nome);
+function editorP(on){$("#ta-p").disabled=!on;document.querySelectorAll(".pp").forEach(b=>b.disabled=!on);}
+function infoP(r){
+  $("#info-p").textContent="«"+r.nome+"»: in coda "+r.link+" link e "+r.testi+" messaggi  |  chat collegate: "+r.chat+"  |  già inviati: "+r.inviati;
+  const p=r.progresso;
+  if(!p)bar("p");
+  else bar("p",p.n,p.tot,p.fine?"Completato":p.n+"/"+p.tot+(p.rimasto?" · ancora circa "+p.rimasto:""));
+}
+async function listaP(){
+  const r=await api("/api/persone");if(!r.persone)return;
+  const sig=JSON.stringify([r.persone,P.nome]);if(sig===P.sig)return;P.sig=sig;
+  $("#chips").replaceChildren(...r.persone.map(p=>{
+    const b=el("button","b chip"+(p.nome===P.nome?" sel":""),p.nome+(p.link?"  ("+p.link+")":""));
+    b.onclick=()=>scegliP(p.nome);return b;}));
+}
+async function caricaP(nome){
+  const r=await api("/api/persona?nome="+encodeURIComponent(nome));
+  if(r.errore){LP.say("⚠ "+r.errore,"err");return;}
+  P.nome=nome;P.sig="";LP.set(r.testo,r.mtime);LP.say("");editorP(true);infoP(r);listaP();
+}
+async function scegliP(nome){
+  if(nome===P.nome)return;
+  if(!(await LP.salva(true)))return;
+  caricaP(nome);
+}
+$("#nuova").onclick=async()=>{
+  if(!(await LP.salva(true)))return;
+  const n=prompt("Nome della persona (es. Marco):");if(!n)return;
+  const r=await api("/api/persona/nuova",{nome:n});
+  if(r.errore)return alert(r.errore);
+  caricaP(r.nome);
+};
+$("#elim").onclick=async()=>{
+  if(!P.nome||!confirm("Eliminare «"+P.nome+"» e la sua lista?\n(Resta una copia in invii/backup/)"))return;
+  await api("/api/persona/elimina",{nome:P.nome});
+  P.nome=null;P.sig="";LP.set("",0);editorP(false);bar("p");
+  $("#info-p").textContent="Scegli una persona o creane una nuova.";listaP();
+};
+$("#scol").onclick=async()=>{
+  if(!P.nome)return;const r=await api("/api/persona/scollega",{nome:P.nome});
+  LP.say(r.n?"Scollegate "+r.n+" chat da «"+P.nome+"».":"Nessuna chat collegata.","ok");caricaP(P.nome);
+};
+async function pollP(){
+  try{
+    if(P.nome){
+      const r=await api("/api/persona?nome="+encodeURIComponent(P.nome));
+      if(r._s==404){P.nome=null;editorP(false);LP.set("",0);}
+      else if(!r.errore){
+        infoP(r);
+        if(r.mtime!==LP.mtime){
+          if(!LP.dirty)LP.set(r.testo,r.mtime);
+          else LP.say("⚠ La lista è cambiata mentre la modifichi: salvando potresti reinviare link già partiti.","err");
+        }
+      }
+    }
+    await listaP();
+  }finally{setTimeout(pollP,3000);}
+}
+
+/* ---------- Telegram ---------- */
+const T={sig:"",canali:[],link:0,testi:0,era:false};
+const LT=Lista("t","/api/tg/salva",()=>({}));
+LT.ricarica=async()=>{const r=await api("/api/tg");if(r.canali)LT.set(r.testo,r.mtime);};
+function renderCanali(cs){
+  const sig=JSON.stringify(cs);if(sig===T.sig)return;T.sig=sig;
+  $("#canali").replaceChildren(...(cs.length?cs.map(c=>{
+    const d=el("div","canale"),cb=el("input");cb.type="checkbox";cb.checked=c.attivo;
+    cb.onchange=()=>api("/api/tg/toggle",{id:c.id,attivo:cb.checked});
+    const s=el("span",0,c.nome);if(c.tipo)s.append(" ",el("small",0,c.tipo));
+    const x=el("button",0,"✕");x.setAttribute("aria-label","Rimuovi");
+    x.onclick=async()=>{if(confirm("Togliere «"+c.nome+"» dall'elenco?\n(Non lascia il canale: toglie solo la voce.)")){await api("/api/tg/rimuovi",{id:c.id});T.sig="";pollT1();}};
+    d.append(cb,s,x);return d;}):[el("div","mu","Nessun canale: usa «Aggiungi ID…».")]));
+}
+async function pollT1(){
+  const r=await api("/api/tg");
+  if(!r.canali){LT.say("⚠ "+(r.errore||"Errore"),"err");return null;}
+  T.canali=r.canali;T.link=r.link;T.testi=r.testi;
+  $("#tok").textContent=r.token?"":"⚠ BOT_TOKEN non impostato in bots.env: senza non posso leggere i nomi né inviare.";
+  renderCanali(r.canali);
+  $("#info-t").textContent="In coda "+r.link+" link e "+r.testi+" messaggi  |  canali spuntati: "+r.canali.filter(c=>c.attivo).length+"  |  già inviati: "+r.inviati;
+  if(r.mtime!==LT.mtime){
+    if(!LT.dirty)LT.set(r.testo,r.mtime);
+    else if(r.invio&&r.invio.attivo)LT.say("⚠ La lista è cambiata durante l'invio: salvando potresti reinviare link già partiti.","err");
+  }
+  const v=r.invio,att=!!(v&&v.attivo);
+  $("#invia").disabled=att;$("#ferma").disabled=!att;
+  if(att){
+    bar("t",v.n,v.tot,(v.tot?v.n+"/"+v.tot:"")+(v.rimasto?" · ancora circa "+v.rimasto:""));LT.say(v.msg||"","info");
+  }else{
+    bar("t");
+    if(T.era){
+      const e=v&&v.esito,pr=[];
+      if(e){if(e.errore)pr.push("errore: "+e.errore);if(e.falliti.length)pr.push(e.falliti.length+" non consegnati (restano in lista)");if(e.fermato)pr.push("invio fermato");}
+      LT.say(pr.length?"⚠ "+pr.join("; ")+". In lista restano "+r.link+" link e "+r.testi+" messaggi. Dettagli in org_bot.log.":"",pr.length?"warn":"");
+    }
+  }
+  T.era=att;return r;
+}
+async function pollT(){try{await pollT1();}finally{setTimeout(pollT,T.era?1500:3000);}}
+$("#invia").onclick=async()=>{
+  const at=T.canali.filter(c=>c.attivo);
+  if(!at.length)return alert("Spunta almeno un canale.");
+  if(LT.dirty&&!(await LT.salva(true)))return alert("La lista è stata cambiata altrove: salvala (o ricaricala) e riprova.");
+  if(!confirm("Inviare "+T.link+" link e "+T.testi+" messaggi a:\n"+at.map(c=>"• "+c.nome).join("\n")+"\n\nProcedo?"))return;
+  const r=await api("/api/tg/invia",{});
+  if(r.errore)LT.say("⚠ "+r.errore,"err");else pollT1();
+};
+$("#ferma").onclick=async()=>{await api("/api/tg/ferma",{});pollT1();};
+async function canaliOp(url,body,attesa){
+  LT.say(attesa,"info");const r=await api(url,body);
+  if(r.errore&&r.aggiunti===undefined)return LT.say("⚠ "+r.errore,"err");
+  const pr=[];if(r.errori&&r.errori.length)pr.push(r.errori.join("; "));if(r.scartati&&r.scartati.length)pr.push("non riconosciuti: "+r.scartati.join(", "));
+  LT.say(r.aggiunti+" canali aggiornati"+(pr.length?" · "+pr.join(" · "):"."),pr.length?"warn":"ok");T.sig="";pollT1();
+}
+$("#agg").onclick=()=>{const t=prompt("Incolla ID (-100…), @username o link t.me (separati da spazio o virgola).\nIl bot deve essere nel canale/gruppo:");if(t)canaliOp("/api/tg/aggiungi",{testo:t},"Cerco i nomi…");};
+$("#nomi").onclick=()=>canaliOp("/api/tg/nomi",{},"Aggiorno i nomi…");
+
+/* ---------- schede, avvio, salvataggio automatico ---------- */
+for(const k of ["p","t"])$("#n-"+k).onclick=()=>{
+  for(const j of ["p","t"]){$("#n-"+j).classList.toggle("sel",j===k);$("#s-"+j).classList.toggle("sel",j===k);}
+};
+setInterval(()=>{LP.salva(true);LT.salva(true);},30000);
+setInterval(bots,3000);
+editorP(false);
+api("/api/bots/start",{}).then(bots);   // aprire l'app accende i bot che non girano
+pollP();pollT();
+</script>
+</body>
+</html>
