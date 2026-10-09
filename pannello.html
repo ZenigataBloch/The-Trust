@@ -343,7 +343,13 @@ $("#ck-ap").onclick=async()=>{
   ckStato();
 };
 /* ---------- git pull ---------- */
-function gitMsg(t,c){const m=$("#gitmsg");m.hidden=!t;m.textContent=t;m.className="msg "+(c||"");}
+let gitT=null;
+function gitMsg(t,c,ms){   // ms: dopo quanto il riquadro si chiude da solo (senza ms resta)
+  clearTimeout(gitT);
+  const m=$("#gitmsg");m.hidden=!t;m.textContent=t;m.className="msg "+(c||"");
+  if(t&&ms)gitT=setTimeout(()=>{m.hidden=true;},ms);
+}
+$("#gitmsg").onclick=()=>gitMsg("");   // un tocco lo chiude
 async function attendiServer(){
   gitMsg("Riavvio in corso…","info");
   await new Promise(r=>setTimeout(r,3000));
@@ -353,21 +359,23 @@ async function attendiServer(){
 $("#git").onclick=async()=>{
   const b=$("#git");b.disabled=true;gitMsg("Scarico gli aggiornamenti da GitHub…","info");
   const r=await api("/api/git/pull",{});b.disabled=false;
-  if(r.errore){gitMsg("⚠ "+r.errore,"err");return;}
-  if(!r.ok){gitMsg("⚠ git pull non riuscito:\n"+r.output,"err");return;}
-  if(!r.cambiati.length){gitMsg("Già aggiornato.","ok");setTimeout(()=>gitMsg(""),4000);return;}
-  const elenco=r.cambiati.slice(0,6).join(", ")+(r.cambiati.length>6?"…":"");
+  if(r._s===404||r._s===403)return gitMsg("⚠ Il server è una versione vecchia e non conosce l'aggiornamento: riavvialo da Termux (pkill -f pannello.py, poi python pannello.py).","err",12000);
+  if(r.errore)return gitMsg("⚠ "+r.errore,"err",8000);
+  if(r.ok!==true)return gitMsg("⚠ git pull non riuscito"+(r.output?":\n"+r.output:"."),"err",10000);
+  const cambiati=r.cambiati||[];
+  if(!cambiati.length)return gitMsg("Nessun aggiornamento!","ok",3000);
+  const elenco=cambiati.slice(0,6).join(", ")+(cambiati.length>6?"…":"");
   const cosa=[r.server&&"il pannello",r.bot&&"i bot"].filter(Boolean).join(" e ");
   if(!cosa){
-    gitMsg("Aggiornati "+r.cambiati.length+" file: "+elenco,"ok");
-    if(r.cambiati.some(x=>x.endsWith("pannello.html")))setTimeout(()=>location.reload(),1200);
+    gitMsg("Aggiornati "+cambiati.length+" file: "+elenco,"ok",5000);
+    if(cambiati.some(x=>x.endsWith("pannello.html")))setTimeout(()=>location.reload(),1200);
     return;
   }
-  gitMsg("Scaricati "+r.cambiati.length+" file: "+elenco,"ok");
-  if(!confirm("Aggiornamento scaricato.\nRiavvio "+cosa+" per applicarlo?"))return gitMsg("Aggiornati "+r.cambiati.length+" file. Riavvia "+cosa+" per applicarli.","warn");
+  gitMsg("Scaricati "+cambiati.length+" file: "+elenco,"ok");
+  if(!confirm("Aggiornamento scaricato.\nRiavvio "+cosa+" per applicarlo?"))return gitMsg("Aggiornati "+cambiati.length+" file. Riavvia "+cosa+" per applicarli.","warn",8000);
   const q=await api("/api/git/riavvia",{server:r.server,bot:r.bot});
-  if(q.errore)return gitMsg("⚠ "+q.errore,"err");
-  if(r.server)attendiServer();else gitMsg("Bot riavviati.","ok");
+  if(q.errore)return gitMsg("⚠ "+q.errore,"err",8000);
+  if(r.server)attendiServer();else gitMsg("Bot riavviati.","ok",4000);
 };
 /* ---------- log ---------- */
 const G={file:""};
