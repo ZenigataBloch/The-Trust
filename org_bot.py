@@ -1137,7 +1137,7 @@ class PannelloProgresso:
     def mostra(self, fatti: int, tot: int, t_inizio: float, occupato: bool,
                testo: str = "", scadenza: Optional[float] = None):
         if not self._visibile:
-            self.frame.pack(fill="x", pady=(4, 0), before=self._prima)
+            self.frame.pack(side="bottom", fill="x", pady=(4, 0), before=self._prima)
             self._visibile = True
         self.barra.config(maximum=max(1, tot))
         self.barra["value"] = min(fatti, tot)
@@ -1198,12 +1198,13 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
     dx.pack(side="left", fill="both", expand=True, padx=(4, 10), pady=10)
     info = tk.Label(dx, text="", anchor="w", font=("Segoe UI", 10, "bold"))
     info.pack(fill="x")
-    tk.Label(dx, anchor="w", justify="left", fg=T.MUTED,
+    hint = tk.Label(dx, anchor="w", justify="left", fg=T.MUTED,
              text="Lista condivisa: va a tutti i canali spuntati. Un link per riga; più link sulla stessa "
                   "riga = un solo invio (album).\nLe righe che iniziano con > sono messaggi di testo; # = commento. "
                   "Con «Invia ora» le righe partite spariscono da qui."
                   + (f" Salvataggio automatico ogni {AUTOSAVE_SEC:g} s." if AUTOSAVE_SEC else "")
-             ).pack(fill="x", pady=(0, 4))
+             )
+    hint.pack(fill="x", pady=(0, 4))
     cornice = tk.Frame(dx)
     cornice.pack(fill="both", expand=True)
     barra = tk.Scrollbar(cornice)
@@ -1214,8 +1215,14 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
     msg = tk.Label(dx, text="", anchor="w", justify="left", fg=T.OK, wraplength=620)
     msg.pack(fill="x", pady=(4, 0))
     bt_dx = tk.Frame(dx)
-    bt_dx.pack(fill="x", pady=(4, 0))
-    pannello = PannelloProgresso(dx, bt_dx, tk, ttk)
+    # pulsanti e messaggi fissi in basso: restringendo la finestra si accorcia il testo, non spariscono i pulsanti
+    cornice.pack_forget()
+    msg.pack_forget()
+    bt_dx.pack(side="bottom", fill="x", pady=(4, 0))
+    msg.pack(side="bottom", fill="x", pady=(4, 0))
+    cornice.pack(fill="both", expand=True)
+    pannello = PannelloProgresso(dx, cornice, tk, ttk)
+    dx.bind("<Configure>", lambda e: [x.config(wraplength=max(200, e.width - 20)) for x in (hint, msg)], add="+")
 
     def dirty() -> bool:
         return testo.edit_modified()
@@ -1557,6 +1564,10 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
     for txt, cmd in (("Incolla dagli appunti", incolla), ("Incolla in 1 riga", lambda: incolla(True)),
                      ("Salva", salva), ("Apri cartella", apri_cartella)):
         tk.Button(riga1, text=txt, command=cmd).pack(side="left", padx=(0, 4))
+    ico_log = icona_log(tk)
+    bt_log = tk.Button(riga2, image=ico_log, command=lambda: apri_log(root, tk, ttk, "telegram"))
+    bt_log.image = ico_log                     # senza riferimento Tk perde l'immagine
+    bt_log.pack(side="right", padx=(8, 0))
     bt_invia = tk.Button(riga2, text="Invia ora", command=invia, font=("Segoe UI", 9, "bold"))
     bt_invia.pack(side="right")
     bt_ferma = tk.Button(riga2, text="Ferma", command=ferma, state="disabled")
@@ -1599,10 +1610,10 @@ def ricorda_head_avvio():
 
 
 def git_pull() -> dict:
-    """git pull --ff-only. Ritorna {ok, output} se fallisce, altrimenti {ok, cambiati, gui, bot}.
-    I file cambiati si contano dal commit di apertura della GUI: se l'aggiornamento automatico ha già
-    scaricato qualcosa, il codice in esecuzione è comunque vecchio e il riavvio viene proposto."""
-    global _HEAD_AVVIO
+    """git pull --ff-only. Se fallisce {ok: False, output}; altrimenti
+    {ok, cambiati (file scaricati ora), gui (il codice della GUI in esecuzione è vecchio), bot (da riavviare)}.
+    «gui» si valuta dal commit con cui la GUI è partita: se l'aggiornamento automatico aveva già scaricato
+    qualcosa, il riavvio resta consigliato finché non riavvii davvero."""
     import subprocess
     try:
         c, _o = _git("rev-parse", "--is-inside-work-tree")
@@ -1613,19 +1624,22 @@ def git_pull() -> dict:
         if c:
             return {"ok": False, "output": out[-500:]}
         _c, dopo = _git("rev-parse", "HEAD")
-        base = _HEAD_AVVIO or prima
-        cambiati = []
-        if dopo != base:
-            _c, d = _git("diff", "--name-only", base, dopo)
-            cambiati = d.splitlines()
-        _HEAD_AVVIO = dopo
+
+        def file_tra(da, a):
+            if not da or da == a:
+                return []
+            _c, d = _git("diff", "--name-only", da, a)
+            return d.splitlines()
+        ora = file_tra(prima, dopo)
+        da_avvio = file_tra(_HEAD_AVVIO or prima, dopo)
     except FileNotFoundError:
         return {"ok": False, "output": "git non è installato."}
     except subprocess.TimeoutExpired:
         return {"ok": False, "output": "Timeout: GitHub non risponde (rete?)."}
-    nomi = {os.path.basename(x) for x in cambiati}
-    _log_gui(f"git pull: {len(cambiati)} file cambiati")
-    return {"ok": True, "cambiati": cambiati, "gui": bool(nomi & FILE_GUI), "bot": bool(nomi & FILE_BOT)}
+    nomi_ora = {os.path.basename(x) for x in ora}
+    nomi_avvio = {os.path.basename(x) for x in da_avvio}
+    _log_gui(f"git pull: {len(ora)} file cambiati")
+    return {"ok": True, "cambiati": ora, "gui": bool(nomi_avvio & FILE_GUI), "bot": bool(nomi_ora & FILE_BOT)}
 
 
 def riavvia_processo():
@@ -1635,6 +1649,325 @@ def riavvia_processo():
         subprocess.Popen([sys.executable] + sys.argv, cwd=BM.BASE)     # su Windows execv non è affidabile
     else:
         os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# ---------------------------------------------------------------- finestra: dimensioni salvate e scala
+FINESTRA_FILE = BASE / "finestra.json"
+FINESTRA_BASE = (980, 600)          # dimensioni a cui i font hanno la misura «normale» (scala 1.0)
+FINESTRA_MIN = (820, 510)
+SCALA = {"k": 1.0}                  # fattore di scala corrente (lo aggiorna installa_scala)
+_GEOM_RE = re.compile(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$")
+
+
+def scala_font(f, k: float):
+    """Font Tk (tupla, nome o Font) -> tupla con la dimensione moltiplicata per k."""
+    try:
+        if isinstance(f, (tuple, list)):
+            fam, size, *stile = f
+            return (fam, max(6, int(round(abs(int(size)) * k))), *stile)
+        from tkinter import font as tkfont
+        a = tkfont.Font(font=f).actual()
+        stile = [n for n, v in (("bold", a["weight"] == "bold"), ("italic", a["slant"] == "italic")) if v]
+        return (a["family"], max(6, int(round(abs(a["size"]) * k))), *stile)
+    except Exception:
+        return f
+
+
+def finestra_massimizzata(root) -> bool:
+    try:
+        if root.state() == "zoomed":
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(root.attributes("-zoomed"))        # X11/Linux
+    except Exception:
+        return False
+
+
+def massimizza(root):
+    try:
+        root.state("zoomed")
+    except Exception:
+        try:
+            root.attributes("-zoomed", True)
+        except Exception:
+            pass
+
+
+def applica_geometria_salvata(root) -> bool:
+    """Imposta la geometria dell'ultima chiusura (se ancora sensata per lo schermo). True = era massimizzata."""
+    w, h = FINESTRA_BASE
+    pos, zoom = "", False
+    try:
+        d = json.loads(FINESTRA_FILE.read_text(encoding="utf-8"))
+        zoom = bool(d.get("massimizzata"))
+        m = _GEOM_RE.match(str(d.get("geometry", "")))
+        if m:
+            sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+            w = max(FINESTRA_MIN[0], min(int(m[1]), sw))
+            h = max(FINESTRA_MIN[1], min(int(m[2]), sh))
+            x, y = int(m[3].replace("+", "")), int(m[4].replace("+", ""))     # Tk scrive «+-7» per i negativi
+            if -sw <= x <= 2 * sw - 100 and -50 <= y <= sh - 100:      # non fuori schermo (tollero un secondo monitor)
+                pos = f"+{x}+{y}"
+    except (OSError, ValueError, TypeError):
+        pass
+    root.geometry(f"{w}x{h}{pos}")
+    return zoom
+
+
+def salva_finestra(root):
+    try:
+        if root.state() == "iconic":
+            return
+        try:
+            d = json.loads(FINESTRA_FILE.read_text(encoding="utf-8"))
+            d = d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            d = {}
+        zoom = finestra_massimizzata(root)
+        if not zoom:
+            d["geometry"] = root.geometry()
+        d["massimizzata"] = zoom
+        scrivi_atomico(FINESTRA_FILE, json.dumps(d))
+    except Exception as e:
+        _log_gui(f"salvataggio finestra: errore {e!r}")
+
+
+def installa_scala(root, tk, ttk, dopo=None, k_min=0.85, k_max=1.8):
+    """Ridimensionando la finestra scala i font di tutti i widget (pulsanti, testi, etichette, schede) in
+    proporzione, così niente resta tagliato né minuscolo. I widget disegnati da branch_tema.py (liste con
+    avatar, banner) tengono le loro misure. `dopo` viene chiamata quando il fattore cambia."""
+    from tkinter import font as tkfont
+    memo = {}                   # path widget -> {"base": (famiglia, size, stile), "k": ..., "applicato": ...}
+    stile_ttk = ttk.Style()
+    tab_base = [None]
+    job = {"j": None}
+
+    def specifica(font):
+        a = tkfont.Font(root=root, font=font).actual()
+        st = [n for n, v in (("bold", a["weight"] == "bold"), ("italic", a["slant"] == "italic"),
+                             ("underline", a["underline"]), ("overstrike", a["overstrike"])) if v]
+        return a["family"], abs(a["size"]) or 9, st
+
+    def applica(k):
+        if k == 1.0 and not memo:
+            return                                          # ancora tutto alla misura base
+        visti = set()
+
+        def visita(w):
+            for c in w.winfo_children():
+                try:
+                    cfg = str(c.cget("font"))
+                except (tk.TclError, AttributeError):
+                    cfg = ""
+                if cfg:
+                    chiave = str(c)
+                    visti.add(chiave)
+                    m = memo.get(chiave)
+                    if m is None or cfg != m["applicato"]:   # widget nuovo o con un font cambiato dal codice
+                        try:
+                            m = memo[chiave] = {"base": specifica(cfg), "k": None, "applicato": None}
+                        except tk.TclError:
+                            m = None
+                    if m is not None and m["k"] != k:
+                        fam, size, st = m["base"]
+                        try:
+                            c.configure(font=(fam, max(6, int(round(size * k))), *st))
+                            m["applicato"], m["k"] = str(c.cget("font")), k
+                        except tk.TclError:
+                            pass
+                visita(c)
+        visita(root)
+        for ch in [x for x in memo if x not in visti]:
+            del memo[ch]
+        try:
+            if tab_base[0] is None:
+                tab_base[0] = specifica(stile_ttk.lookup("TNotebook.Tab", "font") or "TkDefaultFont")
+            fam, size, st = tab_base[0]
+            stile_ttk.configure("TNotebook.Tab", font=(fam, max(6, int(round(size * k))), *st))
+        except tk.TclError:
+            pass
+
+    def ricalcola():
+        job["j"] = None
+        w, h = root.winfo_width(), root.winfo_height()
+        k = SCALA["k"]
+        if w > 100 and h > 100:
+            k = round(max(k_min, min(k_max, min(w / FINESTRA_BASE[0], h / FINESTRA_BASE[1]))) * 20) / 20
+        cambiato = k != SCALA["k"]
+        SCALA["k"] = k
+        applica(k)
+        if cambiato and dopo:
+            dopo()
+
+    def su_configure(e):
+        if e.widget is not root:
+            return
+        if job["j"]:
+            root.after_cancel(job["j"])
+        job["j"] = root.after(120, ricalcola)
+
+    def ciclo():                       # prende anche i widget creati dopo (finestre, barre di avanzamento)
+        try:
+            applica(SCALA["k"])
+        except Exception as e:
+            _log_gui(f"scala: errore {e!r}")
+        root.after(2000, ciclo)
+
+    root.bind("<Configure>", su_configure, add="+")
+    root.after(150, ricalcola)
+    root.after(2000, ciclo)
+
+
+# ---------------------------------------------------------------- log: icona e finestra di lettura
+def icona_log(tk):
+    """Icona «documento con righe» 14x18 disegnata a pixel (nessun file immagine da portarsi dietro)."""
+    colore = getattr(T, "FG", "#e8e8e8")
+    w, h = 14, 18
+    img = tk.PhotoImage(width=w, height=h)
+
+    def r(x0, y0, x1, y1):
+        img.put(colore, to=(x0, y0, x1, y1))
+    r(0, 0, 9, 1)
+    r(0, 0, 1, h)
+    r(0, h - 1, w, h)
+    r(w - 1, 4, w, h)                          # contorno
+    for i in range(5):
+        r(9 + i, i, 10 + i, i + 1)            # angolo tagliato
+    r(9, 0, 10, 5)
+    r(9, 4, w, 5)                             # piega
+    for y in (8, 11, 14):
+        r(3, y, w - 3, y + 1)                 # righe di testo
+    return img
+
+
+_LOG_APERTI: dict = {}
+_LOG_RE = re.compile(r"[\w.\-]+\.log(\.\d+)?")
+_LOG_ERR = re.compile(r"errore|error|traceback|exception|fallit", re.IGNORECASE)
+LOG_TAIL = 200 * 1024                          # leggo solo la coda: i log ruotano a 2 MB
+
+
+def apri_log(root, tk, ttk, tab: str):
+    """Finestra di sola lettura con i log della scheda: «discord» o «telegram». Si aggiorna da sola."""
+    esistente = _LOG_APERTI.get(tab)
+    if esistente is not None and esistente.winfo_exists():
+        esistente.deiconify()
+        esistente.lift()
+        return
+    nome_tab = "Discord" if tab == "discord" else "Telegram"
+    preferiti = ["discord_bot.log", "org_bot.log"] if tab == "discord" else ["telegram_bot.log", "org_bot.log"]
+    cron_dir = INVII_DIR if tab == "discord" else TG_DIR
+
+    def mt(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def elenco() -> dict:
+        try:
+            logs = [p for p in BM.BASE.iterdir() if p.is_file() and _LOG_RE.fullmatch(p.name)]
+        except OSError:
+            logs = []
+        logs.sort(key=lambda p: (p.name not in preferiti, preferiti.index(p.name) if p.name in preferiti else 0,
+                                 -mt(p)))
+        voci = {p.name: p for p in logs}
+        try:
+            cron = sorted(cron_dir.glob("*.inviati.log"), key=lambda p: -mt(p))
+        except OSError:
+            cron = []
+        for p in cron:
+            voci[f"{cron_dir.name}/{p.name}"] = p
+        return voci
+
+    voci = elenco()
+    w = tk.Toplevel(root)
+    w.title(f"Log · {nome_tab}")
+    w.geometry("860x500")
+    w.minsize(520, 300)
+    _LOG_APERTI[tab] = w
+    alto = tk.Frame(w)
+    alto.pack(fill="x", padx=8, pady=(8, 4))
+    combo = ttk.Combobox(alto, state="readonly", width=38, values=list(voci))
+    combo.pack(side="left")
+    if voci:
+        combo.current(0)
+    segui = tk.BooleanVar(value=True)
+    tk.Checkbutton(alto, text="Segui in fondo", variable=segui).pack(side="left", padx=10)
+    info = tk.Label(alto, text="", fg=T.MUTED, anchor="e")
+    info.pack(side="right")
+    corpo = tk.Frame(w)
+    corpo.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    sb = tk.Scrollbar(corpo)
+    sb.pack(side="right", fill="y")
+    txt = tk.Text(corpo, wrap="word", font=("Consolas", 9), state="disabled", yscrollcommand=sb.set,
+                  bg=T.INPUT, fg=T.FG)
+    txt.pack(side="left", fill="both", expand=True)
+    sb.config(command=txt.yview)
+    txt.tag_config("err", foreground=T.ERR)
+    visto = {"firma": None}
+
+    def carica(forza=False):
+        nonlocal voci
+        p = voci.get(combo.get())
+        if p is None:
+            voci = elenco()
+            combo.config(values=list(voci))
+            info.config(text="Nessun file di log trovato" if not voci else "")
+            return
+        try:
+            stt = p.stat()
+            firma = (p.name, stt.st_size, stt.st_mtime_ns)
+        except OSError:
+            info.config(text="file non leggibile (ancora non creato?)")
+            return
+        if firma == visto["firma"] and not forza:
+            return
+        visto["firma"] = firma
+        try:
+            with open(p, "rb") as f:
+                f.seek(max(0, stt.st_size - LOG_TAIL))
+                dati = f.read()
+        except OSError as e:
+            info.config(text=f"errore di lettura: {e}")
+            return
+        testo = dati.decode("utf-8", errors="replace")
+        if stt.st_size > LOG_TAIL and "\n" in testo:
+            testo = testo.split("\n", 1)[1]                  # scarto la prima riga, tagliata a metà
+        pos = txt.yview()[0]
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        txt.insert("1.0", testo)
+        for i, riga in enumerate(testo.split("\n"), 1):
+            if _LOG_ERR.search(riga):
+                txt.tag_add("err", f"{i}.0", f"{i}.end")
+        txt.config(state="disabled")
+        if segui.get():
+            txt.see("end")
+        else:
+            txt.yview_moveto(pos)
+        info.config(text=f"{stt.st_size / 1024:.0f} KB · {time.strftime('%H:%M:%S', time.localtime(stt.st_mtime))}"
+                         + (f" · ultimi {LOG_TAIL // 1024} KB" if stt.st_size > LOG_TAIL else ""))
+
+    def ciclo():
+        if not w.winfo_exists():
+            return
+        try:
+            carica()
+        except Exception as e:
+            _log_gui(f"log: errore {e!r}")
+        w.after(2000, ciclo)
+
+    def chiudi_log():
+        _LOG_APERTI.pop(tab, None)
+        w.destroy()
+
+    tk.Button(alto, text="Aggiorna", command=lambda: carica(True)).pack(side="right", padx=6)
+    combo.bind("<<ComboboxSelected>>", lambda e: carica(True))
+    w.protocol("WM_DELETE_WINDOW", chiudi_log)
+    carica(True)
+    w.after(2000, ciclo)
 
 
 def crea_barra_bot(root, tk):
@@ -1647,12 +1980,15 @@ def crea_barra_bot(root, tk):
     barra.pack(fill="x")
     bt_git = tk.Button(barra, text="⟳ Aggiorna da GitHub")
     bt_git.pack(side="right", padx=(0, 10))
+    lbl_git = tk.Label(barra, text="", bg=T.BG, fg=T.MUTED, anchor="e")
+    lbl_git.pack(side="right", padx=(0, 8))
+    bt_riavvia = tk.Button(barra, text="↻ Riavvia per applicare")      # compare solo se serve
     cv = tk.Canvas(barra, height=34, bg=T.BG, highlightthickness=0, cursor="hand2")
     cv.pack(side="left", fill="x", expand=True, padx=10)
     ultimo = {"firma": None, "stato": {}, "occupato": False, "msg": ""}
 
     def disegna(stato: dict, occupato: bool, msg: str):
-        firma = (tuple(sorted(stato.items())), occupato, msg, cv.winfo_width())
+        firma = (tuple(sorted(stato.items())), occupato, msg, cv.winfo_width(), SCALA["k"])
         if firma == ultimo["firma"]:
             return
         ultimo["firma"] = firma
@@ -1665,21 +2001,26 @@ def crea_barra_bot(root, tk):
             colore, titolo = T.ERR, "BOT SPENTI"
         else:
             colore, titolo = T.WARN, "BOT PARZIALI"
+        k = SCALA["k"]
+        cv.config(height=max(34, int(34 * k)))
         cv.delete("all")
-        cy = 17
-        cv.create_oval(6, cy - 11, 28, cy + 11, fill=T.BG, outline=colore, width=1)     # alone
-        cv.create_oval(10, cy - 7, 24, cy + 7, fill=colore, outline="")                 # led
-        cv.create_text(40, cy, text=titolo, anchor="w", fill=colore, font=T.F_NOME)
-        x = 40 + 9 * len(titolo) + 24
+        cy = int(17 * k)
+        r1, r2 = int(11 * k), int(7 * k)
+        cv.create_oval(6, cy - r1, 6 + 2 * r1, cy + r1, fill=T.BG, outline=colore, width=1)         # alone
+        cv.create_oval(6 + r1 - r2, cy - r2, 6 + r1 + r2, cy + r2, fill=colore, outline="")         # led
+        f_nome, f_piccolo = scala_font(T.F_NOME, k), scala_font(T.F_PICCOLO, k)
+        t = cv.create_text(6 + 2 * r1 + int(12 * k), cy, text=titolo, anchor="w", fill=colore, font=f_nome)
+        x = cv.bbox(t)[2] + int(24 * k)
         for nome, (etichetta, _s, _v) in BM.MODULI.items():
             on = stato.get(nome, False)
-            cv.create_oval(x, cy - 4, x + 8, cy + 4, fill=T.OK if on else T.ROSSO_SCURO, outline="")
-            cv.create_text(x + 14, cy, text=etichetta, anchor="w", fill=T.FG if on else T.MUTED,
-                           font=T.F_PICCOLO)
-            x += 14 + 7 * len(etichetta) + 18
+            d = max(3, int(4 * k))
+            cv.create_oval(x, cy - d, x + 2 * d, cy + d, fill=T.OK if on else T.ROSSO_SCURO, outline="")
+            t = cv.create_text(x + 2 * d + int(6 * k), cy, text=etichetta, anchor="w",
+                               fill=T.FG if on else T.MUTED, font=f_piccolo)
+            x = cv.bbox(t)[2] + int(18 * k)
         errori = [f"{BM.MODULI[n][0]}: {e}" for n, e in gestore.errori.items()]
         cv.create_text(max(cv.winfo_width() - 8, x), cy, anchor="e", fill=T.ERR if errori else T.MUTED,
-                       font=T.F_PICCOLO,
+                       font=f_piccolo,
                        text=("  ·  ".join(errori) if errori else "clic sul led per accendere/spegnere i bot"))
 
     def aggiorna():
@@ -1714,8 +2055,8 @@ def crea_barra_bot(root, tk):
             in_thread(gestore.avvia_mancanti, "AVVIO…")
 
     # ---- pulsante «Aggiorna da GitHub»
-    from tkinter import messagebox
     esiti = queue.SimpleQueue()
+    stato_git = {"job": None}
     hook = {"riavvia": None}          # lo imposta avvia_gui: salva le liste, controlla gli invii, riavvia
 
     def lavoro_git():
@@ -1735,27 +2076,43 @@ def crea_barra_bot(root, tk):
             gestore.ferma_tutti()
             gestore.avvia_mancanti()
 
+    def mostra_git(testo, colore, ms=None):
+        """Scritta a lato del pulsante (niente popup); sparisce da sola dopo `ms` millisecondi."""
+        lbl_git.config(text=testo, fg=colore)
+        if stato_git["job"]:
+            root.after_cancel(stato_git["job"])
+            stato_git["job"] = None
+        if ms:
+            stato_git["job"] = root.after(ms, lambda: lbl_git.config(text=""))
+
+    def riavvia_ora():
+        if hook["riavvia"]:
+            hook["riavvia"]()
+
     def esito_git(r):
         if gestore.occupato:                       # il thread del pull non ha ancora finito
             root.after(200, lambda: esito_git(r))
             return
         bt_git.config(state="normal")
         if not r["ok"]:
-            messagebox.showwarning("Aggiornamento", r.get("output") or "git pull non riuscito.")
+            out = r.get("output") or "git pull non riuscito"
+            _log_gui("aggiornamento da GitHub: " + out)
+            riga = next((x for x in out.splitlines() if x.strip()), out)
+            mostra_git("⚠ Aggiornamento non riuscito: " + riga[:70], T.ERR, 20000)
             return
-        if not r["cambiati"]:
-            messagebox.showinfo("Aggiornamento", "Già all'ultima versione.")
-            return
-        testo = f"Aggiornati {len(r['cambiati'])} file."
+        nomi = sorted({os.path.basename(x) for x in r["cambiati"]})
+        elenco = ", ".join(nomi[:3]) + (f" +{len(nomi) - 3}" if len(nomi) > 3 else "")
         if r["bot"]:
             in_thread(riavvia_bot, "RIAVVIO BOT…")
-            testo += "\nI bot vengono riavviati con il codice nuovo."
-        if r["gui"] and hook["riavvia"]:
-            if messagebox.askyesno("Aggiornamento", testo + "\n\nPer applicare le modifiche a Branch serve "
-                                   "riavviarlo.\nRiavviare ora?"):
-                hook["riavvia"]()
+        if r["gui"]:                               # il codice della GUI in esecuzione è vecchio
+            bt_riavvia.pack(side="right", padx=(0, 6), before=lbl_git)
+            mostra_git((f"✓ Aggiornati {len(r['cambiati'])} file ({elenco}) · " if nomi else
+                        "Aggiornamenti già scaricati · ") + "riavvia per applicarli", T.WARN)
+        elif nomi:
+            mostra_git(f"✓ Aggiornati {len(nomi)} file: {elenco}" + (" · bot riavviati" if r["bot"] else ""),
+                       T.OK, 15000)
         else:
-            messagebox.showinfo("Aggiornamento", testo)
+            mostra_git("✓ Già all'ultima versione", T.MUTED, 6000)
 
     def poll_esiti():
         try:
@@ -1771,6 +2128,7 @@ def crea_barra_bot(root, tk):
         root.after(300, poll_esiti)
 
     bt_git.config(command=aggiorna_ora)
+    bt_riavvia.config(command=riavvia_ora)
     root.after(300, poll_esiti)
 
     cv.bind("<Button-1>", clic)
@@ -1790,7 +2148,11 @@ def crea_barra_bot(root, tk):
         root.after(30 * 60 * 1000, controllo_periodico)
     root.after(30 * 60 * 1000, controllo_periodico)
     root.after(1500, aggiorna)
-    return {"gestore": gestore, "clic": clic, "imposta_riavvio": lambda f: hook.update(riavvia=f)}
+    def ridisegna():
+        ultimo["firma"] = None
+        disegna(gestore.stato(), gestore.occupato, ultimo["msg"])
+    return {"gestore": gestore, "clic": clic, "imposta_riavvio": lambda f: hook.update(riavvia=f),
+            "ridisegna": ridisegna}
 
 
 def avvia_gui():
@@ -1802,8 +2164,9 @@ def avvia_gui():
     root = tk.Tk()
     T.init(root)
     root.title("Branch")
-    root.geometry("980x600")
-    root.minsize(920, 480)
+    root.minsize(*FINESTRA_MIN)
+    if applica_geometria_salvata(root):         # com'era all'ultima chiusura (dimensione, posizione, massimizzata)
+        root.after(50, lambda: massimizza(root))
 
     if hasattr(T, "Banner"):
         T.Banner(root).pack(fill="x")          # illustrazione scurita + logo + nome
@@ -1829,21 +2192,22 @@ def avvia_gui():
     sx.pack(side="left", fill="y", padx=(10, 4), pady=10)
     tk.Label(sx, text="Persone", font=T.F_TITOLO).pack(anchor="w")
     AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+    bt_sx = tk.Frame(sx)
+    bt_sx.pack(side="bottom", fill="x")
     lista = T.ListaAvatar(sx, avatar_persona, width=250)
     lista.pack(fill="y", expand=True, pady=4)
-    bt_sx = tk.Frame(sx)
-    bt_sx.pack(fill="x")
 
     # ---- colonna destra: lista della persona ----
     dx = tk.Frame(scheda_dc)
     dx.pack(side="left", fill="both", expand=True, padx=(4, 10), pady=10)
     info = tk.Label(dx, text="", anchor="w", font=("Segoe UI", 10, "bold"))
     info.pack(fill="x")
-    tk.Label(dx, anchor="w", justify="left", fg=T.MUTED,
+    hint = tk.Label(dx, anchor="w", justify="left", fg=T.MUTED,
              text="Un link per riga. Più link sulla stessa riga (separati da spazio) = un solo messaggio.\n"
                   "Le righe che iniziano con > sono messaggi di testo, quelle con # sono commenti.\n"
                   "Con /invia le righe partite spariscono da qui."
-                  + (f" Salvataggio automatico ogni {AUTOSAVE_SEC:g} s." if AUTOSAVE_SEC else "")).pack(fill="x", pady=(0, 4))
+                  + (f" Salvataggio automatico ogni {AUTOSAVE_SEC:g} s." if AUTOSAVE_SEC else ""))
+    hint.pack(fill="x", pady=(0, 4))
     cornice = tk.Frame(dx)
     cornice.pack(fill="both", expand=True)
     barra = tk.Scrollbar(cornice)
@@ -1856,8 +2220,14 @@ def avvia_gui():
     msg = tk.Label(dx, text="", anchor="w", fg=T.OK)
     msg.pack(fill="x", pady=(4, 0))
     bt_dx = tk.Frame(dx)
-    bt_dx.pack(fill="x", pady=(4, 0))
-    pannello = PannelloProgresso(dx, bt_dx, tk, ttk)
+    # pulsanti e messaggi fissi in basso: restringendo la finestra si accorcia il testo, non spariscono i pulsanti
+    cornice.pack_forget()
+    msg.pack_forget()
+    bt_dx.pack(side="bottom", fill="x", pady=(4, 0))
+    msg.pack(side="bottom", fill="x", pady=(4, 0))
+    cornice.pack(fill="both", expand=True)
+    pannello = PannelloProgresso(dx, cornice, tk, ttk)
+    dx.bind("<Configure>", lambda e: [x.config(wraplength=max(200, e.width - 20)) for x in (hint, msg)], add="+")
 
     def dirty() -> bool:
         return st["nome"] is not None and testo.edit_modified()
@@ -2143,6 +2513,7 @@ def avvia_gui():
             GUI_VIVA.unlink()
         except OSError:
             pass
+        salva_finestra(root)
         return True
 
     def chiudi():
@@ -2186,10 +2557,24 @@ def avvia_gui():
         b.pack(side="left", padx=(0, 4))
         if cmd is not apri_cartella:
             bottoni_persona.append(b)
+    ico_log = icona_log(tk)
+    bt_log = tk.Button(bt_dx, image=ico_log, command=lambda: apri_log(root, tk, ttk, "discord"))
+    bt_log.image = ico_log
+    bt_log.pack(side="right")
 
     lista.bind("<<ListboxSelect>>", su_selezione)
     root.bind("<Control-s>", salva_scheda_attiva)
     root.protocol("WM_DELETE_WINDOW", chiudi)
+    salva_job = {"j": None}
+
+    def pianifica_salvataggio(e):               # anche durante l'uso, se il programma venisse chiuso male
+        if e.widget is not root:
+            return
+        if salva_job["j"]:
+            root.after_cancel(salva_job["j"])
+        salva_job["j"] = root.after(800, lambda: salva_finestra(root))
+    root.bind("<Configure>", pianifica_salvataggio, add="+")
+    installa_scala(root, tk, ttk, dopo=barra_bot["ridisegna"])
     riempi_lista(forza=True)
     aggiorna_editor()
     aggiorna_info()
