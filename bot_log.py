@@ -8,6 +8,7 @@ Con una console normale (o se stdout esiste già, ad esempio org_bot caricato da
 non fa niente.
 """
 import logging
+import os
 import sys
 import time
 from logging.handlers import RotatingFileHandler
@@ -47,7 +48,8 @@ class _FlussoSuLogger:
 
 
 def attiva_log_su_file(max_bytes: int = 2_000_000, copie: int = 2) -> None:
-    if sys.stdout is not None and sys.stderr is not None:
+    forzato = os.environ.get("BOT_LOG_FILE") == "1"   # lo imposta bot_manager: stdout è /dev/null (Linux/Android)
+    if sys.stdout is not None and sys.stderr is not None and not forzato:
         return
     percorso = Path(sys.argv[0] or __file__).resolve().with_suffix(".log")
     handler = RotatingFileHandler(percorso, maxBytes=max_bytes, backupCount=copie, encoding="utf-8")
@@ -55,10 +57,12 @@ def attiva_log_su_file(max_bytes: int = 2_000_000, copie: int = 2) -> None:
     logger = logging.getLogger(f"bot_file_log.{percorso.stem}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
+    if logger.handlers:      # già attivato (es. org_bot caricato da discord_bot)
+        return
     logger.addHandler(handler)
     logger.info(f"\n=== Avvio {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
     flusso = _FlussoSuLogger(logger)
-    if sys.stdout is None:
+    if sys.stdout is None or forzato:
         sys.stdout = flusso
-    if sys.stderr is None:
+    if sys.stderr is None or forzato:
         sys.stderr = flusso

@@ -83,6 +83,7 @@ def carica_env() -> dict:
         env.setdefault(k, v)          # il .bat riempie solo ciò che manca
     env.update(_leggi_env(ENV_FILE))  # bots.env ha sempre l'ultima parola
     env["PYTHONUTF8"] = "1"
+    env["BOT_LOG_FILE"] = "1"      # i bot scrivono su <script>.log (vedi bot_log.py)
     return env
 
 
