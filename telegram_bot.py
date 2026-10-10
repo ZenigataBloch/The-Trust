@@ -768,6 +768,33 @@ _tg_utente_lock = threading.Lock()
 _tg_utente_ultima = [0.0]
 
 
+def _tg_ricarica():
+    """Rilegge le impostazioni TG_*. Branch può essere avviato senza bots.env nel suo ambiente (i bot lo
+    ricevono da bot_manager, Branch no): se i valori non ci sono nell'ambiente li cerco nel file."""
+    global TG_API_ID, TG_API_HASH, TG_SESSION, TG_UTENTE_PAUSA, TG_UTENTE_MAX_GIORNO, TG_UTENTE_MAX_MB, TG_UTENTE_STATO
+    env = dict(os.environ)
+    try:
+        import bot_manager
+        env = bot_manager.carica_env()
+    except Exception:
+        pass
+
+    def num(nome, default):
+        try:
+            return max(0, int(float(env.get(nome, default))))
+        except ValueError:
+            return default
+
+    TG_API_ID = num("TG_API_ID", 0)
+    TG_API_HASH = (env.get("TG_API_HASH") or "").strip()
+    TG_SESSION = env.get("TG_SESSION") or str(Path(__file__).resolve().with_name("utente"))
+    TG_UTENTE_PAUSA = float(num("TG_UTENTE_PAUSA_SEC", 3))
+    TG_UTENTE_MAX_GIORNO = num("TG_UTENTE_MAX_GIORNO", 100)
+    TG_UTENTE_MAX_MB = num("TG_UTENTE_MAX_MB", 200)
+    TG_UTENTE_STATO = Path(env.get("TG_UTENTE_STATO_FILE")
+                           or Path(__file__).resolve().with_name("telegram_utente_uso.json"))
+
+
 def _is_telegram_private(url: str) -> bool:
     return bool(_TG_PRIV_RE.match(url.strip()))
 
@@ -802,6 +829,11 @@ async def _tg_utente_scarica(cid: int, mid: int, folder: str) -> list[Path]:
     try:
         if not await client.is_user_authorized():
             raise RuntimeError("sessione dell'account personale scaduta o assente: rilancia  python telegram_login.py")
+        me = await client.get_me()
+        if getattr(me, "bot", False):
+            raise RuntimeError("La sessione salvata è di un BOT, non del tuo account: cancella utente.session e "
+                               "rilancia  python telegram_login.py  inserendo il tuo NUMERO DI TELEFONO "
+                               "(non il token del bot).")
         try:
             try:
                 msg = await client.get_messages(peer, ids=mid)
@@ -838,9 +870,11 @@ async def _tg_utente_scarica(cid: int, mid: int, folder: str) -> list[Path]:
 def download_telegram_utente(url: str, folder: str) -> list[Path]:
     m = _TG_PRIV_RE.match(url.strip())
     cid, mid = int(m.group(1)), int(m.group(2))
-    if not (TG_API_ID and TG_API_HASH):
-        raise RuntimeError("Link di un canale privato: serve l'account personale. Metti TG_API_ID e TG_API_HASH "
-                           "in bots.env e lancia telegram_login.py una volta.")
+    _tg_ricarica()
+    mancano = [n for n, v in (("TG_API_ID", TG_API_ID), ("TG_API_HASH", TG_API_HASH)) if not v]
+    if mancano:
+        raise RuntimeError("Link di un canale privato: mancano " + " e ".join(mancano) + " in "
+                           f"{Path(__file__).resolve().with_name('bots.env')} (vedi telegram_login.py).")
     try:
         import telethon  # noqa: F401
     except ImportError:
