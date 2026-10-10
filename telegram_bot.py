@@ -1119,7 +1119,45 @@ async def rendi_riproducibile(path: Path) -> Path:
     return await asyncio.to_thread(_rendi_riproducibile, path)
 
 
-async def send_single(bot, chat_id, path: Path, **kw):
+def _id_file(msg) -> tuple[str, str] | None:
+    """(tipo, file_id) di un file appena inviato: serve a rimandarlo ad altri canali senza ricaricarlo."""
+    try:
+        if msg.animation:
+            return "animation", msg.animation.file_id
+        if msg.video:
+            return "video", msg.video.file_id
+        if msg.photo:
+            return "photo", msg.photo[-1].file_id
+        if msg.document:
+            return "document", msg.document.file_id
+    except Exception:
+        pass
+    return None
+
+
+async def _invia_per_id(bot, chat_id, tipo: str, file_id: str, **kw):
+    if tipo == "animation":
+        return await bot.send_animation(chat_id, file_id, **kw)
+    if tipo == "video":
+        return await bot.send_video(chat_id, file_id, supports_streaming=True, **kw)
+    if tipo == "photo":
+        return await bot.send_photo(chat_id, file_id, **kw)
+    return await bot.send_document(chat_id, file_id, **kw)
+
+
+async def send_single(bot, chat_id, path: Path, cache: dict | None = None, **kw):
+    """`cache` (facoltativa, dict condiviso tra i canali): il primo canale carica il file, gli altri lo
+    ricevono per file_id da Telegram, senza un nuovo upload (né ricompressione)."""
+    chiave = str(path)
+    if cache is not None and chiave in cache:
+        tipo, fid = cache[chiave]
+        try:
+            await _invia_per_id(bot, chat_id, tipo, fid, **kw)
+            log(f"    invio: {path.name} (già su Telegram, nessun nuovo upload)")
+            return
+        except Exception as e:
+            log(f"    riuso di {path.name} non riuscito ({e}): lo carico di nuovo")
+            cache.pop(chiave, None)
     ext, size = path.suffix.lower(), path.stat().st_size
     come_gif = ext in ANIM_EXT   # una GIF convertita in mp4 va mandata comunque come animazione
     if size > MAX_FILE:
@@ -1142,20 +1180,25 @@ async def send_single(bot, chat_id, path: Path, **kw):
     log(f"    invio: {path.name} ({mb(size)})")
     with open(path, "rb") as f:
         if come_gif or ext in ANIM_EXT:
-            await bot.send_animation(chat_id, f, **kw)
+            msg = await bot.send_animation(chat_id, f, **kw)
         elif ext in VIDEO_EXT:
-            await bot.send_video(chat_id, f, supports_streaming=True, **kw)
+            msg = await bot.send_video(chat_id, f, supports_streaming=True, **kw)
         elif ext in IMAGE_EXT and size <= MAX_PHOTO:
             try:
-                await bot.send_photo(chat_id, f, **kw)
+                msg = await bot.send_photo(chat_id, f, **kw)
             except Exception:
                 f.seek(0)
-                await bot.send_document(chat_id, f, **kw)
+                msg = await bot.send_document(chat_id, f, **kw)
         else:
-            await bot.send_document(chat_id, f, **kw)
+            msg = await bot.send_document(chat_id, f, **kw)
+    if cache is not None:
+        info = _id_file(msg)
+        if info:
+            cache[chiave] = info
 
 
-async def send_files(bot, chat_id, files: list[Path], **kw) -> list[str]:
+async def send_files(bot, chat_id, files: list[Path], cache: dict | None = None, **kw) -> list[str]:
+    """`cache` (facoltativa): vedi send_single. Chi la passa deve usare lo stesso dict per tutti i canali."""
     errors = []
     groupable, singles = [], []
 
@@ -1184,6 +1227,13 @@ async def send_files(bot, chat_id, files: list[Path], **kw) -> list[str]:
 
         try:
             for p in chunk:
+                nota = cache.get(str(p)) if cache is not None else None
+                if nota and nota[0] in ("video", "photo"):      # già caricato su Telegram: uso il suo file_id
+                    if nota[0] == "video":
+                        media.append(InputMediaVideo(media=nota[1], supports_streaming=True))
+                    else:
+                        media.append(InputMediaPhoto(media=nota[1]))
+                    continue
                 f = open(p, "rb")
                 handles.append(f)
 
@@ -1201,7 +1251,15 @@ async def send_files(bot, chat_id, files: list[Path], **kw) -> list[str]:
                         )
                     )
 
-            await bot.send_media_group(chat_id, media, **kw)
+            inviati = await bot.send_media_group(chat_id, media, **kw)
+            if cache is not None:
+                try:
+                    for p, m in zip(chunk, inviati):
+                        info = _id_file(m)
+                        if info and str(p) not in cache:
+                            cache[str(p)] = info
+                except Exception:
+                    pass
             await asyncio.sleep(0.3)
 
         except Exception as e:
@@ -1217,7 +1275,7 @@ async def send_files(bot, chat_id, files: list[Path], **kw) -> list[str]:
 
     for p in singles:
         try:
-            await send_single(bot, chat_id, p, **kw)
+            await send_single(bot, chat_id, p, cache=cache, **kw)
         except Exception as e:
             log(f"    ERRORE invio {p.name}: {e}")
             errors.append(f"{p.name}: {e}")

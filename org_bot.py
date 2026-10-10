@@ -529,6 +529,40 @@ async def _invia_testo(bot, chat_id: int, testo: str):
     raise RuntimeError("Telegram chiede di rallentare (troppi messaggi)")
 
 
+async def _prepara_link(url: str):
+    """Scarica un link e lo rende riproducibile. Si può lanciare in anticipo (mentre l'elemento precedente
+    viene inviato o sta in pausa). Restituisce (cartella temporanea, file): chi la riceve la deve chiudere."""
+    from telegram_bot import download, rendi_riproducibile
+    tmp = tempfile.TemporaryDirectory()
+    try:
+        files = await asyncio.to_thread(download, url, tmp.name)
+        if not files:
+            raise RuntimeError("niente da scaricare")
+        files = [await rendi_riproducibile(p) for p in files]
+    except BaseException:
+        _chiudi_tmp(tmp)
+        raise
+    return tmp, files
+
+
+def _chiudi_tmp(tmp):
+    try:
+        tmp.cleanup()
+    except Exception as e:
+        _log_gui(f"cartella temporanea non rimossa: {e!r}")
+
+
+async def _chiudi_anticipo(anticipo: dict):
+    """Fine invio: i download fatti in anticipo e mai usati (invio fermato) si aspettano e si buttano."""
+    for task in list(anticipo.values()):
+        try:
+            tmp, _ = await task
+            _chiudi_tmp(tmp)
+        except Exception:
+            pass       # il download è fallito: _prepara_link ha già ripulito
+    anticipo.clear()
+
+
 async def _gruppo_telegram(bot, ids: list[int], nomi: dict, valori: list[str], stato: dict, stop,
                            falliti: list[str]):
     """Più link sulla stessa riga: li scarico una volta sola e li mando insieme (album) a ogni canale.
@@ -553,13 +587,14 @@ async def _gruppo_telegram(bot, ids: list[int], nomi: dict, valori: list[str], s
             except Exception as e:
                 log(f"  ERRORE: {e}")
                 falliti.append(f"{u[:60]} ({str(e)[:60]})")
+        cache: dict = {}        # file già caricati su Telegram: gli altri canali li ricevono per file_id
         for i in ids:
             if stop.is_set():
                 break
             invio = [(u, p) for u in valori if u in pronti and i not in serviti[u] for p in pronti[u]]
             if not invio:
                 continue
-            errs = await send_files(bot, i, [p for _, p in invio])
+            errs = await send_files(bot, i, [p for _, p in invio], cache=cache)
             falliti_url = {u for u, p in invio if any(e.startswith(p.name + ":") for e in errs)}
             if errs and not falliti_url:
                 falliti_url = {u for u, _ in invio}      # errore non attribuibile a un link: li riprovo tutti
@@ -601,71 +636,85 @@ async def _invia_telegram(canali: list[dict], stop, riporta):
     log(f"Telegram: invio di {len(coda)} elementi a {len(ids)} canali")
 
     request = HTTPXRequest(read_timeout=120, write_timeout=600, connect_timeout=30, pool_timeout=30)
+    anticipo: dict[str, asyncio.Future] = {}     # link successivo già in download mentre si invia / si fa pausa
     async with Bot(token, request=request) as bot:
-        for n, (riga, tipo, valori) in enumerate(coda, 1):
-            if stop.is_set():
-                break
-            riporta({"msg": f"Invio {n}/{len(coda)} a {len(ids)} canali…",
-                     "n": n - 1, "tot": len(coda), "occupato": True})
-            unita = [(riga, valori[0])] if tipo == "testo" else [(u, u) for u in valori]
-            inviato, resto = False, []
-            gruppo = tipo == "link" and len(valori) > 1
-            if gruppo:   # più link sulla stessa riga: un solo invio (album) per canale
-                inviato, resto = await _gruppo_telegram(bot, ids, nomi, valori, stato, stop, falliti)
-                salva_stato_tg(stato)
-            for chiave, contenuto in ([] if gruppo else unita):
-                serviti = set(stato.get(chiave, []))
-                da_fare = [i for i in ids if i not in serviti]
-                if da_fare:
-                    try:
-                        if tipo == "testo":
-                            for i in da_fare:
-                                if stop.is_set():
-                                    break
-                                try:
-                                    await _invia_testo(bot, i, contenuto)
-                                    serviti.add(i)
-                                    inviato = True
-                                    cronologia(TG_NOME, f"{nomi[i]}\t{contenuto}", TG_DIR)
-                                except Exception as e:
-                                    falliti.append(f"{nomi[i]}: {str(e)[:60]}")
-                        else:
-                            log(f"  [{n}/{len(coda)}] {contenuto}")
-                            with tempfile.TemporaryDirectory() as d:
-                                files = await asyncio.to_thread(download, contenuto, d)
-                                if not files:
-                                    raise RuntimeError("niente da scaricare")
-                                files = [await rendi_riproducibile(p) for p in files]
+        try:
+            for n, (riga, tipo, valori) in enumerate(coda, 1):
+                if stop.is_set():
+                    break
+                riporta({"msg": f"Invio {n}/{len(coda)} a {len(ids)} canali…",
+                         "n": n - 1, "tot": len(coda), "occupato": True})
+                unita = [(riga, valori[0])] if tipo == "testo" else [(u, u) for u in valori]
+                inviato, resto = False, []
+                gruppo = tipo == "link" and len(valori) > 1
+                if gruppo:   # più link sulla stessa riga: un solo invio (album) per canale
+                    inviato, resto = await _gruppo_telegram(bot, ids, nomi, valori, stato, stop, falliti)
+                    salva_stato_tg(stato)
+                for chiave, contenuto in ([] if gruppo else unita):
+                    serviti = set(stato.get(chiave, []))
+                    da_fare = [i for i in ids if i not in serviti]
+                    if da_fare:
+                        try:
+                            if tipo == "testo":
                                 for i in da_fare:
                                     if stop.is_set():
                                         break
-                                    errs = await send_files(bot, i, files)
-                                    if errs:
-                                        falliti.append(f"{nomi[i]}: {contenuto[:50]} ({errs[0][:50]})")
-                                    else:
+                                    try:
+                                        await _invia_testo(bot, i, contenuto)
                                         serviti.add(i)
                                         inviato = True
                                         cronologia(TG_NOME, f"{nomi[i]}\t{contenuto}", TG_DIR)
-                    except Exception as e:
-                        log(f"  ERRORE: {e}")
-                        falliti.append(f"{contenuto[:60]} ({str(e)[:60]})")
-                if all(i in serviti for i in ids):
-                    stato.pop(chiave, None)
-                else:
-                    if serviti:
-                        stato[chiave] = sorted(serviti)
-                    resto.append(chiave)
-                salva_stato_tg(stato)
-            if resto != [k for k, _ in unita]:        # qualcosa è partito per tutti: aggiorno la lista
-                _togli_riga_tg(riga, (resto[0] if tipo == "testo" else " ".join(resto)) if resto else None)
-            if inviato and n < len(coda) and not stop.is_set():
-                pub += 1
-                pausa = random.uniform(PAUSA_MIN, PAUSA_MAX)
-                if pub % EXTRA_OGNI == 0:
-                    pausa += random.uniform(EXTRA_MIN, EXTRA_MAX)
-                riporta({"msg": f"Pausa di {pausa:.0f} s prima del prossimo invio…",
-                         "n": n, "tot": len(coda), "occupato": False})
-                await _pausa(stop, pausa)
+                                    except Exception as e:
+                                        falliti.append(f"{nomi[i]}: {str(e)[:60]}")
+                            else:
+                                log(f"  [{n}/{len(coda)}] {contenuto}")
+                                lavoro = anticipo.pop(contenuto, None)     # già scaricato in anticipo?
+                                if lavoro is None:
+                                    lavoro = asyncio.ensure_future(_prepara_link(contenuto))
+                                tmp, files = await lavoro
+                                try:
+                                    # scarico in anticipo il prossimo link singolo: lavora mentre questo parte e
+                                    # durante la pausa (un solo download alla volta, quindi nessun ritmo in più)
+                                    if n < len(coda) and not stop.is_set():
+                                        _, t2, v2 = coda[n]
+                                        if (t2 == "link" and len(v2) == 1 and v2[0] not in anticipo
+                                                and not all(i in set(stato.get(v2[0], [])) for i in ids)):
+                                            anticipo[v2[0]] = asyncio.ensure_future(_prepara_link(v2[0]))
+                                    cache: dict = {}    # il primo canale carica, gli altri ricevono per file_id
+                                    for i in da_fare:
+                                        if stop.is_set():
+                                            break
+                                        errs = await send_files(bot, i, files, cache=cache)
+                                        if errs:
+                                            falliti.append(f"{nomi[i]}: {contenuto[:50]} ({errs[0][:50]})")
+                                        else:
+                                            serviti.add(i)
+                                            inviato = True
+                                            cronologia(TG_NOME, f"{nomi[i]}\t{contenuto}", TG_DIR)
+                                finally:
+                                    _chiudi_tmp(tmp)
+                        except Exception as e:
+                            log(f"  ERRORE: {e}")
+                            falliti.append(f"{contenuto[:60]} ({str(e)[:60]})")
+                    if all(i in serviti for i in ids):
+                        stato.pop(chiave, None)
+                    else:
+                        if serviti:
+                            stato[chiave] = sorted(serviti)
+                        resto.append(chiave)
+                    salva_stato_tg(stato)
+                if resto != [k for k, _ in unita]:        # qualcosa è partito per tutti: aggiorno la lista
+                    _togli_riga_tg(riga, (resto[0] if tipo == "testo" else " ".join(resto)) if resto else None)
+                if inviato and n < len(coda) and not stop.is_set():
+                    pub += 1
+                    pausa = random.uniform(PAUSA_MIN, PAUSA_MAX)
+                    if pub % EXTRA_OGNI == 0:
+                        pausa += random.uniform(EXTRA_MIN, EXTRA_MAX)
+                    riporta({"msg": f"Pausa di {pausa:.0f} s prima del prossimo invio…",
+                             "n": n, "tot": len(coda), "occupato": False})
+                    await _pausa(stop, pausa)
+        finally:
+            await _chiudi_anticipo(anticipo)
         fermato = stop.is_set()
     log(f"Telegram: finito ({len(falliti)} non consegnati{', fermato' if fermato else ''})")
     riporta({"fine": True, "falliti": falliti, "fermato": fermato, "errore": None})
@@ -1509,6 +1558,8 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
             msg.config(text="")           # tutto partito: nessun messaggio di conferma
         if not dirty():
             carica_lista()
+        else:
+            salva_presto()       # modifiche fatte durante l'invio: il salvataggio rapido riparte ora
         aggiorna_info()
 
     def poll():
