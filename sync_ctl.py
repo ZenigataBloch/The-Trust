@@ -71,7 +71,10 @@ def _pids() -> list:
             continue
         try:
             with open(f"/proc/{v}/cmdline", "rb") as f:
-                arg = f.read().split(b"\0")[:3]
+                cmd = f.read()
+            if not cmd:                # cmdline vuota = processo zombie (già morto, non ancora "raccolto") o thread del kernel
+                continue
+            arg = cmd.split(b"\0")[:3]
             trovato = any(os.path.basename(a.decode("utf-8", "replace")) == "syncthing" for a in arg if a)
             if not trovato:
                 with open(f"/proc/{v}/comm", "rb") as f:
@@ -149,6 +152,7 @@ def _prova_avvio(exe: str, env: dict):
             return "fallito"
         time.sleep(PROVA_AVVIO_S)
         if p.poll() is None:
+            threading.Thread(target=p.wait, daemon=True).start()   # raccoglie il processo quando muore: niente zombie
             return "ok"
         if _lock_nel_log(dim):         # si è chiuso per il lock: inutile provare l'altra sintassi
             return "lock"
