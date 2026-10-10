@@ -257,7 +257,6 @@ async function pollP(){
 /* ---------- Telegram ---------- */
 const T={sig:"",canali:[],link:0,testi:0,era:false};
 const LT=Lista("t","/api/tg/salva",()=>({}));
-LT.sospeso=()=>T.era;
 LT.ricarica=async()=>{const r=await api("/api/tg");if(r.canali)LT.set(r.testo,r.mtime);};
 function renderCanali(cs){
   const sig=JSON.stringify(cs);if(sig===T.sig)return;T.sig=sig;
@@ -278,7 +277,7 @@ async function pollT1(){
   $("#info-t").textContent="In coda "+r.link+" link e "+r.testi+" messaggi  |  canali spuntati: "+r.canali.filter(c=>c.attivo).length+"  |  già inviati: "+r.inviati;
   if(r.mtime!==LT.mtime){
     if(!LT.dirty)LT.set(r.testo,r.mtime);
-    else if(r.invio&&r.invio.attivo)LT.say("⚠ La lista è cambiata durante l'invio: salvando potresti reinviare link già partiti.","err");
+    else if(r.invio&&r.invio.attivo)LT.say("⚠ La lista è cambiata mentre inviavo (ti tornano in lista i link non consegnati): salva a mano per decidere.","err");
   }
   const v=r.invio,att=!!(v&&v.attivo);
   $("#invia").disabled=att;$("#ferma").disabled=!att;

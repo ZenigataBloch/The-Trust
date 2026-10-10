@@ -23,6 +23,8 @@ Come si usa
   Il bot manda messaggi e link (scaricati e allegati) in ordine, con una pausa
   tra un invio e l'altro, e TOGLIE dalla lista quello che è partito. Quello che
   non parte (link che non si scarica) resta in lista per il prossimo /invia.
+  Scheda Telegram: premendo Invia la lista si svuota subito (i link passano in una copia nascosta,
+  invii/telegram/.in_invio.txt) e a fine invio i link non partiti tornano in cima alla lista.
   La cronologia è in invii/<nome>.inviati.log
 
 Più link in un messaggio
@@ -391,6 +393,7 @@ TG_LISTA = TG_DIR / "lista.txt"        # lista condivisa, inviata a tutti i cana
 TG_CANALI = TG_DIR / "canali.json"     # [{"id": -100..., "nome": "...", "tipo": "...", "attivo": true}]
 TG_STATO = TG_DIR / "stato.json"       # {link o testo: [id dei canali che l'hanno già ricevuto]}
 TG_NOME = "_telegram"                  # nome usato per backup e cronologia della lista condivisa
+TG_IN_INVIO = TG_DIR / ".in_invio.txt"  # copia nascosta di ciò che si sta inviando (la lista visibile si svuota subito)
 _TG_LOCK = threading.Lock()            # GUI e thread di invio non scrivono la lista insieme
 
 _TIPI = {"channel": "canale", "supergroup": "gruppo", "group": "gruppo", "private": "privata"}
@@ -505,9 +508,83 @@ def salva_stato_tg(stato: dict):
             pass
 
 
-def _togli_riga_tg(riga: str, nuova: Optional[str]):
+def _righe_file(path: Path) -> list[str]:
+    try:
+        return path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return []
+
+
+def _ripristina_senza_lock() -> int:
+    """Rimette in cima alla lista visibile ciò che era rimasto nella copia nascosta, poi la cancella."""
+    resto = [r for r in _righe_file(TG_IN_INVIO) if r.strip()]
+    if resto:
+        scrivi_atomico(TG_LISTA, "\n".join(resto + _righe_file(TG_LISTA)) + "\n")
+    try:
+        TG_IN_INVIO.unlink()
+    except OSError:
+        pass
+    return len(resto)
+
+
+def tg_ripristina_in_lista() -> int:
+    """Fine invio (o invio interrotto): i link non partiti tornano nella lista visibile, davanti ai nuovi."""
     with _TG_LOCK:
-        aggiorna_riga(TG_NOME, riga, nuova, TG_LISTA)
+        return _ripristina_senza_lock()
+
+
+def tg_ripristina_se_orfana(minuti: float = 30.0) -> int:
+    """All'apertura: se la copia nascosta non si muove da `minuti` min nessun invio la sta usando (processo
+    chiuso o crollato): i suoi link tornano in lista."""
+    try:
+        if time.time() - TG_IN_INVIO.stat().st_mtime < minuti * 60:
+            return 0
+    except OSError:
+        return 0
+    return tg_ripristina_in_lista()
+
+
+def tg_in_invio_conta() -> tuple[int, int]:
+    """(link, messaggi) ancora nella copia nascosta, cioè in invio adesso."""
+    try:
+        return conta(leggi_coda(TG_NOME, TG_IN_INVIO))
+    except Exception:
+        return 0, 0
+
+
+def tg_prendi_lista() -> list[tuple[str, str, list[str]]]:
+    """Inizio invio: gli elementi da inviare passano dalla lista visibile a una copia nascosta, così la lista
+    si vede vuota subito. Restano al loro posto commenti e righe ignorate. Prima scrivo la copia, poi
+    svuoto la lista: se qualcosa va storto non si perde niente."""
+    with _TG_LOCK:
+        _ripristina_senza_lock()          # avanzi di un invio interrotto male: tornano in lista
+        if not TG_LISTA.exists():
+            return []
+        fai_backup(TG_NOME, forza=True, src=TG_LISTA)
+        coda, restano = [], []
+        for r in _righe_file(TG_LISTA):
+            c = classifica(r)
+            if c:
+                coda.append((r, c[0], c[1]))
+            else:
+                restano.append(r)
+        if not coda:
+            return []
+        scrivi_atomico(TG_IN_INVIO, "\n".join(r for r, _, _ in coda) + "\n")
+        scrivi_atomico(TG_LISTA, "\n".join(restano) + ("\n" if restano else ""))
+        return coda
+
+
+def _togli_riga_tg(riga: str, nuova: Optional[str]):
+    """Un elemento è stato lavorato: lo tolgo dalla copia nascosta (o lo sostituisco con ciò che non è partito).
+    La lista visibile non si tocca fino a fine invio."""
+    with _TG_LOCK:
+        aggiorna_riga(TG_NOME, riga, nuova, TG_IN_INVIO)
+        if not _righe_file(TG_IN_INVIO):
+            try:
+                TG_IN_INVIO.unlink()
+            except OSError:
+                pass
 
 
 async def _pausa(stop, secondi: float):
@@ -617,7 +694,21 @@ async def _gruppo_telegram(bot, ids: list[int], nomi: dict, valori: list[str], s
     return inviato, resto
 
 
-async def _invia_telegram(canali: list[dict], stop, riporta):
+async def _invia_telegram(canali: list[dict], stop, riporta, coda=None):
+    """Prende la lista (che si svuota subito) e la invia; ciò che non parte torna in lista PRIMA di annunciare
+    la fine. `coda`: già presa dal chiamante (la GUI la prende da sé per svuotare la lista all'istante)."""
+    def riporta_fine(d):
+        if d.get("fine"):
+            tg_ripristina_in_lista()
+        riporta(d)
+    try:
+        await _invia_telegram_lavoro(canali, stop, riporta_fine, coda)
+    except BaseException:
+        tg_ripristina_in_lista()
+        raise
+
+
+async def _invia_telegram_lavoro(canali: list[dict], stop, riporta, coda=None):
     token = os.environ.get("BOT_TOKEN", "")
     if not token:
         raise RuntimeError("BOT_TOKEN non impostato")
@@ -631,7 +722,8 @@ async def _invia_telegram(canali: list[dict], stop, riporta):
     ids = [c["id"] for c in canali]
     nomi = {c["id"]: semplifica_nome(c["nome"], f"Canale {c['id']}") for c in canali}
     stato = carica_stato_tg()
-    coda = leggi_coda(TG_NOME, TG_LISTA)
+    if coda is None:
+        coda = tg_prendi_lista()
     pub, falliti, fermato = 0, [], False
     log(f"Telegram: invio di {len(coda)} elementi a {len(ids)} canali")
 
@@ -720,10 +812,10 @@ async def _invia_telegram(canali: list[dict], stop, riporta):
     riporta({"fine": True, "falliti": falliti, "fermato": fermato, "errore": None})
 
 
-def lavora_telegram(canali: list[dict], stop, riporta):
+def lavora_telegram(canali: list[dict], stop, riporta, coda=None):
     """Corpo del thread di invio (la GUI non si blocca): manda la lista condivisa ai canali."""
     try:
-        asyncio.run(_invia_telegram(canali, stop, riporta))
+        asyncio.run(_invia_telegram(canali, stop, riporta, coda))
     except Exception as e:
         _log_gui(f"invio Telegram: errore {e!r}")
         riporta({"fine": True, "falliti": [], "fermato": False, "errore": str(e)[:150]})
@@ -1306,7 +1398,9 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
         except Exception:
             link = testi = 0
         att = sum(1 for c in st["canali"] if c["attivo"])
-        info.config(text=f"Lista Telegram: in coda {link} link e {testi} messaggi  |  "
+        in_l, in_t = tg_in_invio_conta() if st["invio"] is not None else (0, 0)
+        invio_txt = f"in invio {in_l} link e {in_t} messaggi  |  " if (in_l or in_t) else ""
+        info.config(text=f"Lista Telegram: in coda {link} link e {testi} messaggi  |  {invio_txt}"
                          f"canali spuntati: {att}  |  già inviati: {conta_cronologia(TG_NOME, TG_DIR)}")
 
     def salva(auto: bool = False, motivo: str = "Salvato") -> bool:
@@ -1315,7 +1409,7 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
                 return False        # l'ha cambiata l'invio: senza chiedere non la sovrascrivo
             if not messagebox.askyesno(
                     "Lista cambiata",
-                    "L'invio ha modificato questa lista nel frattempo (ha inviato dei link).\n"
+                    "Questa lista è cambiata nel frattempo (l'invio ha rimesso dei link non consegnati, o l'hai cambiata altrove).\n"
                     "Sovrascrivere con quello che vedi?\n\nScegli No per ricaricare la lista aggiornata."):
                 testo.edit_modified(False)
                 carica_lista()
@@ -1517,12 +1611,22 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
         elenco = "\n".join("• " + semplifica_nome(c["nome"], f"Canale {c['id']}") for c in attivi)
         if not messagebox.askyesno("Invia ora", f"Inviare {link} link e {testi} messaggi a:\n{elenco}\n\nProcedo?"):
             return
+        try:
+            presa = tg_prendi_lista()       # la lista si svuota subito: il bot lavora su una copia nascosta
+        except Exception as e:
+            _log_gui(f"scheda Telegram, preparazione dell'invio: errore {e!r}")
+            messagebox.showerror("Invia", f"Non riesco a preparare l'invio: {e}")
+            return
+        if not presa:
+            messagebox.showinfo("Invia", "Niente in coda.")
+            return
+        carica_lista()
         stop = threading.Event()
         st["invio"] = {"stop": stop, "t0": time.time()}
         aggiorna_bottoni()
         msg.config(text="Avvio dell'invio…", fg=T.INFO)
         riporta = lambda d: code.put(("rep", d))
-        threading.Thread(target=lavora_telegram, args=([dict(c) for c in attivi], stop, riporta),
+        threading.Thread(target=lavora_telegram, args=([dict(c) for c in attivi], stop, riporta, presa),
                          daemon=True).start()
 
     def ferma():
@@ -1590,8 +1694,8 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
             if TG_LISTA.exists() and TG_LISTA.stat().st_mtime != st["mtime"]:
                 if dirty():
                     if st["invio"]:
-                        msg.config(text="⚠ La lista è cambiata durante l'invio: salvando potresti "
-                                        "reinviare link già partiti.", fg=T.ERR)
+                        msg.config(text="⚠ La lista è cambiata mentre inviavo (ti tornano in lista i link non "
+                                        "consegnati): salva a mano per decidere.", fg=T.ERR)
                 else:
                     carica_lista()
             aggiorna_info()
@@ -1613,7 +1717,7 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
         """Salvataggio quasi immediato: circa 1 s dopo l'ultima modifica (senza aspettare AUTOSAVE_SEC)."""
         rapido["job"] = None
         try:
-            if dirty() and st["invio"] is None:      # durante un invio la lista la tocca solo il bot
+            if dirty():       # durante l'invio il bot lavora su una copia nascosta: la lista si può salvare
                 salva(auto=True, motivo="Salvataggio automatico")
         except Exception as e:
             _log_gui(f"scheda Telegram, salvataggio rapido: errore {e!r}")
@@ -1647,6 +1751,12 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
     bt_ferma = tk.Button(riga2, text="Ferma", command=ferma, state="disabled")
     bt_ferma.pack(side="right", padx=(0, 6))
 
+    try:
+        if tg_ripristina_se_orfana():
+            msg.config(text="Un invio precedente era rimasto a metà: i link non partiti sono tornati in lista.",
+                       fg=T.WARN)
+    except Exception as e:
+        _log_gui(f"scheda Telegram, recupero invio interrotto: errore {e!r}")
     carica_lista()
     ridisegna()
     aggiorna_info()
