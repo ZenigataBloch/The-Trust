@@ -45,6 +45,13 @@ except Exception as _e:
     HB = None
     print(f"heartbeat non disponibile: {_e!r}")
 
+try:
+    import sync_ctl as SY       # Syncthing acceso solo mentre la web app è aperta (vedi sync_ctl.py)
+    SY.log = O._log_gui
+except Exception as _e:
+    SY = None
+    print(f"sync_ctl non disponibile: {_e!r}")
+
 PORTA = 8080
 HOSTS = {f"localhost:{PORTA}", f"127.0.0.1:{PORTA}"}   # blocca il DNS rebinding
 FLAG = BM.BASE / "bots_fermi.flag"
@@ -111,11 +118,21 @@ def r_bots(_):
             err = "avviato ma non ancora collegato a Discord: controlla il log"
         out[n] = {"nome": BM.MODULI[n][0], "acceso": bool(a), "pronto": pronto, "errore": err}
     d = HB.L.info() if HB else {}
-    return 200, {"occupato": g.occupato, "bot": out, "desktop": bool(d.get("attivo")), "desktop_host": d.get("host", "")}
+    return 200, {"occupato": g.occupato, "bot": out, "desktop": bool(d.get("attivo")), "desktop_host": d.get("host", ""),
+                 "sync": bool(SY and SY.attivo())}
+
+
+def r_sync_apri(_):
+    """La pagina è tornata visibile (app ripresa dal background senza ricaricare): riaccende Syncthing se serve."""
+    if SY:
+        SY.apri()
+    return 200, {}
 
 
 def r_bots_start(_):
     """Accensione ESPLICITA (clic sul led): toglie anche lo spegnimento manuale."""
+    if SY:
+        SY.apri()
     if desktop_attivo():
         return 200, {"desktop": True}          # i bot girano già sul PC: qui restano spenti
     FLAG.unlink(missing_ok=True)
@@ -126,6 +143,8 @@ def r_bots_start(_):
 
 def r_bots_apri(_):
     """Chiamata dalla pagina al caricamento/refresh: accende i bot SOLO se non li hai spenti a mano."""
+    if SY:
+        SY.apri()
     if desktop_attivo():
         return 200, {"desktop": True}
     if MANUALE.exists():
@@ -578,7 +597,7 @@ def r_c_applica(b):
 
 
 # ------------------------------------------------------------ git pull
-FILE_SERVER = {"pannello.py", "org_bot.py", "bot_manager.py", "bot_log.py", "sendbot_tema.py", "heartbeat.py"}
+FILE_SERVER = {"pannello.py", "org_bot.py", "bot_manager.py", "bot_log.py", "sendbot_tema.py", "heartbeat.py", "sync_ctl.py"}
 FILE_BOT = {"telegram_bot.py", "discord_bot.py", "org_bot.py", "bot_log.py"}
 
 
@@ -683,7 +702,7 @@ SW = "self.addEventListener('fetch',()=>{});"
 ICONE = {"/icon-192.png": BM.BASE / "icon-192.png", "/icon-512.png": BM.BASE / "icon-512.png"}
 
 GET = {"/api/bots": r_bots, "/api/persone": r_persone, "/api/persona": r_persona, "/api/tg": r_tg, "/api/log": r_log, "/api/cookie": r_cookie}
-POST = {"/api/bots/start": r_bots_start, "/api/bots/apri": r_bots_apri, "/api/bots/stop": r_bots_stop, "/api/righe": r_righe,
+POST = {"/api/sync/apri": r_sync_apri, "/api/bots/start": r_bots_start, "/api/bots/apri": r_bots_apri, "/api/bots/stop": r_bots_stop, "/api/righe": r_righe,
         "/api/persona/salva": r_p_salva, "/api/persona/nuova": r_p_nuova, "/api/persona/elimina": r_p_elimina,
         "/api/persona/scollega": r_p_scollega, "/api/tg/salva": r_t_salva, "/api/tg/toggle": r_t_toggle,
         "/api/tg/rimuovi": r_t_rimuovi, "/api/tg/aggiungi": r_t_aggiungi, "/api/tg/nomi": r_t_nomi,
@@ -711,6 +730,8 @@ class H(BaseHTTPRequestHandler):
         if self.headers.get("Host") not in HOSTS:
             return self._send(403, {})
         u = urlparse(self.path)
+        if SY:
+            SY.viva()                        # la pagina è viva: azzera il conto alla rovescia di Syncthing
         if u.path in GET:
             try:
                 q = {k: v[0] for k, v in parse_qs(u.query).items()}
@@ -729,6 +750,8 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.headers.get("Host") not in HOSTS or self.headers.get("X-Panel") != "1":
             return self._send(403, {})
+        if SY:
+            SY.viva()
         if self.path not in POST:
             return self._send(404, {})
         try:
@@ -754,6 +777,8 @@ if __name__ == "__main__":
     if HB:
         HB.L.avvia(su_cambio_desktop, log)
     threading.Thread(target=ciclo, daemon=True).start()
+    if SY:
+        threading.Thread(target=SY.ciclo, daemon=True).start()
     log(f"Branch su http://localhost:{PORTA}  (Ctrl+C per uscire: i bot restano accesi)")
     try:
         srv.serve_forever()

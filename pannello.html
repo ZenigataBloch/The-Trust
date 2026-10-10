@@ -138,7 +138,7 @@ async function bots(){
   const k=Object.values(s.bot),up=k.filter(x=>x.acceso).length,pr=k.filter(x=>x.pronto).length;
   led.className=s.occupato||(up&&pr<k.length)?"mid":up?"on":"";
   const t=s.occupato?"IN CORSO…":up&&pr<up?"IN AVVIO…":up===k.length?"BOT ATTIVI":up?"BOT PARZIALI":"BOT SPENTI";
-  st.replaceChildren(el("b",0,t),el("small",0,k.map(x=>(x.pronto?"● ":x.acceso?"◐ ":"○ ")+x.nome).join("   ")+k.filter(x=>x.errore).map(x=>"\n"+x.nome+": "+x.errore).join("")));
+  st.replaceChildren(el("b",0,t),el("small",0,k.map(x=>(x.pronto?"● ":x.acceso?"◐ ":"○ ")+x.nome).join("   ")+(s.sync?"   ⇅ Syncthing":"")+k.filter(x=>x.errore).map(x=>"\n"+x.nome+": "+x.errore).join("")));
 }
 $("#led").onclick=async()=>{
   const s=await api("/api/bots");if(!s.bot||s.occupato||s.desktop)return;
@@ -397,6 +397,7 @@ $("#log-c").onclick=async()=>{try{await navigator.clipboard.writeText($("#log").
 setInterval(()=>{if($("#s-l").classList.contains("sel")&&$("#log-auto").checked)caricaLog(false);},3000);
 setInterval(()=>{LP.salva(true);LT.salva(true);},30000);
 setInterval(bots,3000);
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")api("/api/sync/apri",{}).then(bots);});
 editorP(false);
 if("serviceWorker"in navigator)navigator.serviceWorker.register("/sw.js").catch(()=>{});
 // app appena aperta (sessione nuova) -> accende i bot anche se erano spenti a mano; semplice refresh -> rispetta lo spegnimento manuale
