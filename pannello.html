@@ -397,7 +397,7 @@ setInterval(()=>{LP.salva(true);LT.salva(true);},30000);
 setInterval(bots,3000);
 editorP(false);
 if("serviceWorker"in navigator)navigator.serviceWorker.register("/sw.js").catch(()=>{});
-api("/api/bots/start",{}).then(bots);   // aprire l'app accende i bot che non girano
+api("/api/bots/apri",{}).then(bots);   // aprire l'app accende i bot che non girano
 pollP();pollT();
 </script>
 </body>
