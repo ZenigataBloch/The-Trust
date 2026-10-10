@@ -397,7 +397,9 @@ setInterval(()=>{LP.salva(true);LT.salva(true);},30000);
 setInterval(bots,3000);
 editorP(false);
 if("serviceWorker"in navigator)navigator.serviceWorker.register("/sw.js").catch(()=>{});
-api("/api/bots/apri",{}).then(bots);   // aprire l'app accende i bot che non girano
+// app appena aperta (sessione nuova) -> accende i bot anche se erano spenti a mano; semplice refresh -> rispetta lo spegnimento manuale
+let aperta=false;try{aperta=sessionStorage.getItem("branch_aperta")==="1";sessionStorage.setItem("branch_aperta","1");}catch(e){}
+api(aperta?"/api/bots/apri":"/api/bots/start",{}).then(bots);
 pollP();pollT();
 </script>
 </body>
