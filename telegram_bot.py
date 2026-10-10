@@ -724,9 +724,123 @@ def _ig_cooldown(motivo: str):
     log(f"  Instagram ha segnalato un problema ({motivo[:120]}): pausa di {IG_COOLDOWN_MIN} min")
 
 
+# ---------- fonte: canali privati, con il TUO account personale (Telethon) ----------
+# Tenuto separato dal bot: il bot (BOT_TOKEN) pubblica e basta; l'account personale viene usato SOLO
+# per LEGGERE un post di un canale/gruppo privato di cui sei membro (link t.me/c/<id>/<post>), mai per
+# scrivere. Ha sessione, contatore, pausa e righe di log proprie ("[account personale]").
+# Setup: TG_API_ID e TG_API_HASH (da my.telegram.org) in bots.env, poi  python telegram_login.py  una volta.
+_TG_PRIV_RE = re.compile(r"^https?://(?:www\.)?(?:t|telegram)\.me/c/(\d+)(?:/\d+)?/(\d+)(?:[/?#].*)?$", re.I)
+TG_API_ID = int(os.environ.get("TG_API_ID") or 0)
+TG_API_HASH = os.environ.get("TG_API_HASH", "")
+TG_SESSION = os.environ.get("TG_SESSION") or str(Path(__file__).resolve().with_name("utente"))   # + ".session"
+TG_UTENTE_PAUSA = float(_int_env("TG_UTENTE_PAUSA_SEC", 3))        # pausa minima tra due richieste
+TG_UTENTE_MAX_GIORNO = _int_env("TG_UTENTE_MAX_GIORNO", 100)       # tetto richieste al giorno (0 = nessuno)
+TG_UTENTE_MAX_MB = _int_env("TG_UTENTE_MAX_MB", 200)               # non scarica file più grandi
+TG_UTENTE_STATO = Path(os.environ.get("TG_UTENTE_STATO_FILE")
+                       or Path(__file__).resolve().with_name("telegram_utente_uso.json"))
+_tg_utente_lock = threading.Lock()
+_tg_utente_ultima = [0.0]
+
+
+def _is_telegram_private(url: str) -> bool:
+    return bool(_TG_PRIV_RE.match(url.strip()))
+
+
+def _tg_utente_conta() -> int:
+    """Conta le richieste dell'account personale (a parte da quelle del bot) e applica il tetto giornaliero."""
+    oggi = datetime.date.today().isoformat()
+    try:
+        d = json.loads(TG_UTENTE_STATO.read_text(encoding="utf-8"))
+    except Exception:
+        d = {}
+    n = int(d.get("n", 0)) if d.get("giorno") == oggi else 0
+    if TG_UTENTE_MAX_GIORNO and n >= TG_UTENTE_MAX_GIORNO:
+        raise RuntimeError(f"Account personale: raggiunto il tetto di {TG_UTENTE_MAX_GIORNO} richieste per oggi "
+                           "(si cambia con TG_UTENTE_MAX_GIORNO)")
+    try:
+        TG_UTENTE_STATO.write_text(json.dumps({"giorno": oggi, "n": n + 1}), encoding="utf-8")
+    except OSError as e:
+        log(f"  [account personale] contatore non salvato: {e}")
+    return n + 1
+
+
+async def _tg_utente_scarica(cid: int, mid: int, folder: str) -> list[Path]:
+    from telethon import TelegramClient
+    from telethon.errors import ChannelPrivateError, FloodWaitError
+    from telethon.tl.types import PeerChannel
+
+    peer = PeerChannel(cid)
+    # flood_sleep_threshold=0: se Telegram chiede di aspettare non dormo in silenzio, mi fermo e lo dico
+    client = TelegramClient(TG_SESSION, TG_API_ID, TG_API_HASH, flood_sleep_threshold=0)
+    await client.connect()                       # niente start(): non deve mai chiedere codici da solo
+    try:
+        if not await client.is_user_authorized():
+            raise RuntimeError("sessione dell'account personale scaduta o assente: rilancia  python telegram_login.py")
+        try:
+            try:
+                msg = await client.get_messages(peer, ids=mid)
+            except ValueError:                   # canale non ancora nella cache della sessione
+                await client.get_dialogs()
+                msg = await client.get_messages(peer, ids=mid)
+            if not msg:
+                raise RuntimeError("Post non trovato: cancellato, oppure il tuo account non è nel canale.")
+            msgs = [msg]
+            if msg.grouped_id:                   # album: prendo i messaggi vicini dello stesso gruppo
+                vicini = await client.get_messages(peer, ids=list(range(max(1, mid - 9), mid + 10)))
+                msgs = sorted((m for m in vicini if m and m.grouped_id == msg.grouped_id), key=lambda m: m.id)
+            files = []
+            for m in msgs:
+                if not (m.photo or m.video or m.gif or m.video_note):
+                    continue
+                size = getattr(m.file, "size", 0) or 0
+                if TG_UTENTE_MAX_MB and size > TG_UTENTE_MAX_MB * 1_000_000:
+                    log(f"  [account personale] salto un file da {mb(size)} (tetto {TG_UTENTE_MAX_MB} MB)")
+                    continue
+                p = await client.download_media(m, file=folder + os.sep)
+                if p and Path(p).suffix.lower() in ALL_EXT:
+                    files.append(Path(p))
+            return files
+        except ChannelPrivateError:
+            raise RuntimeError("Il tuo account non ha accesso a questo canale (non sei membro?).") from None
+        except FloodWaitError as e:
+            raise RuntimeError(f"Telegram chiede di aspettare {e.seconds} s per l'account personale: "
+                               "riprova più tardi.") from None
+    finally:
+        await client.disconnect()
+
+
+def download_telegram_utente(url: str, folder: str) -> list[Path]:
+    m = _TG_PRIV_RE.match(url.strip())
+    cid, mid = int(m.group(1)), int(m.group(2))
+    if not (TG_API_ID and TG_API_HASH):
+        raise RuntimeError("Link di un canale privato: serve l'account personale. Metti TG_API_ID e TG_API_HASH "
+                           "in bots.env e lancia telegram_login.py una volta.")
+    try:
+        import telethon  # noqa: F401
+    except ImportError:
+        raise RuntimeError("Manca la libreria telethon:  pip install telethon") from None
+    if not Path(TG_SESSION + ".session").exists():
+        raise RuntimeError("Account personale non collegato: lancia  python telegram_login.py  una volta.")
+    with _tg_utente_lock:                        # una richiesta alla volta, con pausa minima
+        attesa = TG_UTENTE_PAUSA - (time.time() - _tg_utente_ultima[0])
+        if attesa > 0:
+            time.sleep(attesa)
+        n = _tg_utente_conta()
+        log(f"  [account personale] richiesta n. {n} di oggi: canale {cid}, post {mid} (sola lettura)")
+        try:
+            files = asyncio.run(_tg_utente_scarica(cid, mid, folder))
+        finally:
+            _tg_utente_ultima[0] = time.time()
+    if not files:
+        raise RuntimeError("Nessuna foto o video in questo post (solo testo, o file oltre il tetto di dimensione).")
+    return files
+
+
 def download(url: str, folder: str) -> list[Path]:
     """Punto d'ingresso dei download. Per i link Instagram aggiunge la protezione (conteggio, avviso,
     pausa minima, tetti e pausa dopo una segnalazione); poi scarica con _download_cookie."""
+    if _is_telegram_private(url):       # canale privato: account personale, in sola lettura
+        return download_telegram_utente(url, folder)
     if _is_telegram_post(url):          # post pubblico di Telegram: nessun cookie, nessun yt-dlp
         return download_telegram(url, folder)
     ig = _is_instagram(url)

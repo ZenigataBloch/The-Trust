@@ -31,3 +31,5 @@ bots_pid.json
 bots_fermi.flag
 bots_spenti_a_mano.flag
 *.log
+*.session
+telegram_utente_uso.json
