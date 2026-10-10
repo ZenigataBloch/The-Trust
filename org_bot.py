@@ -21,8 +21,9 @@ Come si usa
   Le righe con  #  sono commenti. Premi Salva.
 - Discord: apri la chat con quella persona e scrivi  /invia.
   Il bot manda messaggi e link (scaricati e allegati) in ordine, con una pausa
-  tra un invio e l'altro, e TOGLIE dalla lista quello che è partito. Quello che
-  non parte (link che non si scarica) resta in lista per il prossimo /invia.
+  tra un invio e l'altro. Premendo /invia la lista si svuota subito (i link passano in una copia
+  nascosta, invii/.in_invio.<nome>.lista); quello che non parte (link che non si scarica) torna in cima
+  alla lista a fine invio, per il prossimo /invia.
   Scheda Telegram: premendo Invia la lista si svuota subito (i link passano in una copia nascosta,
   invii/telegram/.in_invio.txt) e a fine invio i link non partiti tornano in cima alla lista.
   La cronologia è in invii/<nome>.inviati.log
@@ -515,22 +516,56 @@ def _righe_file(path: Path) -> list[str]:
         return []
 
 
-def _ripristina_senza_lock() -> int:
-    """Rimette in cima alla lista visibile ciò che era rimasto nella copia nascosta, poi la cancella."""
-    resto = [r for r in _righe_file(TG_IN_INVIO) if r.strip()]
-    if resto:
-        scrivi_atomico(TG_LISTA, "\n".join(resto + _righe_file(TG_LISTA)) + "\n")
+def _ripristina_senza_lock(lista: Path = TG_LISTA, nascosta: Path = TG_IN_INVIO, crea: bool = True) -> int:
+    """Rimette in cima alla lista visibile ciò che era rimasto nella copia nascosta, poi la cancella.
+    crea=False: se la lista non esiste più (persona eliminata nel frattempo) non la ricreo."""
+    resto = [r for r in _righe_file(nascosta) if r.strip()]
+    if resto and (crea or lista.exists()):
+        scrivi_atomico(lista, "\n".join(resto + _righe_file(lista)) + "\n")
     try:
-        TG_IN_INVIO.unlink()
+        nascosta.unlink()
     except OSError:
         pass
     return len(resto)
 
 
+def _prendi_da(lista: Path, nascosta: Path, nome_backup: str, crea: bool = True) -> list[tuple[str, str, list[str]]]:
+    """Gli elementi da inviare passano dalla lista visibile a una copia nascosta: la lista si vede vuota subito.
+    Restano al loro posto commenti e righe ignorate. Prima scrivo la copia, poi svuoto la lista: se qualcosa
+    va storto non si perde niente."""
+    _ripristina_senza_lock(lista, nascosta, crea)      # avanzi di un invio interrotto male: tornano in lista
+    if not lista.exists():
+        return []
+    fai_backup(nome_backup, forza=True, src=lista)
+    coda, restano = [], []
+    for r in _righe_file(lista):
+        c = classifica(r)
+        if c:
+            coda.append((r, c[0], c[1]))
+        else:
+            restano.append(r)
+    if not coda:
+        return []
+    scrivi_atomico(nascosta, "\n".join(r for r, _, _ in coda) + "\n")
+    scrivi_atomico(lista, "\n".join(restano) + ("\n" if restano else ""))
+    return coda
+
+
+def _togli_da(nascosta: Path, nome: str, riga: str, nuova: Optional[str]):
+    """Un elemento è stato lavorato: lo tolgo dalla copia nascosta (o lo sostituisco con ciò che non è partito)."""
+    aggiorna_riga(nome, riga, nuova, nascosta)
+    if not _righe_file(nascosta):
+        try:
+            nascosta.unlink()
+        except OSError:
+            pass
+
+
+# ---- lista condivisa Telegram ----
 def tg_ripristina_in_lista() -> int:
     """Fine invio (o invio interrotto): i link non partiti tornano nella lista visibile, davanti ai nuovi."""
     with _TG_LOCK:
-        return _ripristina_senza_lock()
+        return _ripristina_senza_lock(TG_LISTA, TG_IN_INVIO)
 
 
 def tg_ripristina_se_orfana(minuti: float = 30.0) -> int:
@@ -553,38 +588,48 @@ def tg_in_invio_conta() -> tuple[int, int]:
 
 
 def tg_prendi_lista() -> list[tuple[str, str, list[str]]]:
-    """Inizio invio: gli elementi da inviare passano dalla lista visibile a una copia nascosta, così la lista
-    si vede vuota subito. Restano al loro posto commenti e righe ignorate. Prima scrivo la copia, poi
-    svuoto la lista: se qualcosa va storto non si perde niente."""
     with _TG_LOCK:
-        _ripristina_senza_lock()          # avanzi di un invio interrotto male: tornano in lista
-        if not TG_LISTA.exists():
-            return []
-        fai_backup(TG_NOME, forza=True, src=TG_LISTA)
-        coda, restano = [], []
-        for r in _righe_file(TG_LISTA):
-            c = classifica(r)
-            if c:
-                coda.append((r, c[0], c[1]))
-            else:
-                restano.append(r)
-        if not coda:
-            return []
-        scrivi_atomico(TG_IN_INVIO, "\n".join(r for r, _, _ in coda) + "\n")
-        scrivi_atomico(TG_LISTA, "\n".join(restano) + ("\n" if restano else ""))
-        return coda
+        return _prendi_da(TG_LISTA, TG_IN_INVIO, TG_NOME)
 
 
 def _togli_riga_tg(riga: str, nuova: Optional[str]):
-    """Un elemento è stato lavorato: lo tolgo dalla copia nascosta (o lo sostituisco con ciò che non è partito).
-    La lista visibile non si tocca fino a fine invio."""
     with _TG_LOCK:
-        aggiorna_riga(TG_NOME, riga, nuova, TG_IN_INVIO)
-        if not _righe_file(TG_IN_INVIO):
-            try:
-                TG_IN_INVIO.unlink()
-            except OSError:
-                pass
+        _togli_da(TG_IN_INVIO, TG_NOME, riga, nuova)
+
+
+# ---- liste delle persone (Discord /invia) ----
+_PERS_LOCK = threading.Lock()
+
+
+def file_in_invio(nome: str) -> Path:
+    return INVII_DIR / f".in_invio.{nome}.lista"     # niente .txt: l'elenco delle persone cerca *.txt
+
+
+def persona_prendi_lista(nome: str) -> list[tuple[str, str, list[str]]]:
+    with _PERS_LOCK:
+        return _prendi_da(file_persona(nome), file_in_invio(nome), nome, crea=False)
+
+
+def persona_ripristina(nome: str) -> int:
+    with _PERS_LOCK:
+        return _ripristina_senza_lock(file_persona(nome), file_in_invio(nome), crea=False)
+
+
+def persona_togli_riga(nome: str, riga: str, nuova: Optional[str]):
+    with _PERS_LOCK:
+        _togli_da(file_in_invio(nome), nome, riga, nuova)
+
+
+def persona_ripristina_orfane() -> int:
+    """All'avvio del bot nessun invio è in corso: ciò che era rimasto nascosto torna nelle liste."""
+    n = 0
+    for p in INVII_DIR.glob(".in_invio.*.lista"):
+        nome = p.name[len(".in_invio."):-len(".lista")]
+        try:
+            n += persona_ripristina(nome)
+        except Exception as e:
+            _log_gui(f"recupero di «{nome}»: errore {e!r}")
+    return n
 
 
 async def _pausa(stop, secondi: float):
@@ -893,6 +938,11 @@ def registra(client, owner: int, fit, batches):
             vecchio.unlink()
         except OSError:
             pass
+    try:
+        if persona_ripristina_orfane():
+            log("avvio: link rimasti a metà di un invio interrotto rimessi nelle liste")
+    except Exception as e:
+        log(f"avvio: recupero degli invii interrotti non riuscito: {e!r}")
 
     class _Fallito(Exception):
         """Il link non si è potuto scaricare/preparare (non è un errore di Discord)."""
@@ -1076,10 +1126,29 @@ def registra(client, owner: int, fit, batches):
         # Discord vuole una risposta entro 3 secondi: rispondo subito, poi lavoro
         await interaction.response.defer(thinking=True)
         in_corso.add(nome)
+        # la lista si svuota subito: gli elementi passano in una copia nascosta (backup compreso) e a fine
+        # invio ciò che non è partito torna in lista
+        try:
+            coda = await asyncio.to_thread(persona_prendi_lista, nome)
+        except Exception as e:
+            in_corso.discard(nome)
+            log(f"/invia «{nome}»: preparazione non riuscita: {e!r}")
+            await interaction.followup.send(f"Non riesco a preparare l'invio: {str(e)[:150]}", ephemeral=True)
+            return
+        if not coda:
+            in_corso.discard(nome)
+            try:
+                await interaction.delete_original_response()
+            except Exception:
+                pass
+            await interaction.followup.send(f"Niente in coda per «{nome}».", ephemeral=True)
+            return
         if nuova_chat:
-            diagnostica_interazione(interaction, log)
-            await salva_avatar_discord(interaction, nome, log)
-        await asyncio.to_thread(fai_backup, nome, True)   # copia della lista prima che si svuoti
+            try:
+                diagnostica_interazione(interaction, log)
+                await salva_avatar_discord(interaction, nome, log)
+            except Exception as e:      # l'avatar non deve lasciare la lista nascosta e «in corso»
+                log(f"/invia «{nome}»: avatar/diagnostica non riusciti: {e!r}")
         t0 = time.time()
         stat = {"pub": 0}                   # messaggi partiti nella chat
         falliti: list[str] = []
@@ -1120,7 +1189,7 @@ def registra(client, owner: int, fit, batches):
                     if tipo == "testo":
                         await interaction.followup.send(valori[0])
                         stat["pub"] += 1
-                        aggiorna_riga(nome, riga, None)
+                        persona_togli_riga(nome, riga, None)
                         cronologia(nome, riga)
                     else:
                         fatti = []
@@ -1140,7 +1209,7 @@ def registra(client, owner: int, fit, batches):
                         finally:
                             # tolgo dalla lista ciò che è partito, anche se mi interrompo a metà
                             restanti = [u for u in valori if u not in fatti]
-                            aggiorna_riga(nome, riga, " ".join(restanti) if restanti else None)
+                            persona_togli_riga(nome, riga, " ".join(restanti) if restanti else None)
                             for u in fatti:
                                 cronologia(nome, u)
                 except IgLimite as e:     # soglia alta Instagram: mi fermo, il resto resta in lista
@@ -1160,6 +1229,10 @@ def registra(client, owner: int, fit, batches):
             else:
                 completato = True
         finally:
+            try:
+                persona_ripristina(nome)      # i link non partiti tornano in lista (prima di dire «finito»)
+            except Exception as e:
+                log(f"/invia «{nome}»: non riesco a rimettere in lista i link non partiti: {e!r}")
             in_corso.discard(nome)
             task_prog.cancel()
             if completato:   # barra piena per qualche secondo; poi la GUI lo ignora da sola
@@ -2389,7 +2462,7 @@ def avvia_gui():
     hint = tk.Label(dx, anchor="w", justify="left", fg=T.MUTED,
              text="Un link per riga. Più link sulla stessa riga (separati da spazio) = un solo messaggio.\n"
                   "Le righe che iniziano con > sono messaggi di testo, quelle con # sono commenti.\n"
-                  "Con /invia le righe partite spariscono da qui."
+                  "Con /invia la lista si svuota subito; i link non partiti tornano qui a fine invio."
                   + (f" Salvataggio automatico ogni {AUTOSAVE_SEC:g} s." if AUTOSAVE_SEC else ""))
     hint.pack(fill="x", pady=(0, 4))
     cornice = tk.Frame(dx)
@@ -2490,7 +2563,7 @@ def avvia_gui():
                 return False    # l'ha cambiata il bot: senza chiedere non la sovrascrivo
             if not messagebox.askyesno(
                     "Lista cambiata",
-                    "Il bot ha modificato questa lista nel frattempo (ha inviato dei link).\n"
+                    "Questa lista è cambiata nel frattempo (/invia l'ha svuotata o ha rimesso dei link non consegnati).\n"
                     "Sovrascrivere con quello che vedi?\n\nScegli No per ricaricare la lista aggiornata."):
                 testo.edit_modified(False)
                 carica(nome)
@@ -2634,17 +2707,30 @@ def avvia_gui():
                 p = file_persona(nome)
                 if p.exists() and p.stat().st_mtime != st["mtime"]:
                     if dirty():
-                        msg.config(text="⚠ Il bot ha modificato la lista: salvando potresti "
-                                        "reinviare link già partiti.", fg=T.ERR)
+                        msg.config(text="⚠ La lista è cambiata (/invia l'ha svuotata o ha rimesso dei link non "
+                                        "consegnati): salva a mano per decidere.", fg=T.ERR)
                     else:
                         carica(nome)
-                        msg.config(text="Lista aggiornata (il bot ha inviato qualcosa).", fg=T.OK)
+                        msg.config(text="Lista aggiornata dal bot.", fg=T.OK)
                 else:
                     aggiorna_info()
             riempi_lista()
         except Exception as e:
             _log_gui(f"tick: errore {e!r}")
         root.after(3000, tick)
+
+    def controlla_lista():
+        """Ogni 0,4 s: se il bot ha cambiato la lista selezionata (/invia l'ha appena svuotata) la ricarico subito."""
+        try:
+            nome = st["nome"]
+            if nome and not dirty():
+                p = file_persona(nome)
+                if p.exists() and p.stat().st_mtime != st["mtime"]:
+                    carica(nome)
+                    msg.config(text="Lista aggiornata dal bot.", fg=T.OK)
+        except Exception as e:
+            _log_gui(f"controllo lista: errore {e!r}")
+        root.after(400, controlla_lista)
 
     def battito():
         """Segnala al bot che la GUI è aperta (così /invia sa che può chiederle di salvare)."""
@@ -2791,6 +2877,7 @@ def avvia_gui():
     battito()
     root.after(3000, tick)
     root.after(300, controlla_richiesta)
+    root.after(400, controlla_lista)
     root.after(1000, aggiorna_progresso)
     if AUTOSAVE_SEC > 0:
         root.after(int(AUTOSAVE_SEC * 1000), autosalva)

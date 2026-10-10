@@ -251,7 +251,7 @@ async function pollP(){
       }
     }
     await listaP();
-  }finally{setTimeout(pollP,3000);}
+  }finally{setTimeout(pollP,document.hidden?3000:600);}
 }
 
 /* ---------- Telegram ---------- */
@@ -293,7 +293,7 @@ async function pollT1(){
   }
   T.era=att;return r;
 }
-async function pollT(){try{await pollT1();}finally{setTimeout(pollT,T.era?700:3000);}}
+async function pollT(){try{await pollT1();}finally{setTimeout(pollT,document.hidden?3000:(T.era?600:700));}}
 $("#invia").onclick=async()=>{
   const at=T.canali.filter(c=>c.attivo);
   if(!at.length)return alert("Spunta almeno un canale.");
