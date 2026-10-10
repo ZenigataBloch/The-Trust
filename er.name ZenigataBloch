@@ -1,0 +1,93 @@
+[33mcommit 51695555e60078547c16b6e5b68d80de04d87adc[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Author: ZenigataBloch <ID+ZenigataBloch@users.noreply.github.com>
+Date:   Sat Oct 10 00:42:54 2026 +0200
+
+    update alla GUI desktop
+    
+    Amended
+
+[33mcommit 81f3dbd052cca8c4ee1befd11ff7c920bc3dd01c[m
+Author: ZenigataBloch <zeromindfang@gmail.com>
+Date:   Sat Oct 10 00:42:54 2026 +0200
+
+    Aggiornamento UI desktop w/ update feature
+
+[33mcommit cc15043d588de25ea26e558943b3a27c0f42084d[m
+Author: ZenigataBloch <zeromindfang@gmail.com>
+Date:   Sat Oct 10 00:42:54 2026 +0200
+
+    Instagram fix
+
+[33mcommit a98ab4bca5744558b09c2a216a9014810d42c17d[m
+Author: AlessandroSuppa <alessandro.suppa94@gmail.com>
+Date:   Fri Oct 9 23:53:52 2026 +0200
+
+    small update
+
+[33mcommit 5d8837a45dd16a00d3a136f0f1ac8e93cb81c9ee[m
+Author: AlessandroSuppa <alessandro.suppa94@gmail.com>
+Date:   Fri Oct 9 23:48:24 2026 +0200
+
+    funzione di update nell'app, più inserimento cookies
+
+[33mcommit 51b3dcda078e58a42735f1b9f09a41af82fdb3d5[m
+Author: AlessandroSuppa <alessandro.suppa94@gmail.com>
+Date:   Fri Oct 9 23:39:36 2026 +0200
+
+    aggiunte funzioni di log e update all'UI
+
+[33mcommit d87d83e1dc13fc54825123504cca0d354507edf9[m
+Author: AlessandroSuppa <alessandro.suppa94@gmail.com>
+Date:   Fri Oct 9 23:29:33 2026 +0200
+
+    nuova icona e aggiornamenti
+
+[33mcommit ce1ad0bc2c9423baaf09b93a84f655c43453ff83[m
+Author: AlessandroSuppa <alessandro.suppa94@gmail.com>
+Date:   Fri Oct 9 23:15:18 2026 +0200
+
+    webapp test
+
+[33mcommit 23237039841d491510bf0e08ce951c73f3013d0c[m
+Author: AlessandroSuppa <alessandro.suppa94@gmail.com>
+Date:   Fri Oct 9 22:43:36 2026 +0200
+
+    Widget Termux, log su Linux, flag di arresto
+
+[33mcommit 991abfde564b004fe2e2704365ed86c79e987f4c[m
+Author: AlessandroSuppa <alessandro.suppa94@gmail.com>
+Date:   Fri Oct 9 22:38:27 2026 +0200
+
+    Lanciatore da terminale per Termux
+
+[33mcommit bc01e508a247f9f6d61c6b7e69cfc615b06e499f[m
+Author: AlessandroSuppa <alessandro.suppa94@gmail.com>
+Date:   Fri Oct 9 22:36:11 2026 +0200
+
+    messaggio del commit
+
+[33mcommit 0440609bae25c3c82d23ed30bf73c1a87ab02007[m
+Merge: 53d922c 010d0f4
+Author: AlessandroSuppa <alessandro.suppa94@gmail.com>
+Date:   Fri Oct 9 22:33:30 2026 +0200
+
+    Merge branch 'main' of https://github.com/ZenigataBloch/The-Trust
+    Update
+
+[33mcommit 53d922cd05015f7d9213e6f1b5841f46d72ef390[m
+Author: AlessandroSuppa <alessandro.suppa94@gmail.com>
+Date:   Fri Oct 9 22:33:13 2026 +0200
+
+    README e modello di bots.env
+
+[33mcommit 010d0f4cc9c62c0058fefc1dcac4a6c86e467cbf[m
+Author: ZenigataBloch <43986930+ZenigataBloch@users.noreply.github.com>
+Date:   Fri Oct 9 22:32:46 2026 +0200
+
+    Create README.md
+
+[33mcommit 1e1cbc799cd0a3df25b3f58c1f90831e70f1ac7c[m
+Author: AlessandroSuppa <alessandro.suppa94@gmail.com>
+Date:   Fri Oct 9 22:14:44 2026 +0200
+
+    primo commit

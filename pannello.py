@@ -42,6 +42,7 @@ except ImportError as e:
 PORTA = 8080
 HOSTS = {f"localhost:{PORTA}", f"127.0.0.1:{PORTA}"}   # blocca il DNS rebinding
 FLAG = BM.BASE / "bots_fermi.flag"
+MANUALE = BM.BASE / "bots_spenti_a_mano.flag"   # li hai spenti tu dal led: l'apertura/refresh della pagina NON li riaccende
 HTML = BM.BASE / "pannello.html"
 OGNI_MIN = 30
 log = O._log_gui
@@ -73,16 +74,29 @@ def r_bots(_):
 
 
 def r_bots_start(_):
+    """Accensione ESPLICITA (clic sul led): toglie anche lo spegnimento manuale."""
+    FLAG.unlink(missing_ok=True)
+    MANUALE.unlink(missing_ok=True)
+    bg(g.avvia_mancanti)
+    return 200, {}
+
+
+def r_bots_apri(_):
+    """Chiamata dalla pagina al caricamento/refresh: accende i bot SOLO se non li hai spenti a mano."""
+    if MANUALE.exists():
+        return 200, {"manuale": True}
     FLAG.unlink(missing_ok=True)
     bg(g.avvia_mancanti)
     return 200, {}
 
 
 def r_bots_stop(_):
-    try:
-        FLAG.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
-    except OSError:
-        pass
+    ora = time.strftime("%Y-%m-%d %H:%M:%S")
+    for f in (FLAG, MANUALE):
+        try:
+            f.write_text(ora, encoding="utf-8")
+        except OSError:
+            pass
     bg(g.ferma_tutti)
     return 200, {}
 
@@ -623,7 +637,7 @@ SW = "self.addEventListener('fetch',()=>{});"
 ICONE = {"/icon-192.png": BM.BASE / "icon-192.png", "/icon-512.png": BM.BASE / "icon-512.png"}
 
 GET = {"/api/bots": r_bots, "/api/persone": r_persone, "/api/persona": r_persona, "/api/tg": r_tg, "/api/log": r_log, "/api/cookie": r_cookie}
-POST = {"/api/bots/start": r_bots_start, "/api/bots/stop": r_bots_stop, "/api/righe": r_righe,
+POST = {"/api/bots/start": r_bots_start, "/api/bots/apri": r_bots_apri, "/api/bots/stop": r_bots_stop, "/api/righe": r_righe,
         "/api/persona/salva": r_p_salva, "/api/persona/nuova": r_p_nuova, "/api/persona/elimina": r_p_elimina,
         "/api/persona/scollega": r_p_scollega, "/api/tg/salva": r_t_salva, "/api/tg/toggle": r_t_toggle,
         "/api/tg/rimuovi": r_t_rimuovi, "/api/tg/aggiungi": r_t_aggiungi, "/api/tg/nomi": r_t_nomi,
