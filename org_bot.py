@@ -179,7 +179,8 @@ def nome_valido(nome: str) -> bool:
 
 
 def nomi_persone() -> list[str]:
-    return sorted((p.stem for p in INVII_DIR.glob("*.txt")), key=str.lower)
+    # i file di conflitto di Syncthing (Nome.sync-conflict-DATA-ID.txt) non sono persone
+    return sorted((p.stem for p in INVII_DIR.glob("*.txt") if ".sync-conflict-" not in p.name), key=str.lower)
 
 
 def file_persona(nome: str) -> Path:
