@@ -1546,7 +1546,7 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
             aggiorna_info()
         except Exception as e:
             _log_gui(f"scheda Telegram, tick: errore {e!r}")
-        root.after(3000, tick)
+        root.after(1000 if st["invio"] is not None else 3000, tick)   # più rapido finché sta inviando (la lista si svuota)
 
     def autosalva():
         try:
@@ -1555,6 +1555,28 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
         except Exception as e:
             _log_gui(f"scheda Telegram, salvataggio automatico: errore {e!r}")
         root.after(int(AUTOSAVE_SEC * 1000), autosalva)
+
+    rapido = {"job": None}
+
+    def salva_rapido():
+        """Salvataggio quasi immediato: circa 1 s dopo l'ultima modifica (senza aspettare AUTOSAVE_SEC)."""
+        rapido["job"] = None
+        try:
+            if dirty() and st["invio"] is None:      # durante un invio la lista la tocca solo il bot
+                salva(auto=True, motivo="Salvataggio automatico")
+        except Exception as e:
+            _log_gui(f"scheda Telegram, salvataggio rapido: errore {e!r}")
+
+    def salva_presto(_e=None):
+        if AUTOSAVE_SEC <= 0:                        # INVII_AUTOSAVE_SEC=0 = salvataggio automatico disattivato
+            return
+        if rapido["job"] is not None:
+            root.after_cancel(rapido["job"])
+        rapido["job"] = root.after(1000, salva_rapido)
+
+    testo.bind("<<Modified>>", salva_presto, add="+")   # incolla / inserimenti da pulsante
+    testo.bind("<KeyRelease>", salva_presto, add="+")   # digitazione
+    testo.bind("<FocusOut>", lambda e: salva_rapido() if (AUTOSAVE_SEC > 0 and dirty()) else None, add="+")
 
     for txt, cmd in (("Aggiungi ID…", aggiungi), ("Aggiorna nomi", aggiorna_nomi)):
         tk.Button(bt_sx, text=txt, command=cmd).pack(side="left", expand=True, fill="x", padx=1, pady=(4, 0))
@@ -2498,6 +2520,28 @@ def avvia_gui():
         except Exception as e:
             _log_gui(f"salvataggio automatico: errore {e!r}")
         root.after(int(AUTOSAVE_SEC * 1000), autosalva)
+
+    rapido = {"job": None}
+
+    def salva_rapido():
+        """Salvataggio quasi immediato: circa 1 s dopo l'ultima modifica (senza aspettare AUTOSAVE_SEC)."""
+        rapido["job"] = None
+        try:
+            if dirty():
+                salva(auto=True, motivo="Salvataggio automatico")
+        except Exception as e:
+            _log_gui(f"salvataggio rapido: errore {e!r}")
+
+    def salva_presto(_e=None):
+        if AUTOSAVE_SEC <= 0:
+            return
+        if rapido["job"] is not None:
+            root.after_cancel(rapido["job"])
+        rapido["job"] = root.after(1000, salva_rapido)
+
+    testo.bind("<<Modified>>", salva_presto, add="+")
+    testo.bind("<KeyRelease>", salva_presto, add="+")
+    testo.bind("<FocusOut>", lambda e: salva_rapido() if (AUTOSAVE_SEC > 0 and dirty()) else None, add="+")
 
     def prepara_chiusura() -> bool:
         """Salvataggi, conferma se c'è un invio in corso, tolgo il segnale GUI. False = l'utente annulla."""

@@ -294,7 +294,7 @@ async function pollT1(){
   }
   T.era=att;return r;
 }
-async function pollT(){try{await pollT1();}finally{setTimeout(pollT,T.era?1500:3000);}}
+async function pollT(){try{await pollT1();}finally{setTimeout(pollT,T.era?700:3000);}}
 $("#invia").onclick=async()=>{
   const at=T.canali.filter(c=>c.attivo);
   if(!at.length)return alert("Spunta almeno un canale.");
