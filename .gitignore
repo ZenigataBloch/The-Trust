@@ -25,3 +25,9 @@ instagram_uso.json
 __pycache__/
 *.zip
 bots_fermi.flag
+discord_comandi.hash
+discord_pronto.flag
+bots_pid.json
+bots_fermi.flag
+bots_spenti_a_mano.flag
+*.log
