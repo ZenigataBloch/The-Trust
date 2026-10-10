@@ -47,6 +47,7 @@ attiva_log_su_file()
 import asyncio
 import atexit
 import datetime
+import html
 import json
 import logging
 import os
@@ -57,6 +58,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import traceback
 from importlib import metadata
@@ -535,6 +538,68 @@ def _download_cookie(url: str, folder: str) -> list[Path]:
     raise CookieError(_messaggio_cookie(sito, fatti, ultimo))
 
 
+# ---------- fonte: post pubblici di Telegram ----------
+# Link tipo https://t.me/canale/123 (anche t.me/s/canale/123). Si legge la pagina "embed" pubblica del
+# post: niente login, niente account. Non funziona per canali privati/con contenuto protetto.
+_TG_POST_RE = re.compile(r"^https?://(?:www\.)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,})/(\d+)(?:[/?#].*)?$", re.I)
+_TG_MEDIA_RE = re.compile(
+    r"<video[^>]*?\ssrc=\"([^\"]+)\""                                              # video, GIF, video tondi
+    r"|tgme_widget_message_photo_wrap[^>]*?background-image:\s*url\(['\"]?([^'\")]+)",  # foto
+    re.I,
+)
+_TG_UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0 Mobile Safari/537.36"}
+
+
+def _is_telegram_post(url: str) -> bool:
+    return bool(_TG_POST_RE.match(url.strip()))
+
+
+def _tg_media(pagina: str) -> list[tuple[str, str]]:
+    """[(tipo, url)] nell'ordine in cui compaiono nella pagina, senza doppioni."""
+    out, visti = [], set()
+    for m in _TG_MEDIA_RE.finditer(pagina):
+        u = html.unescape(m.group(1) or m.group(2))
+        if u.startswith("//"):
+            u = "https:" + u
+        if u in visti or not u.startswith("http"):
+            continue
+        visti.add(u)
+        out.append(("video" if m.group(1) else "foto", u))
+    return out
+
+
+def download_telegram(url: str, folder: str) -> list[Path]:
+    m = _TG_POST_RE.match(url.strip())
+    canale, post = m.group(1), m.group(2)
+    log(f"  post pubblico di Telegram: {canale}/{post}")
+    try:
+        req = urllib.request.Request(f"https://t.me/{canale}/{post}?embed=1&mode=tme", headers=_TG_UA)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            pagina = r.read().decode("utf-8", "replace")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Telegram non raggiungibile: {e}") from None
+    media = _tg_media(pagina)
+    if not media:
+        raise RuntimeError("Nessuna foto o video pubblico in questo post (solo testo, post cancellato, "
+                           "canale privato o contenuto protetto?)")
+    files = []
+    for n, (tipo, u) in enumerate(media, 1):
+        ext = Path(urlsplit(u).path).suffix.lower()
+        if ext not in ALL_EXT:
+            ext = ".mp4" if tipo == "video" else ".jpg"
+        dest = Path(folder) / f"{canale}_{post}_{n}{ext}"
+        log(f"    {tipo} {n}/{len(media)}…")
+        try:
+            with urllib.request.urlopen(urllib.request.Request(u, headers=_TG_UA), timeout=120) as r, \
+                    open(dest, "wb") as f:
+                shutil.copyfileobj(r, f)
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"download del {tipo} {n} non riuscito: {e}") from None
+        files.append(dest)
+    return files
+
+
 # ---------- protezione Instagram ----------
 def _int_env(nome: str, default: int) -> int:
     try:
@@ -662,6 +727,8 @@ def _ig_cooldown(motivo: str):
 def download(url: str, folder: str) -> list[Path]:
     """Punto d'ingresso dei download. Per i link Instagram aggiunge la protezione (conteggio, avviso,
     pausa minima, tetti e pausa dopo una segnalazione); poi scarica con _download_cookie."""
+    if _is_telegram_post(url):          # post pubblico di Telegram: nessun cookie, nessun yt-dlp
+        return download_telegram(url, folder)
     ig = _is_instagram(url)
     if ig:
         _ig_prima()
