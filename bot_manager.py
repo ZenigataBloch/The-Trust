@@ -252,10 +252,19 @@ class GestoreBot:
                     self.log(f"{MODULI[n][0]}: già in esecuzione, lo riprendo senza riavviarlo")
                 else:
                     self.avvia(n)
+            self._heartbeat()
             time.sleep(2.5)           # un bot che crasha subito (token sbagliato…) si vede qui
             self.stato()
         finally:
             self.occupato = False
+
+    def _heartbeat(self):
+        """Sul PC fa partire (se manca) il mittente dell'heartbeat; sul telefono non fa nulla (vedi heartbeat.py)."""
+        try:
+            import heartbeat as HB
+            HB.assicura_sender(self.log)
+        except Exception as e:
+            self.log(f"heartbeat: {e!r}")
 
     # ---- aggiornamento da GitHub
     def _git(self, *args):
@@ -301,6 +310,12 @@ class GestoreBot:
             if self.attivo(n):
                 self.ferma(n)
                 self.avvia(n)
+        if "heartbeat.py" in cambiati:
+            try:
+                import heartbeat as HB
+                HB.riavvia_sender(self.log)
+            except Exception as e:
+                self.log(f"heartbeat: riavvio non riuscito: {e!r}")
         msg = f"aggiornato a {remoto[:7]}"
         if da_riavviare:
             msg += ", riavviati: " + ", ".join(sorted(da_riavviare))

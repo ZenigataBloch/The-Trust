@@ -39,6 +39,12 @@ except ImportError as e:
     raise SystemExit(f"Non riesco a importare org_bot.py: {e}\n"
                      "Se manca tkinter o Pillow dimmelo: branch_tema.py va reso importabile senza.")
 
+try:
+    import heartbeat as HB      # "il PC ha già i bot accesi?" (letto da Telegram, vedi heartbeat.py)
+except Exception as _e:
+    HB = None
+    print(f"heartbeat non disponibile: {_e!r}")
+
 PORTA = 8080
 HOSTS = {f"localhost:{PORTA}", f"127.0.0.1:{PORTA}"}   # blocca il DNS rebinding
 FLAG = BM.BASE / "bots_fermi.flag"
@@ -67,6 +73,35 @@ def bg(fn):
     threading.Thread(target=run, daemon=True).start()
 
 
+def desktop_attivo() -> bool:
+    """True se il PC ha i bot accesi. Alla partenza aspetta (max 8 s) la prima lettura da Telegram."""
+    if HB is None:
+        return False
+    HB.L.attendi(8)
+    return HB.L.attivo
+
+
+def _riallinea():
+    """Il desktop è comparso o sparito: ferma i bot di qui (senza spegnimento manuale) oppure li riaccende."""
+    for _ in range(120):                       # aspetto che finisca un'eventuale operazione in corso
+        if not g.occupato:
+            break
+        time.sleep(0.5)
+    if g.occupato:
+        return
+    if HB.L.attivo:
+        if any(g.stato().values()):
+            log("desktop attivo: fermo i bot di questo dispositivo")
+            bg(g.ferma_tutti)
+    elif not FLAG.exists() and not MANUALE.exists():
+        log("desktop spento: riaccendo i bot di questo dispositivo")
+        bg(g.avvia_mancanti)
+
+
+def su_cambio_desktop(_attivo):
+    threading.Thread(target=_riallinea, daemon=True).start()
+
+
 def r_bots(_):
     out = {}
     for n, a in g.stato().items():
@@ -75,11 +110,14 @@ def r_bots(_):
         if a and not pronto and not err and g.secondi_da_avvio(n) > 90:
             err = "avviato ma non ancora collegato a Discord: controlla il log"
         out[n] = {"nome": BM.MODULI[n][0], "acceso": bool(a), "pronto": pronto, "errore": err}
-    return 200, {"occupato": g.occupato, "bot": out}
+    d = HB.L.info() if HB else {}
+    return 200, {"occupato": g.occupato, "bot": out, "desktop": bool(d.get("attivo")), "desktop_host": d.get("host", "")}
 
 
 def r_bots_start(_):
     """Accensione ESPLICITA (clic sul led): toglie anche lo spegnimento manuale."""
+    if desktop_attivo():
+        return 200, {"desktop": True}          # i bot girano già sul PC: qui restano spenti
     FLAG.unlink(missing_ok=True)
     MANUALE.unlink(missing_ok=True)
     bg(g.avvia_mancanti)
@@ -88,6 +126,8 @@ def r_bots_start(_):
 
 def r_bots_apri(_):
     """Chiamata dalla pagina al caricamento/refresh: accende i bot SOLO se non li hai spenti a mano."""
+    if desktop_attivo():
+        return 200, {"desktop": True}
     if MANUALE.exists():
         return 200, {"manuale": True}
     FLAG.unlink(missing_ok=True)
@@ -114,7 +154,8 @@ def ciclo():
             continue
         try:
             g.aggiorna()
-            g.avvia_mancanti()
+            if not (HB and HB.L.attivo):       # con il desktop attivo i bot di qui restano spenti
+                g.avvia_mancanti()
         except Exception as e:
             log(f"ciclo: errore {e!r}")
 
@@ -537,7 +578,7 @@ def r_c_applica(b):
 
 
 # ------------------------------------------------------------ git pull
-FILE_SERVER = {"pannello.py", "org_bot.py", "bot_manager.py", "bot_log.py", "sendbot_tema.py"}
+FILE_SERVER = {"pannello.py", "org_bot.py", "bot_manager.py", "bot_log.py", "sendbot_tema.py", "heartbeat.py"}
 FILE_BOT = {"telegram_bot.py", "discord_bot.py", "org_bot.py", "bot_log.py"}
 
 
@@ -710,6 +751,8 @@ if __name__ == "__main__":
     if not FLAG.exists() and not any(g.stato().values()):
         # il server parte a bot spenti: li accende l'apertura dell'app (e il ciclo non li tocca prima)
         FLAG.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+    if HB:
+        HB.L.avvia(su_cambio_desktop, log)
     threading.Thread(target=ciclo, daemon=True).start()
     log(f"Branch su http://localhost:{PORTA}  (Ctrl+C per uscire: i bot restano accesi)")
     try:

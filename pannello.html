@@ -17,6 +17,7 @@ header{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:
 #led{width:40px;height:40px;border-radius:50%;border:0;flex:none;background:var(--er);box-shadow:0 0 16px var(--er);cursor:pointer}
 #led.on{background:var(--ok);box-shadow:0 0 16px var(--ok)}
 #led.mid{background:var(--wa);box-shadow:0 0 16px var(--wa)}
+#led.dk{background:#3498db;box-shadow:0 0 16px #3498db;cursor:default}
 #stato b{display:block}
 #stato small{color:var(--mu);white-space:pre-line}
 nav{display:flex;border-bottom:1px solid var(--ln)}
@@ -133,13 +134,14 @@ function bar(id,n,tot,txt){
 async function bots(){
   const s=await api("/api/bots"),led=$("#led"),st=$("#stato");
   if(!s.bot){led.className="";st.replaceChildren(el("b",0,"Server non raggiungibile"));return;}
+  if(s.desktop){led.className="dk";st.replaceChildren(el("b",0,"BRANCH ACCESO SU DESKTOP"),el("small",0,"I bot di questo dispositivo restano spenti"+(s.desktop_host?"\n"+s.desktop_host:"")));return;}
   const k=Object.values(s.bot),up=k.filter(x=>x.acceso).length,pr=k.filter(x=>x.pronto).length;
   led.className=s.occupato||(up&&pr<k.length)?"mid":up?"on":"";
   const t=s.occupato?"IN CORSO…":up&&pr<up?"IN AVVIO…":up===k.length?"BOT ATTIVI":up?"BOT PARZIALI":"BOT SPENTI";
   st.replaceChildren(el("b",0,t),el("small",0,k.map(x=>(x.pronto?"● ":x.acceso?"◐ ":"○ ")+x.nome).join("   ")+k.filter(x=>x.errore).map(x=>"\n"+x.nome+": "+x.errore).join("")));
 }
 $("#led").onclick=async()=>{
-  const s=await api("/api/bots");if(!s.bot||s.occupato)return;
+  const s=await api("/api/bots");if(!s.bot||s.occupato||s.desktop)return;
   await api(Object.values(s.bot).some(x=>x.acceso)?"/api/bots/stop":"/api/bots/start",{});
   setTimeout(bots,300);
 };
