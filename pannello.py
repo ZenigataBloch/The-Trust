@@ -751,7 +751,7 @@ class H(BaseHTTPRequestHandler):
         if self.headers.get("Host") not in HOSTS or self.headers.get("X-Panel") != "1":
             return self._send(403, {})
         if SY:
-            SY.viva()
+            SY.apri()
         if self.path not in POST:
             return self._send(404, {})
         try:
