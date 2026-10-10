@@ -149,19 +149,29 @@ $("#led").onclick=async()=>{
 /* ---------- editor di lista (comune a Discord e Telegram) ---------- */
 function Lista(id,url,extra){
   const ta=$("#ta-"+id),msg=$("#msg-"+id);
-  const L={mtime:0,dirty:false,ta,ricarica:null,
+  const L={mtime:0,dirty:false,ta,ricarica:null,sospeso:()=>false,_t:null,_in:false,
+    presto(ms){   // salvataggio automatico quasi immediato dopo una modifica (ms = attesa dall'ultima modifica)
+      clearTimeout(L._t);
+      L._t=setTimeout(async()=>{
+        if(!L.dirty)return;
+        if(L._in||L.sospeso()){L.presto(1500);return;}
+        L._in=true;try{await L.salva(true);}finally{L._in=false;}
+      },ms);
+    },
     say(t,c){msg.textContent=t;msg.className="msg "+(c||"");},
     set(testo,mt){ta.value=testo;L.mtime=mt;L.dirty=false;},
     async salva(auto,forza){
       if(auto&&!L.dirty)return true;
-      const r=await api(url,{...extra(),testo:ta.value,mtime:L.mtime,forza:!!forza});
+      const testo=ta.value;
+      const r=await api(url,{...extra(),testo,mtime:L.mtime,forza:!!forza});
       if(r._s==409){
         if(auto){L.say("⚠ La lista è cambiata nel frattempo: salva a mano per decidere.","err");return false;}
         if(confirm("La lista è cambiata nel frattempo (sono partiti dei link).\nSovrascrivere con quello che vedi?\n\nAnnulla = ricarica la lista aggiornata."))return L.salva(false,true);
         L.dirty=false;if(L.ricarica)await L.ricarica();return false;
       }
       if(r.errore){L.say("⚠ "+r.errore,"err");return false;}
-      L.mtime=r.mtime;L.dirty=false;
+      L.mtime=r.mtime;L.dirty=(ta.value!==testo);
+      if(L.dirty)L.presto(800);
       L.say((auto?"Salvataggio automatico":"Salvato")+" ("+hhmm()+"): "+r.link+" link, "+r.testi+" messaggi"+(r.ignorate?", "+r.ignorate+" righe ignorate (senza link né >).":"."),r.ignorate?"warn":"ok");
       return true;
     },
@@ -172,9 +182,10 @@ function Lista(id,url,extra){
       const r=await api("/api/righe",{testo:clip,unisci});
       if(!r.righe||!r.righe.length)return L.say("Niente da aggiungere.","warn");
       ta.value+=(ta.value&&!ta.value.endsWith("\n")?"\n":"")+r.righe.join("\n")+"\n";
-      L.dirty=true;ta.scrollTop=ta.scrollHeight;L.say("Aggiunte "+r.righe.length+" righe: ricorda di salvare.","warn");
+      L.dirty=true;ta.scrollTop=ta.scrollHeight;L.say("Aggiunte "+r.righe.length+" righe: salvo…","warn");L.presto(300);
     }};
-  ta.addEventListener("input",()=>L.dirty=true);
+  ta.addEventListener("input",()=>{L.dirty=true;L.presto(800);});
+  ta.addEventListener("blur",()=>{if(L.dirty)L.presto(0);});
   $("#inc-"+id).onclick=()=>L.incolla(false);
   $("#inc1-"+id).onclick=()=>L.incolla(true);
   $("#sal-"+id).onclick=()=>L.salva(false);
@@ -246,6 +257,7 @@ async function pollP(){
 /* ---------- Telegram ---------- */
 const T={sig:"",canali:[],link:0,testi:0,era:false};
 const LT=Lista("t","/api/tg/salva",()=>({}));
+LT.sospeso=()=>T.era;
 LT.ricarica=async()=>{const r=await api("/api/tg");if(r.canali)LT.set(r.testo,r.mtime);};
 function renderCanali(cs){
   const sig=JSON.stringify(cs);if(sig===T.sig)return;T.sig=sig;
@@ -397,7 +409,7 @@ $("#log-c").onclick=async()=>{try{await navigator.clipboard.writeText($("#log").
 setInterval(()=>{if($("#s-l").classList.contains("sel")&&$("#log-auto").checked)caricaLog(false);},3000);
 setInterval(()=>{LP.salva(true);LT.salva(true);},30000);
 setInterval(bots,3000);
-document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")api("/api/sync/apri",{}).then(bots);});
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")api("/api/sync/apri",{}).then(bots);else{LP.presto(0);LT.presto(0);}});
 editorP(false);
 if("serviceWorker"in navigator)navigator.serviceWorker.register("/sw.js").catch(()=>{});
 // app appena aperta (sessione nuova) -> accende i bot anche se erano spenti a mano; semplice refresh -> rispetta lo spegnimento manuale
