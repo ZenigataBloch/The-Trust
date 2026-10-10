@@ -569,16 +569,43 @@ def _tg_media(pagina: str) -> list[tuple[str, str]]:
     return out
 
 
+def _tg_scarica_file(u: str, dest: Path, tentativi: int = 4):
+    """Scarica un file dal CDN di Telegram. Gli errori temporanei (500/502/503, 429, timeout, rete) si
+    riprovano con attesa crescente; 403/404 e simili no, perché ripeterli non serve."""
+    for t in range(1, tentativi + 1):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(u, headers=_TG_UA), timeout=120) as r, \
+                    open(dest, "wb") as f:
+                shutil.copyfileobj(r, f)
+            return
+        except OSError as e:                      # URLError e HTTPError ne derivano
+            dest.unlink(missing_ok=True)          # niente file a metà
+            codice = e.code if isinstance(e, urllib.error.HTTPError) else None
+            temporaneo = codice is None or codice == 429 or codice >= 500
+            if not temporaneo or t == tentativi:
+                raise
+            attesa = 2 * t
+            log(f"    errore temporaneo ({e}), riprovo tra {attesa}s ({t}/{tentativi - 1})")
+            time.sleep(attesa)
+
+
 def download_telegram(url: str, folder: str) -> list[Path]:
     m = _TG_POST_RE.match(url.strip())
     canale, post = m.group(1), m.group(2)
     log(f"  post pubblico di Telegram: {canale}/{post}")
-    try:
-        req = urllib.request.Request(f"https://t.me/{canale}/{post}?embed=1&mode=tme", headers=_TG_UA)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            pagina = r.read().decode("utf-8", "replace")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Telegram non raggiungibile: {e}") from None
+    pagina = None
+    for t in range(1, 4):
+        try:
+            req = urllib.request.Request(f"https://t.me/{canale}/{post}?embed=1&mode=tme", headers=_TG_UA)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                pagina = r.read().decode("utf-8", "replace")
+            break
+        except OSError as e:
+            codice = e.code if isinstance(e, urllib.error.HTTPError) else None
+            if t == 3 or (codice is not None and codice != 429 and codice < 500):
+                raise RuntimeError(f"Telegram non raggiungibile: {e}") from None
+            log(f"    pagina del post: errore temporaneo ({e}), riprovo…")
+            time.sleep(2 * t)
     media = _tg_media(pagina)
     if not media:
         raise RuntimeError("Nessuna foto o video pubblico in questo post (solo testo, post cancellato, "
@@ -591,11 +618,10 @@ def download_telegram(url: str, folder: str) -> list[Path]:
         dest = Path(folder) / f"{canale}_{post}_{n}{ext}"
         log(f"    {tipo} {n}/{len(media)}…")
         try:
-            with urllib.request.urlopen(urllib.request.Request(u, headers=_TG_UA), timeout=120) as r, \
-                    open(dest, "wb") as f:
-                shutil.copyfileobj(r, f)
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"download del {tipo} {n} non riuscito: {e}") from None
+            _tg_scarica_file(u, dest)
+        except OSError as e:
+            cosa = "della foto" if tipo == "foto" else "del video"
+            raise RuntimeError(f"download {cosa} {n} non riuscito: {e}") from None
         files.append(dest)
     return files
 
