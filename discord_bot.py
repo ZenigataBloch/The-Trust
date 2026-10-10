@@ -45,6 +45,7 @@ attiva_log_su_file()
 
 import asyncio
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -91,6 +92,11 @@ for _t in CACHE_DIR.glob("*.tmp"):          # resti di salvataggi interrotti
 log(f"Librerie caricate (discord.py {discord.__version__}). "
     f"Limite upload {mb(MAX_UPLOAD)}, compressione a {mb(TARGET)}.")
 log(f"Cache: {CACHE_DIR} (max {mb(CACHE_MAX)})")
+
+# segnale "sono pronto" per il pannello: creato in on_ready (comandi registrati + connesso), con il mio PID
+PRONTO_FILE = Path(__file__).resolve().parent / "discord_pronto.flag"
+HASH_FILE = Path(__file__).resolve().parent / "discord_comandi.hash"
+PRONTO_FILE.unlink(missing_ok=True)
 log_versioni()
 log("Cookie: " + descrivi_cookie())
 
@@ -102,9 +108,43 @@ class DiscordBot(discord.Client):
                          allowed_mentions=discord.AllowedMentions.none())
         self.tree = app_commands.CommandTree(self)
 
+    def _impronta_comandi(self) -> str:
+        """Impronta dei comandi (e del token): se non cambia, non serve richiamare tree.sync()."""
+        dati = []
+        for c in self.tree.get_commands():
+            try:
+                dati.append(c.to_dict(self.tree))
+            except TypeError:
+                dati.append(c.to_dict())
+        blob = json.dumps(dati, sort_keys=True, default=str) + "|" + TOKEN
+        return hashlib.sha256(blob.encode()).hexdigest()
+
     async def setup_hook(self):
+        # tree.sync() ha un rate limit severo (429): con riavvii ripetuti il bot restava bloccato.
+        # Registro i comandi solo se sono cambiati (per forzarlo: cancella discord_comandi.hash).
+        try:
+            impronta = self._impronta_comandi()
+        except Exception as e:
+            log(f"impronta comandi non calcolabile ({e!r}): registro comunque")
+            impronta = None
+        try:
+            salvata = HASH_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            salvata = ""
+        if impronta and impronta == salvata:
+            log("Comandi slash invariati dall'ultimo avvio: registrazione saltata")
+            return
         log("Registro i comandi slash su Discord…")
-        cmds = await self.tree.sync()   # registra /url globalmente
+        try:
+            cmds = await self.tree.sync()   # registra /url globalmente
+        except Exception as e:
+            log(f"Registrazione comandi non riuscita ({e!r}): uso quelli già presenti su Discord")
+            return
+        if impronta:
+            try:
+                HASH_FILE.write_text(impronta, encoding="utf-8")
+            except OSError:
+                pass
         log("Comandi registrati: " + (", ".join("/" + c.name for c in cmds) or "nessuno"))
 
 
@@ -113,6 +153,10 @@ client = DiscordBot()
 
 @client.event
 async def on_ready():
+    try:
+        PRONTO_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
     log(f"✅ Bot Discord AVVIATO come {client.user} (id {client.user.id}). "
         f"Usa /url in un DM; solo l'utente {OWNER} è autorizzato.")
 

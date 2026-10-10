@@ -68,9 +68,14 @@ def bg(fn):
 
 
 def r_bots(_):
-    return 200, {"occupato": g.occupato,
-                 "bot": {n: {"nome": BM.MODULI[n][0], "acceso": bool(a), "errore": g.errori.get(n)}
-                         for n, a in g.stato().items()}}
+    out = {}
+    for n, a in g.stato().items():
+        pronto = bool(a) and g.pronto(n)
+        err = g.errori.get(n)
+        if a and not pronto and not err and g.secondi_da_avvio(n) > 90:
+            err = "avviato ma non ancora collegato a Discord: controlla il log"
+        out[n] = {"nome": BM.MODULI[n][0], "acceso": bool(a), "pronto": pronto, "errore": err}
+    return 200, {"occupato": g.occupato, "bot": out}
 
 
 def r_bots_start(_):

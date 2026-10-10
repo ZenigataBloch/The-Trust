@@ -35,6 +35,8 @@ BASE = Path(__file__).resolve().parent
 PID_FILE = BASE / "bots_pid.json"
 ENV_FILE = BASE / "bots.env"
 BAT_FILE = BASE / "launch.bat"
+# bot che segnalano da soli di essere pronti scrivendo il proprio PID in questo file (vedi on_ready in discord_bot.py)
+PRONTO_FILES = {"discord": BASE / "discord_pronto.flag"}
 
 # nome interno -> (etichetta, script, variabili obbligatorie)
 MODULI = {
@@ -169,6 +171,24 @@ class GestoreBot:
 
     def stato(self) -> dict:
         return {n: self.attivo(n) for n in MODULI}
+
+    def pronto(self, nome: str) -> bool:
+        """Processo vivo E (se il bot lo segnala) collegato a Discord con i comandi registrati."""
+        if not self.attivo(nome):
+            return False
+        f = PRONTO_FILES.get(nome)
+        if f is None:                      # telegram: nessun segnale, vale "acceso"
+            return True
+        try:
+            return int(f.read_text(encoding="utf-8").strip()) == int(self._leggi().get(nome, {}).get("pid", -1))
+        except (OSError, ValueError):
+            return False
+
+    def secondi_da_avvio(self, nome: str) -> float:
+        try:
+            return max(0.0, time.time() - float(self._leggi().get(nome, {}).get("avviato", 0)))
+        except (TypeError, ValueError):
+            return 0.0
 
     # ---- avvio
     def avvia(self, nome: str) -> bool:
@@ -323,6 +343,9 @@ class GestoreBot:
                         break
                     time.sleep(0.1)
                 self.log(f"{MODULI[nome][0]}: fermato (pid {pid})")
+            pf = PRONTO_FILES.get(nome)
+            if pf is not None:
+                pf.unlink(missing_ok=True)
             f = self._figli.pop(nome, None)
             if f is not None:
                 try:

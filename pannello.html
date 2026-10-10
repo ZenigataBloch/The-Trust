@@ -66,7 +66,7 @@ select.b{max-width:100%}
 </nav>
 <main>
 <section id="s-p" class="sel">
-  <div class="row"><div class="chips" id="chips"></div><button class="b" id="nuova">+ Nuova</button></div>
+  <div class="row"><div class="chips" id="chips"></div><button class="b" id="nuova" aria-label="Nuova persona">+</button></div>
   <div id="info-p" class="mu">Scegli una persona o creane una nuova.</div>
   <textarea id="ta-p" spellcheck="false" autocapitalize="off" disabled></textarea>
   <div id="pr-p" class="prog" hidden><div class="bar"><i></i></div><small></small></div>
@@ -133,10 +133,10 @@ function bar(id,n,tot,txt){
 async function bots(){
   const s=await api("/api/bots"),led=$("#led"),st=$("#stato");
   if(!s.bot){led.className="";st.replaceChildren(el("b",0,"Server non raggiungibile"));return;}
-  const k=Object.values(s.bot),up=k.filter(x=>x.acceso).length;
-  led.className=s.occupato||(up&&up<k.length)?"mid":up?"on":"";
-  const t=s.occupato?"IN CORSO…":up===k.length?"BOT ATTIVI":up?"BOT PARZIALI":"BOT SPENTI";
-  st.replaceChildren(el("b",0,t),el("small",0,k.map(x=>(x.acceso?"● ":"○ ")+x.nome).join("   ")+k.filter(x=>x.errore).map(x=>"\n"+x.nome+": "+x.errore).join("")));
+  const k=Object.values(s.bot),up=k.filter(x=>x.acceso).length,pr=k.filter(x=>x.pronto).length;
+  led.className=s.occupato||(up&&pr<k.length)?"mid":up?"on":"";
+  const t=s.occupato?"IN CORSO…":up&&pr<up?"IN AVVIO…":up===k.length?"BOT ATTIVI":up?"BOT PARZIALI":"BOT SPENTI";
+  st.replaceChildren(el("b",0,t),el("small",0,k.map(x=>(x.pronto?"● ":x.acceso?"◐ ":"○ ")+x.nome).join("   ")+k.filter(x=>x.errore).map(x=>"\n"+x.nome+": "+x.errore).join("")));
 }
 $("#led").onclick=async()=>{
   const s=await api("/api/bots");if(!s.bot||s.occupato)return;
