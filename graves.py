@@ -40,9 +40,33 @@ Altre variabili (tutte opzionali):
 Sicurezza: gli URL delle immagini arrivano da pagine web qualsiasi. Prima di scaricarli (e a ogni
 redirect) controllo che l'indirizzo sia pubblico: niente localhost, rete di casa o indirizzi interni.
 Le chiavi API non finiscono mai nei messaggi di errore né nel log.
+
+BOORU (modulo per tag su rule34.xxx e siti simili)
+  telegram_bot.py   /booru <tag> [-n 1-5] [-s r34|gb|db|e621] [-r]
+  discord_bot.py    /booru tag:<tag> sito:<...> quante:<1-5> casuale:<si/no>
+Per ogni risultato arriva prima l'ANTEPRIMA (immagine leggera con sito, id, tipo, punteggio e link al post)
+e poi il file completo (immagine, gif o video). L'anteprima e il file si scaricano in parallelo.
+Tag: separati da spazio (hatsune_miku solo -cat) oppure da virgola se hanno spazi (hatsune miku, solo).
+-n quanti risultati (default 3, max 5), -s il sito, -r risultati casuali invece dei più recenti.
+Chiavi in bots.env (rule34.xxx e Gelbooru NON funzionano senza: l'API vuole account e chiave):
+  GRAVES_R34_KEY, GRAVES_R34_USER            rule34.xxx (Account -> Options -> API Access Credentials)
+  GRAVES_GELBOORU_KEY, GRAVES_GELBOORU_USER  Gelbooru
+  GRAVES_DANBOORU_USER, GRAVES_DANBOORU_KEY  Danbooru (facoltative; senza, max 2 tag per ricerca)
+  GRAVES_E621_USER, GRAVES_E621_KEY          e621 (facoltative; GRAVES_E621_UA per lo user-agent)
+Altre variabili (opzionali):
+  GRAVES_BOORU_SITO        sito di default (default r34)
+  GRAVES_BOORU_RISULTATI   quanti di default (default 3, massimo 5)
+  GRAVES_BOORU_MAX_MB      non scarica file più grandi di così (default 100; poi i bot comprimono)
+  GRAVES_BOORU_ANTEPRIMA   0 = niente anteprima, manda solo il file
+  GRAVES_BOORU_BLACKLIST   tag in più da escludere, separati da virgola
+Filtro fisso (non disattivabile): le ricerche con tag che riguardano minori vengono rifiutate e i post che
+li hanno vengono scartati. Su Discord il comando gira solo in DM, gruppi privati e canali con limite di età.
+Il tetto GRAVES_MAX_GIORNO vale anche qui (contato a parte per ogni sito).
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import datetime
 import ipaddress
 import json
@@ -168,12 +192,13 @@ def _conta(provider: str):
 
 
 # ---------- provider ----------
-def _http_json(nome: str, req: urllib.request.Request, timeout: int = 20) -> dict:
+def _http_json(nome: str, req: urllib.request.Request, timeout: int = 20, grezzo: bool = False):
     """Esegue la richiesta e restituisce il JSON. Gli errori non contengono mai l'URL (che per alcuni
     provider include la chiave API)."""
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
+            testo = r.read().decode("utf-8", "replace")
+            return testo if grezzo else json.loads(testo)
     except urllib.error.HTTPError as e:
         try:
             corpo = e.read().decode("utf-8", "replace")
@@ -452,3 +477,391 @@ def cerca_e_scarica(query: str, cartella: str | Path, n: int | None = None) -> l
         raise GravesErrore(f"Ho trovato {len(risultati)} risultati per «{query}» ma nessuna immagine si è "
                            "scaricata (i siti bloccano il download). Riprova con un'altra ricerca.")
     return files
+
+
+# ======================================================================================================
+# BOORU - ricerca per tag su rule34.xxx e siti simili: prima l'anteprima, poi il video / l'immagine
+# ======================================================================================================
+_IMG_EXT = {"jpg", "jpeg", "png", "gif", "webp"}
+_VID_EXT = {"mp4", "webm"}
+MAX_BOORU = 5
+USO_BOORU = "Uso: /booru <tag> [-n 1-5] [-s r34|gb|db|e621] [-r]"
+
+# Tag che riguardano minori. Elenco FISSO e non disattivabile: una ricerca che li contiene viene rifiutata
+# e i post che li hanno vengono scartati dai risultati (si può solo ampliare con GRAVES_BOORU_BLACKLIST).
+_VIETATI_RE = re.compile(r"^(?:loli|shota|toddler|infant|underage|under_age|preteen|prepubescent|child)")
+_VIETATI = frozenset({"kid", "kids", "minor", "baby", "cub", "young", "younger",
+                      "little_girl", "little_boy", "small_girl", "small_boy"})
+_ESCLUDI_SERVER = ("loli", "shota", "child", "toddler", "underage", "young")
+
+
+def tag_vietato(tag: str) -> bool:
+    t = (tag or "").strip().lower().lstrip("-~")
+    if not t:
+        return False
+    extra = {x.lower() for x in re.split(r"[,\s]+", _env("GRAVES_BOORU_BLACKLIST")) if x}
+    return t in _VIETATI or t in extra or bool(_VIETATI_RE.match(t))
+
+
+def _num(x) -> int:
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ext_url(url: str) -> str:
+    nome = urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
+    return nome.rsplit(".", 1)[-1].lower() if "." in nome else ""
+
+
+def _https(u) -> str:
+    u = str(u or "").strip()
+    if u.startswith("//"):
+        u = "https:" + u
+    return u if u.startswith(("http://", "https://")) else ""
+
+
+@dataclass
+class RichiestaBooru:
+    tags: list
+    n: int
+    sito: str
+    casuale: bool = False
+
+
+@dataclass
+class PostBooru:
+    sito: str
+    id: str
+    url: str                    # file a piena risoluzione (immagine, gif o video)
+    anteprima: str              # immagine leggera per l'anteprima ("" = nessuna)
+    ext: str
+    tags: frozenset
+    score: int = 0
+
+    @property
+    def video(self) -> bool:
+        return self.ext in _VID_EXT
+
+    @property
+    def pagina(self) -> str:
+        return _SITI[self.sito]["link"].format(id=self.id)
+
+    def etichetta(self) -> str:
+        tipo = "video" if self.video else ("gif" if self.ext == "gif" else "immagine")
+        return f"{_SITI[self.sito]['nome']} #{self.id} · {tipo} · ★{self.score}"
+
+    def scarica(self, cartella: Path, i: int = 0) -> Path:
+        """Scarica il file completo (SSRF e redirect controllati come per le immagini di Google)."""
+        mb = _int_env("GRAVES_BOORU_MAX_MB", 100) or 100
+        return _scarica_media(self.url, Path(cartella) / f"booru_{i:02d}", _SITI[self.sito]["referer"],
+                              mb * 1024 * 1024, solo_immagini=False)
+
+
+def _post(sito, id_, url, anteprime, tags, score):
+    url = _https(url)
+    ext = _ext_url(url) if url else ""
+    if ext not in _IMG_EXT | _VID_EXT or id_ in (None, ""):
+        return None
+    prev = next((a for a in map(_https, anteprime) if a and _ext_url(a) in _IMG_EXT), "")
+    if isinstance(tags, str):
+        tags = tags.split()
+    return PostBooru(sito=sito, id=str(id_), url=url, anteprima=prev, ext=ext,
+                     tags=frozenset(str(t).lower() for t in tags or ()), score=_num(score))
+
+
+def _con_esclusioni(tags: list) -> list:
+    presenti = {t.lstrip("-~").lower() for t in tags}
+    return list(tags) + [f"-{t}" for t in _ESCLUDI_SERVER if t not in presenti]
+
+
+def _basic(utente: str, chiave: str) -> dict:
+    if utente and chiave:
+        return {"Authorization": "Basic " + base64.b64encode(f"{utente}:{chiave}".encode()).decode()}
+    return {}
+
+
+def _json_o_vuoto(nome: str, req: urllib.request.Request):
+    testo = _http_json(nome, req, 25, grezzo=True)
+    if not testo.strip():       # rule34 risponde con un corpo vuoto quando non trova niente
+        return None
+    try:
+        dati = json.loads(testo)
+    except json.JSONDecodeError:
+        raise GravesErrore(f"{nome}: {' '.join(testo.split())[:200]}") from None
+    if isinstance(dati, str):       # rule34 risponde cosi' ("Missing authentication...") con HTTP 200
+        raise GravesErrore(f"{nome}: {' '.join(dati.split())[:200]}")
+    return dati
+
+
+# ---------- i siti ----------
+def _credenziali(k: str, u: str) -> tuple:
+    """Il sito mostra le credenziali come '&api_key=XXXX&user_id=123': se hai incollato quella stringa (in una
+    qualsiasi delle due variabili) ne estraggo i due valori; tolgo anche spazi e virgolette."""
+    blocco = f"{k}&{u}"
+    mk = re.search(r"api_key=([^&\s\"']+)", blocco)
+    mu = re.search(r"user_id=([^&\s\"']+)", blocco)
+    return (mk.group(1) if mk else k.strip().strip("\"'")), (mu.group(1) if mu else u.strip().strip("\"'"))
+
+
+def _dapi(nome: str, base: str, k: str, u: str, tags: list, quanti: int, casuale: bool) -> list:
+    """API 'dapi' (rule34.xxx e Gelbooru). Prima chiede con le esclusioni dei tag vietati lato server; se non
+    esce niente (alcuni siti rispondono vuoto con troppi tag) riprova senza: il filtro locale resta sempre."""
+    k, u = _credenziali(k, u)
+
+    def chiedi(q: list):
+        p = {"page": "dapi", "s": "post", "q": "index", "json": "1", "limit": quanti, "pid": 0,
+             "tags": " ".join(q + (["sort:random"] if casuale else [])), "api_key": k, "user_id": u}
+        dati = _json_o_vuoto(nome, urllib.request.Request(base + "?" + urllib.parse.urlencode(p),
+                                                          headers={"User-Agent": UA}))
+        lista = dati.get("post") if isinstance(dati, dict) else dati
+        return [i for i in (lista or []) if isinstance(i, dict)]
+    lista = chiedi(_con_esclusioni(tags))
+    if not lista:
+        lista = chiedi(list(tags))
+        if lista:
+            log(f"    Graves: {nome} risponde vuoto con le esclusioni lato server: uso solo il filtro locale")
+    return lista
+
+
+def _r34(tags: list, quanti: int, casuale: bool) -> list:
+    k, u = _env("GRAVES_R34_KEY"), _env("GRAVES_R34_USER")
+    if not (k and u):
+        raise GravesErrore("rule34.xxx vuole una chiave API: metti GRAVES_R34_KEY e GRAVES_R34_USER in bots.env "
+                           "(dal sito: Account → Options → API Access Credentials) e riavvia i bot.")
+    return [_post("r34", i.get("id"), i.get("file_url"), (i.get("sample_url"), i.get("preview_url")),
+                  i.get("tags"), i.get("score"))
+            for i in _dapi("rule34.xxx", "https://api.rule34.xxx/index.php", k, u, tags, quanti, casuale)]
+
+
+def _gelbooru(tags: list, quanti: int, casuale: bool) -> list:
+    k, u = _env("GRAVES_GELBOORU_KEY"), _env("GRAVES_GELBOORU_USER")
+    if not (k and u):
+        raise GravesErrore("Gelbooru vuole una chiave API: metti GRAVES_GELBOORU_KEY e GRAVES_GELBOORU_USER "
+                           "in bots.env (dal sito: Account → Options) e riavvia i bot.")
+    return [_post("gelbooru", i.get("id"), i.get("file_url"), (i.get("sample_url"), i.get("preview_url")),
+                  i.get("tags"), i.get("score"))
+            for i in _dapi("Gelbooru", "https://gelbooru.com/index.php", k, u, tags, quanti, casuale)]
+
+
+def _danbooru(tags: list, quanti: int, casuale: bool) -> list:
+    q = list(tags) + (["order:random"] if casuale else [])
+    p = {"tags": " ".join(q), "limit": min(100, quanti)}
+    h = {"User-Agent": UA, **_basic(_env("GRAVES_DANBOORU_USER"), _env("GRAVES_DANBOORU_KEY"))}
+    dati = _json_o_vuoto("Danbooru", urllib.request.Request(
+        "https://danbooru.donmai.us/posts.json?" + urllib.parse.urlencode(p), headers=h))
+    return [_post("danbooru", i.get("id"), i.get("file_url"), (i.get("large_file_url"), i.get("preview_file_url")),
+                  i.get("tag_string"), i.get("score")) for i in (dati or []) if isinstance(i, dict)]
+
+
+def _e621(tags: list, quanti: int, casuale: bool) -> list:
+    utente = _env("GRAVES_E621_USER")
+    ua = _env("GRAVES_E621_UA") or (f"Graves/1.0 (by {utente} on e621)" if utente else "Graves/1.0 (personal bot)")
+    q = _con_esclusioni(tags) + (["order:random"] if casuale else [])
+    p = {"tags": " ".join(q), "limit": min(75, quanti)}
+    h = {"User-Agent": ua, **_basic(utente, _env("GRAVES_E621_KEY"))}
+    dati = _json_o_vuoto("e621", urllib.request.Request(
+        "https://e621.net/posts.json?" + urllib.parse.urlencode(p), headers=h))
+    out = []
+    for i in (dati or {}).get("posts") or []:
+        if not isinstance(i, dict):
+            continue
+        t = i.get("tags") if isinstance(i.get("tags"), dict) else {}
+        tutti = [x for lista in t.values() if isinstance(lista, list) for x in lista]
+        f, s, a = i.get("file") or {}, i.get("sample") or {}, i.get("preview") or {}
+        out.append(_post("e621", i.get("id"), f.get("url"), (s.get("url"), a.get("url")), tutti,
+                         (i.get("score") or {}).get("total")))
+    return out
+
+
+_SITI = {
+    "r34": {"nome": "rule34", "cerca": _r34, "referer": "https://rule34.xxx/",
+            "link": "https://rule34.xxx/index.php?page=post&s=view&id={id}"},
+    "gelbooru": {"nome": "gelbooru", "cerca": _gelbooru, "referer": "https://gelbooru.com/",
+                 "link": "https://gelbooru.com/index.php?page=post&s=view&id={id}"},
+    "danbooru": {"nome": "danbooru", "cerca": _danbooru, "referer": "https://danbooru.donmai.us/",
+                 "link": "https://danbooru.donmai.us/posts/{id}"},
+    "e621": {"nome": "e621", "cerca": _e621, "referer": "https://e621.net/",
+             "link": "https://e621.net/posts/{id}"},
+}
+_ALIAS_SITI = {"r34": "r34", "rule34": "r34", "gb": "gelbooru", "gelbooru": "gelbooru",
+               "db": "danbooru", "danbooru": "danbooru", "e621": "e621", "e6": "e621"}
+
+
+# ---------- richiesta ----------
+def parse_booru(testo: str, n: int | None = None, sito: str | None = None, casuale: bool = False) -> RichiestaBooru:
+    """'hatsune_miku solo -n 2 -s gb -r' -> tag, 2 risultati, gelbooru, casuali. Se c'è una virgola i tag
+    sono separati da virgole e gli spazi diventano _ ('hatsune miku, solo'). Solleva GravesErrore."""
+    toks = "".join(c for c in (testo or "") if c.isprintable() or c.isspace()).split()
+    resto, i = [], 0
+    while i < len(toks):
+        t = toks[i].lower()
+        if t in ("-n", "-s"):
+            if i + 1 >= len(toks):
+                raise GravesErrore(USO_BOORU)
+            if t == "-n":
+                try:
+                    n = int(toks[i + 1])
+                except ValueError:
+                    raise GravesErrore(USO_BOORU) from None
+            else:
+                sito = toks[i + 1]
+            i += 2
+        elif t == "-r":
+            casuale, i = True, i + 1
+        else:
+            resto.append(toks[i])
+            i += 1
+    riga = " ".join(resto)
+    if "," in riga:
+        tags = [x.strip().replace(" ", "_") for x in riga.split(",") if x.strip()]
+    else:
+        tags = riga.split()
+    tags = [t[:80] for t in tags][:20]
+    if not tags:
+        raise GravesErrore(USO_BOORU)
+    if any(tag_vietato(t) for t in tags if not t.startswith("-")):
+        raise GravesErrore("Ricerca non eseguita: contiene tag che riguardano minori.")
+    nome = _ALIAS_SITI.get((sito or _env("GRAVES_BOORU_SITO", "r34")).strip().lower())
+    if not nome:
+        raise GravesErrore("Sito non valido: usa r34, gelbooru (gb), danbooru (db) o e621.")
+    n = max(1, min(MAX_BOORU, n or _int_env("GRAVES_BOORU_RISULTATI", 3) or 3))
+    return RichiestaBooru(tags=tags, n=n, sito=nome, casuale=bool(casuale))
+
+
+def booru_cerca(rich: RichiestaBooru) -> list:
+    """Candidati (circa 4 volte n: alcuni file non si scaricheranno), senza i post con tag vietati."""
+    _conta(f"booru-{rich.sito}")
+    quanti = min(40, max(rich.n * 4, 10))
+    log(f"  Graves: cerco su {_SITI[rich.sito]['nome']} (voglio {rich.n}"
+        f"{', casuali' if rich.casuale else ''})")
+    grezzi = _SITI[rich.sito]["cerca"](rich.tags, quanti, rich.casuale)
+    visti, out, scartati, inutili = set(), [], 0, 0
+    for p in grezzi:
+        if p is None:
+            inutili += 1            # senza file, o in un formato che non gestisco (zip, swf...)
+            continue
+        if p.id in visti:
+            continue
+        visti.add(p.id)
+        if any(tag_vietato(t) for t in p.tags):
+            scartati += 1
+            continue
+        out.append(p)
+    log(f"  Graves: il sito ha restituito {len(grezzi)} post: {len(out)} utilizzabili, "
+        f"{scartati} scartati dal filtro tag, {inutili} senza file o formato non supportato")
+    if not out:
+        nome = _SITI[rich.sito]["nome"]
+        if not grezzi:
+            raise GravesErrore(f"{nome} non ha trovato niente per questi tag.")
+        raise GravesErrore(f"{nome} ha restituito {len(grezzi)} post ma nessuno è utilizzabile "
+                           f"({scartati} scartati dal filtro dei tag, {inutili} senza file o in formato non supportato).")
+    return out
+
+
+# ---------- download (immagini, gif e video) ----------
+def _estensione_media(testa: bytes) -> str | None:
+    e = _estensione(testa)
+    if e:
+        return e
+    if testa[4:8] == b"ftyp":
+        return ".mp4"
+    if testa.startswith(b"\x1a\x45\xdf\xa3"):
+        return ".webm"
+    return None
+
+
+def _scarica_media(url: str, base: Path, referer: str, max_bytes: int, solo_immagini: bool) -> Path:
+    _controlla_url(url)
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*", "Referer": referer})
+    tmp = base.with_name(base.name + ".part")
+    try:
+        with _OPENER.open(req, timeout=30) as resp:
+            try:
+                if int(resp.headers.get("Content-Length") or 0) > max_bytes:
+                    raise GravesErrore("file troppo grande")
+            except ValueError:
+                pass
+            testa = resp.read(16)
+            ext = _estensione_media(testa)
+            if not ext or (solo_immagini and ext in (".mp4", ".webm")):
+                raise GravesErrore("formato non supportato")
+            totale = len(testa)
+            with open(tmp, "wb") as f:
+                f.write(testa)
+                while True:
+                    blocco = resp.read(262144)
+                    if not blocco:
+                        break
+                    totale += len(blocco)
+                    if totale > max_bytes:
+                        raise GravesErrore("file troppo grande")
+                    f.write(blocco)
+        if totale < 1024:
+            raise GravesErrore("file troppo piccolo")
+        dest = base.with_name(base.name + ext)
+        os.replace(tmp, dest)
+        return dest
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _scarica_anteprima(p: PostBooru, cartella: Path, i: int) -> Path | None:
+    if not p.anteprima:
+        return None
+    try:
+        return _scarica_media(p.anteprima, Path(cartella) / f"booru_{i:02d}_anteprima",
+                              _SITI[p.sito]["referer"], 8 * 1024 * 1024, solo_immagini=True)
+    except Exception as e:
+        log(f"    Graves: anteprima di #{p.id} non scaricata ({e})")
+        return None
+
+
+# ---------- punto d'ingresso per i bot ----------
+async def booru_esegui(rich: RichiestaBooru, cartella, anteprima_cb, file_cb,
+                       scadenza: float | None = None) -> tuple[int, list]:
+    """Cerca e, per ogni risultato: scarica anteprima e file in parallelo, chiama `await anteprima_cb(path|None, post)`
+    appena l'anteprima è pronta e poi `await file_cb(path, post)` con il file completo. Si ferma a rich.n file
+    inviati (o a `scadenza`, un time.time()). Restituisce (inviati, problemi). Solleva GravesErrore se la
+    ricerca fallisce o non trova niente."""
+    cartella = Path(cartella)
+    candidati = await asyncio.to_thread(booru_cerca, rich)
+    con_anteprima = _env("GRAVES_BOORU_ANTEPRIMA", "1").lower() not in ("0", "no", "off", "false")
+    inviati, problemi = 0, []
+    for i, p in enumerate(candidati):
+        if inviati >= rich.n:
+            break
+        if scadenza and time.time() > scadenza:
+            problemi.append("tempo quasi scaduto: mi fermo qui")
+            break
+        t_file = asyncio.create_task(asyncio.to_thread(p.scarica, cartella, i))   # parte subito, in parallelo
+        prev = None
+        if con_anteprima:
+            try:
+                prev = await asyncio.to_thread(_scarica_anteprima, p, cartella, i)
+                await anteprima_cb(prev, p)
+            except Exception as e:
+                log(f"    Graves: anteprima di #{p.id} non inviata ({e})")
+                problemi.append(f"{p.etichetta()}: anteprima non inviata ({e})")
+        try:
+            file = await t_file
+        except Exception as e:
+            log(f"    Graves: {p.etichetta()} non scaricato ({e})")
+            problemi.append(f"{p.etichetta()}: non scaricato ({e})")
+            if prev:
+                prev.unlink(missing_ok=True)
+            continue
+        try:
+            log(f"    Graves: invio {p.etichetta()} ({file.stat().st_size // 1024} KB)")
+            await file_cb(file, p)
+            inviati += 1
+        except Exception as e:
+            log(f"    Graves: invio di #{p.id} non riuscito ({e})")
+            problemi.append(f"{p.etichetta()}: invio non riuscito ({e})")
+        finally:
+            for x in (file, prev):      # libero subito il disco: i video possono pesare decine di MB
+                if x:
+                    x.unlink(missing_ok=True)
+    return inviati, problemi

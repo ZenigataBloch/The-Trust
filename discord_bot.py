@@ -1,5 +1,5 @@
 """
-Bot Discord personale (app installabile dall'utente): comandi slash /url e /ricerca.
+Bot Discord personale (app installabile dall'utente): comandi slash /url, /ricerca e /booru.
 
 Uso:
   Scrivi  /url link:<url>  in qualsiasi DM, gruppo privato o server.
@@ -32,6 +32,10 @@ Variabili d'ambiente:
 Ricerca immagini su Google (modulo Graves, graves.py): /ricerca query:<testo> quante:<1-10>
 Serve una chiave di un provider in bots.env (GRAVES_SERPER_KEY, GRAVES_SERPAPI_KEY o
 GOOGLE_API_KEY+GOOGLE_CX): vedi graves.py. Le immagini vengono scaricate e postate come allegati.
+
+Ricerca per tag (rule34.xxx e simili, sempre in graves.py): /booru tag:<tag> sito:<...> quante:<1-5>
+Per ogni risultato prima l'anteprima, poi il file. Funziona solo in DM, gruppi privati e canali con limite
+di età. Chiavi e variabili: vedi l'inizio di graves.py.
 
 Cache: i file già scaricati/compressi restano su disco e, se rimandi lo stesso link
 (anche a un'altra persona), vengono inviati subito senza riscaricare. Per forzare un
@@ -450,6 +454,84 @@ async def cmd_ricerca(interaction: discord.Interaction, query: str,
     log(f"  completato in {time.time() - t0:.0f}s")
     if problems:
         if sent == 0:
+            try:
+                await interaction.delete_original_response()   # niente errori visibili agli altri
+            except Exception:
+                pass
+        try:
+            await interaction.followup.send(("⚠️ " + "\n⚠️ ".join(problems))[:1900], ephemeral=True)
+        except Exception as e:
+            log(f"  non riesco a inviare il riepilogo degli errori: {e}")
+
+
+@client.tree.command(name="booru", description="Cerca per tag (rule34 e simili): prima l'anteprima, poi il file")
+@app_commands.describe(tag="Tag separati da spazio (o da virgola se contengono spazi)",
+                       sito="Dove cercare (default: GRAVES_BOORU_SITO, altrimenti rule34)",
+                       quante="Quanti risultati (1-5, default 3)",
+                       casuale="Risultati casuali invece dei più recenti")
+@app_commands.choices(sito=[app_commands.Choice(name="rule34.xxx", value="r34"),
+                            app_commands.Choice(name="gelbooru", value="gelbooru"),
+                            app_commands.Choice(name="danbooru", value="danbooru"),
+                            app_commands.Choice(name="e621", value="e621")])
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def cmd_booru(interaction: discord.Interaction, tag: str,
+                    sito: Optional[app_commands.Choice[str]] = None,
+                    quante: Optional[app_commands.Range[int, 1, 5]] = None,
+                    casuale: bool = False):
+    if interaction.user.id != OWNER:
+        log(f"Ignorato /booru da {interaction.user.id}: non è DISCORD_OWNER_ID")
+        await interaction.response.send_message("Non sei autorizzato.", ephemeral=True)
+        return
+    if graves is None:
+        await interaction.response.send_message(
+            "Il modulo Graves non è caricato: manca graves.py accanto a telegram_bot.py.", ephemeral=True)
+        return
+    # contenuti per adulti: solo in DM / gruppi privati (nessun server) o in canali con limite di età
+    if interaction.guild_id is not None and not getattr(interaction.channel, "nsfw", False):
+        await interaction.response.send_message(
+            "Qui non posso: in un server il comando funziona solo nei canali con limite di età. "
+            "Usalo in DM, in un gruppo privato o in un canale con limite di età.", ephemeral=True)
+        return
+    try:
+        rich = graves.parse_booru(tag, n=quante, sito=sito.value if sito else None, casuale=casuale)
+    except graves.GravesErrore as e:
+        await interaction.response.send_message(str(e), ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    log(f"/booru ({rich.sito}, {len(rich.tags)} tag, n={rich.n})")
+    t0 = time.time()
+
+    async def anteprima(path, post):
+        testo = f"{post.etichetta()}\n<{post.pagina}>"      # <> = niente embed del sito
+        if path is None:
+            await interaction.followup.send(testo)
+            return
+        h = discord.File(path)
+        try:
+            await interaction.followup.send(testo, file=h)
+        finally:
+            h.close()
+
+    async def invia(path, post):
+        pronto = await fit(path)
+        h = discord.File(pronto)
+        try:
+            await interaction.followup.send(file=h)
+        finally:
+            h.close()
+
+    inviati, problems = 0, []
+    with tempfile.TemporaryDirectory() as dd:
+        try:
+            inviati, problems = await graves.booru_esegui(rich, dd, anteprima, invia, scadenza=t0 + LIMITE_SEC)
+        except Exception as e:
+            log(f"  ERRORE Graves: {e}")
+            problems = [str(e)]
+    log(f"  completato in {time.time() - t0:.0f}s ({inviati} inviati)")
+    if problems:
+        if inviati == 0:
             try:
                 await interaction.delete_original_response()   # niente errori visibili agli altri
             except Exception:

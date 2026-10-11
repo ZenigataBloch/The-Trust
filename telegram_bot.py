@@ -28,6 +28,8 @@ Ricerca immagini su Google (modulo Graves, file graves.py):  /ricerca <cosa cerc
 Funziona solo per OWNER_ID, in chat privata e nei gruppi (non nei canali). Serve una chiave di un
 provider (GRAVES_SERPER_KEY, GRAVES_SERPAPI_KEY o GOOGLE_API_KEY+GOOGLE_CX in bots.env): vedi graves.py.
 GRAVES_ORIGINALE=1 manda le immagini come file (prima un album, poi uno per uno se l'album fallisce), senza
+Ricerca per tag (rule34.xxx e simili, sempre in graves.py):  /booru <tag> [-n 1-5] [-s r34|gb|db|e621] [-r]
+Per ogni risultato prima l'anteprima, poi il file. Chiavi e variabili: vedi l'inizio di graves.py.
 la ricompressione che Telegram applica alle foto.
 
 Protezione Instagram (opzionale; 0 = disattivato). Troppe richieste ravvicinate fanno scattare
@@ -1652,6 +1654,72 @@ async def cmd_ricerca(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await avvisa(err)
 
 
+async def cmd_booru(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/booru <tag> [-n 1-5] [-s r34|gb|db|e621] [-r]: per ogni risultato prima l'anteprima, poi il file."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not chat or not user:
+        return
+    if chat.type not in (ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if user.id != OWNER:
+        log(f"Ignorato /booru da {user.id}: non è OWNER_ID")
+        return
+    kw = {"message_thread_id": msg.message_thread_id} if msg.is_topic_message else {}
+
+    async def avvisa(testo: str):
+        try:
+            await ctx.bot.send_message(OWNER, testo[:4000])
+        except Exception as e:
+            log(f"  non riesco a scrivere in privato ({e}): rispondo nella chat")
+            await ctx.bot.send_message(chat.id, testo[:4000], **kw)
+
+    if graves is None:
+        await avvisa("⚠️ Il modulo Graves non è caricato: manca graves.py accanto a telegram_bot.py.")
+        return
+    try:
+        rich = graves.parse_booru(" ".join(ctx.args or []))
+    except graves.GravesErrore as e:
+        await avvisa(f"ℹ️ {e}")
+        return
+
+    async def anteprima(path, post):
+        testo = f"{post.etichetta()}\n{post.pagina}"
+        if path is None:
+            await ctx.bot.send_message(chat.id, testo, **kw)
+            return
+        with open(path, "rb") as f:
+            try:
+                await ctx.bot.send_photo(chat.id, f, caption=testo, **kw)
+            except Exception:       # per esempio una gif: la mando come documento
+                f.seek(0)
+                await ctx.bot.send_document(chat.id, f, caption=testo, **kw)
+
+    async def invia(path, post):
+        await send_single(ctx.bot, chat.id, path, **kw)
+
+    where = chat.title or "chat privata"
+    log(f"/booru da «{where}» ({rich.sito}, {len(rich.tags)} tag, n={rich.n})")
+    status = await ctx.bot.send_message(chat.id, "🔎 Cerco…", **kw)
+    t0 = time.time()
+    problems = []
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            _, problems = await graves.booru_esegui(rich, d, anteprima, invia)
+        except Exception as e:
+            log(f"  ERRORE Graves: {e}")
+            problems = [str(e)]
+    log(f"  completato in {time.time() - t0:.0f}s")
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    if problems:
+        err = "⚠️ " + "\n⚠️ ".join(problems)
+        if chat.type != ChatType.PRIVATE:
+            err = f"Errore in «{where}»:\n" + err
+        await avvisa(err)
+
+
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log(f"ERRORE: {ctx.error}")
 
@@ -1683,6 +1751,7 @@ def main():
     )
     app.add_handler(InlineQueryHandler(handle_inline))
     app.add_handler(CommandHandler("ricerca", cmd_ricerca))
+    app.add_handler(CommandHandler("booru", cmd_booru))
     app.add_handler(
         MessageHandler(
             (filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST)
