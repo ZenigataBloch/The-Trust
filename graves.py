@@ -27,6 +27,11 @@ Altre variabili (tutte opzionali):
                       viene inviato ma non ho verificato che lo applichi
   GRAVES_LINGUA       lingua dei risultati (default it)
   GRAVES_PAESE        paese dei risultati (default it)
+  GRAVES_MIN_PX       lato lungo minimo (pixel) delle immagini preferite (default 1000; 0 = nessuna
+                      preferenza). Le più piccole vengono messe in fondo: si usano solo se le grandi
+                      non bastano a raggiungere il numero richiesto
+  GRAVES_ORIGINALE    1 = su Telegram manda le immagini come FILE (identiche all'originale) invece che
+                      come foto: Telegram ricomprime le foto a circa 1280 px. Niente galleria in chat
   GRAVES_MAX_MB       non scarica immagini più grandi di così (default 15)
   GRAVES_MAX_GIORNO   tetto di ricerche al giorno, contate a parte per ogni provider
                       (default 80; 0 = nessun tetto)
@@ -44,6 +49,7 @@ import json
 import os
 import re
 import socket
+import struct
 import threading
 import time
 import urllib.error
@@ -69,6 +75,15 @@ class Risultato:
     titolo: str = ""
     pagina: str = ""      # pagina web che la contiene
     miniatura: str = ""
+    w: int = 0            # dimensioni dichiarate dal provider (0 = sconosciute)
+    h: int = 0
+
+
+def _px(x) -> int:
+    try:
+        return max(0, int(x))
+    except (TypeError, ValueError):
+        return 0
 
 
 MAX_RISULTATI = 10
@@ -114,6 +129,10 @@ def _provider() -> str:
             return nome
     raise GravesErrore("Graves non è configurato: metti GRAVES_SERPER_KEY (o GRAVES_SERPAPI_KEY, oppure "
                        "GOOGLE_API_KEY e GOOGLE_CX) in bots.env e riavvia i bot. Vedi l'inizio di graves.py.")
+
+
+def originale() -> bool:
+    return _env("GRAVES_ORIGINALE").lower() in ("1", "si", "sì", "yes", "true", "on")
 
 
 def configurato() -> bool:
@@ -182,7 +201,8 @@ def _serper(query: str, quanti: int) -> list[Risultato]:
         headers={"X-API-KEY": _env("GRAVES_SERPER_KEY"), "Content-Type": "application/json", "User-Agent": UA})
     dati = _http_json("Serper", req)
     return [Risultato(url=i.get("imageUrl") or "", titolo=i.get("title") or "",
-                      pagina=i.get("link") or "", miniatura=i.get("thumbnailUrl") or "")
+                      pagina=i.get("link") or "", miniatura=i.get("thumbnailUrl") or "",
+                      w=_px(i.get("imageWidth")), h=_px(i.get("imageHeight")))
             for i in dati.get("images") or [] if isinstance(i, dict)]
 
 
@@ -198,7 +218,8 @@ def _serpapi(query: str, quanti: int) -> list[Risultato]:
             return []
         raise GravesErrore(f"SerpApi: {str(dati['error'])[:200]}")
     return [Risultato(url=i.get("original") or "", titolo=i.get("title") or "",
-                      pagina=i.get("link") or "", miniatura=i.get("thumbnail") or "")
+                      pagina=i.get("link") or "", miniatura=i.get("thumbnail") or "",
+                      w=_px(i.get("original_width")), h=_px(i.get("original_height")))
             for i in (dati.get("images_results") or [])[:quanti] if isinstance(i, dict)]
 
 
@@ -214,7 +235,8 @@ def _cse(query: str, quanti: int) -> list[Risultato]:
         if isinstance(i, dict):
             img = i.get("image") or {}
             out.append(Risultato(url=i.get("link") or "", titolo=i.get("title") or "",
-                                 pagina=img.get("contextLink") or "", miniatura=img.get("thumbnailLink") or ""))
+                                 pagina=img.get("contextLink") or "", miniatura=img.get("thumbnailLink") or "",
+                                 w=_px(img.get("width")), h=_px(img.get("height"))))
     return out
 
 
@@ -249,7 +271,7 @@ def cerca(query: str, n: int | None = None) -> list[Risultato]:
     n = _quante(n)
     provider = _provider()
     _conta(provider)
-    quanti = min(20, max(n * 2, n + 4))
+    quanti = min(20, max(n * 3, n + 6))
     log(f"  Graves: cerco «{query}» con {provider} (voglio {n} immagini)")
     grezzi = _PROVIDER[provider](query, quanti)
     visti, out = set(), []
@@ -259,6 +281,10 @@ def cerca(query: str, n: int | None = None) -> list[Risultato]:
             out.append(r)
     if not out:
         raise GravesErrore(f"Nessun risultato per «{query}».")
+    minimo = _int_env("GRAVES_MIN_PX", 1000)
+    if minimo:    # le immagini che il provider dichiara piccole vanno in fondo (ordine di Google per il resto)
+        piccola = lambda r: bool(r.w and r.h and max(r.w, r.h) < minimo)
+        out = [r for r in out if not piccola(r)] + [r for r in out if piccola(r)]
     return out
 
 
@@ -303,6 +329,45 @@ def _estensione(testa: bytes) -> str | None:
     return None
 
 
+def _dimensioni(path: Path) -> tuple[int, int]:
+    """(larghezza, altezza) letta dall'intestazione del file; (0, 0) se non riesco."""
+    try:
+        with open(path, "rb") as f:
+            b = f.read(65536)
+        if b.startswith(b"\x89PNG"):
+            return struct.unpack(">II", b[16:24])
+        if b.startswith(b"GIF"):
+            return struct.unpack("<HH", b[6:10])
+        if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+            tipo = b[12:16]
+            if tipo == b"VP8X":
+                return 1 + int.from_bytes(b[24:27], "little"), 1 + int.from_bytes(b[27:30], "little")
+            if tipo == b"VP8L":
+                bit = int.from_bytes(b[21:25], "little")
+                return 1 + (bit & 0x3FFF), 1 + ((bit >> 14) & 0x3FFF)
+            if tipo == b"VP8 ":
+                return int.from_bytes(b[26:28], "little") & 0x3FFF, int.from_bytes(b[28:30], "little") & 0x3FFF
+        if b.startswith(b"\xff\xd8"):
+            i = 2
+            while i + 9 < len(b):
+                if b[i] != 0xFF:
+                    i += 1
+                    continue
+                m = b[i + 1]
+                if m == 0xFF:
+                    i += 1
+                elif m == 0x01 or 0xD0 <= m <= 0xD9:
+                    i += 2
+                elif 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+                    h, w = struct.unpack(">HH", b[i + 5:i + 9])
+                    return w, h
+                else:
+                    i += 2 + struct.unpack(">H", b[i + 2:i + 4])[0]
+    except Exception:
+        pass
+    return 0, 0
+
+
 def _scarica_uno(r: Risultato, cartella: Path, i: int, max_bytes: int) -> Path:
     _controlla_url(r.url)
     u = urllib.parse.urlsplit(r.url)
@@ -343,26 +408,38 @@ def _scarica_uno(r: Risultato, cartella: Path, i: int, max_bytes: int) -> Path:
 
 
 def scarica(risultati: list[Risultato], cartella: str | Path, n: int | None = None) -> list[Path]:
-    """Scarica i risultati in parallelo e restituisce i primi n riusciti, nell'ordine di Google."""
+    """Scarica i risultati in parallelo e restituisce n file: prima le immagini con il lato lungo di almeno
+    GRAVES_MIN_PX, nell'ordine di Google; se non bastano, le più piccole a completare."""
     n = _quante(n)
     cartella = Path(cartella)
+    minimo = _int_env("GRAVES_MIN_PX", 1000)
     max_bytes = _int_env("GRAVES_MAX_MB", 15) * 1024 * 1024 or 15 * 1024 * 1024
-    files: list[Path] = []
+    grandi: list[Path] = []
+    piccole: list[Path] = []
     with ThreadPoolExecutor(max_workers=5) as ex:
         futuri = [ex.submit(_scarica_uno, r, cartella, i, max_bytes) for i, r in enumerate(risultati)]
         for r, fut in zip(risultati, futuri):
-            if len(files) >= n:
+            if len(grandi) >= n:
                 fut.cancel()
                 continue
+            host = urllib.parse.urlsplit(r.url).netloc
             try:
-                files.append(fut.result())
+                p = fut.result()
             except Exception as e:
-                host = urllib.parse.urlsplit(r.url).netloc
                 log(f"    Graves: scartata un'immagine di {host} ({e})")
-    for p in cartella.glob("graves_*"):     # download extra finiti dopo che n era già raggiunto
+                continue
+            w, h = _dimensioni(p)
+            kb = p.stat().st_size // 1024
+            log(f"    Graves: {host} {w}x{h} px, {kb} KB")
+            (grandi if not minimo or max(w, h) >= minimo else piccole).append(p)
+    files = (grandi + piccole)[:n]
+    for p in cartella.glob("graves_*"):     # download extra, o finiti dopo che n era già raggiunto
         if p not in files:
             p.unlink(missing_ok=True)
-    log(f"  Graves: scaricate {len(files)} immagini su {len(risultati)} risultati")
+    if minimo and len(grandi) < len(files):
+        log(f"  Graves: solo {len(grandi)} immagini sopra {minimo} px, le altre sono più piccole "
+            "(abbassa GRAVES_MIN_PX o cerca in modo più specifico)")
+    log(f"  Graves: consegno {len(files)} immagini su {len(risultati)} risultati")
     return files
 
 

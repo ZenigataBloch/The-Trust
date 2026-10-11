@@ -27,6 +27,7 @@ Variabili d'ambiente:
 Ricerca immagini su Google (modulo Graves, file graves.py):  /ricerca <cosa cercare> [-n 1-10]
 Funziona solo per OWNER_ID, in chat privata e nei gruppi (non nei canali). Serve una chiave di un
 provider (GRAVES_SERPER_KEY, GRAVES_SERPAPI_KEY o GOOGLE_API_KEY+GOOGLE_CX in bots.env): vedi graves.py.
+GRAVES_ORIGINALE=1 manda le immagini come file, senza la ricompressione che Telegram applica alle foto.
 
 Protezione Instagram (opzionale; 0 = disattivato). Troppe richieste ravvicinate fanno scattare
 «attività sospetta» sull'account dei cookie: il bot le conta (tutti i moduli, anche dopo un riavvio),
@@ -73,6 +74,7 @@ from urllib.parse import urlsplit, urlunsplit
 import yt_dlp
 from telegram import (
     InlineQueryResultArticle,
+    InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
     InputTextMessageContent,
@@ -1562,6 +1564,28 @@ except Exception as e:
     log(f"graves.py non si carica ({e!r}): il comando /ricerca non è attivo")
 
 
+async def _invia_come_file(bot, chat_id, files: list[Path], **kw) -> list[str]:
+    """GRAVES_ORIGINALE=1: le immagini partono come documenti (a gruppi di 10), senza la ricompressione
+    che Telegram applica alle foto."""
+    errori = []
+    for i in range(0, len(files), 10):
+        gruppo = files[i:i + 10]
+        handles = [open(p, "rb") for p in gruppo]
+        try:
+            if len(gruppo) == 1:
+                await bot.send_document(chat_id, handles[0], filename=gruppo[0].name, **kw)
+            else:
+                await bot.send_media_group(
+                    chat_id, [InputMediaDocument(h, filename=p.name) for h, p in zip(handles, gruppo)], **kw)
+        except Exception as e:
+            log(f"    ERRORE invio come file: {e}")
+            errori.append(f"invio non riuscito: {e}")
+        finally:
+            for h in handles:
+                h.close()
+    return errori
+
+
 async def cmd_ricerca(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not msg or not chat or not user:
@@ -1603,7 +1627,10 @@ async def cmd_ricerca(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             problems.append(str(e))
         else:
             log(f"  trovate {len(files)} immagini, invio su Telegram…")
-            problems.extend(await send_files(ctx.bot, chat.id, files, **kw))
+            if graves.originale():
+                problems.extend(await _invia_come_file(ctx.bot, chat.id, files, **kw))
+            else:
+                problems.extend(await send_files(ctx.bot, chat.id, files, **kw))
     log(f"  completato in {time.time() - t0:.0f}s")
     try:
         await status.delete()
