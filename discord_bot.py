@@ -276,29 +276,42 @@ def _riduci_immagine(path: Path, target: int) -> Path:
     raise ValueError(f"{path.name} è ancora sopra {mb(MAX_UPLOAD)} anche dopo la riduzione")
 
 
-async def fit(path: Path, riduci: bool = True) -> Path:
+async def fit(path: Path, riduci: bool = True, limite: int | None = None) -> Path:
     """Restituisce un file che sta nel limite di Discord: comprime i video, converte le GIF e, se `riduci`,
-    ricomprime le immagini troppo pesanti (con riduci=False le scarta con un errore)."""
-    if path.stat().st_size <= MAX_UPLOAD:
+    ricomprime le immagini troppo pesanti (con riduci=False le scarta con un errore).
+    `limite` (byte) sostituisce MAX_UPLOAD per questa chiamata: serve a riprovare con file più piccoli."""
+    lim = limite or MAX_UPLOAD
+    target = int(lim * 0.9)
+    if path.stat().st_size <= lim:
         return path
     if path.suffix.lower() == ".gif":
         # una GIF troppo grande diventa un mp4 muto, molto più leggero
-        nuovo = await asyncio.to_thread(gif_to_mp4, path, TARGET)
+        nuovo = await asyncio.to_thread(gif_to_mp4, path, target)
         if nuovo == path:   # GIF senza animazione: non c'è niente da convertire
             if not riduci:
-                raise ValueError(f"{path.name} supera {mb(MAX_UPLOAD)}")
-            return await asyncio.to_thread(_riduci_immagine, path, TARGET)
+                raise ValueError(f"{path.name} supera {mb(lim)}")
+            return await asyncio.to_thread(_riduci_immagine, path, target)
         path = nuovo
-        if path.stat().st_size <= MAX_UPLOAD:
+        if path.stat().st_size <= lim:
             return path
     elif path.suffix.lower() not in VIDEO_EXT:
         if not riduci:
-            raise ValueError(f"{path.name} supera {mb(MAX_UPLOAD)}")
-        return await asyncio.to_thread(_riduci_immagine, path, TARGET)
-    small = await asyncio.to_thread(compress_video, path, TARGET, limite_bytes=MAX_UPLOAD)
-    if small.stat().st_size > MAX_UPLOAD:
-        raise ValueError(f"{path.name} è ancora sopra {mb(MAX_UPLOAD)}")
+            raise ValueError(f"{path.name} supera {mb(lim)}")
+        return await asyncio.to_thread(_riduci_immagine, path, target)
+    small = await asyncio.to_thread(compress_video, path, target, limite_bytes=lim)
+    if small.stat().st_size > lim:
+        raise ValueError(f"{path.name} è ancora sopra {mb(lim)}")
     return small
+
+
+def troppo_grande(e: Exception) -> bool:
+    """True se Discord ha rifiutato l'upload per le dimensioni (413 / codice 40005)."""
+    return isinstance(e, discord.HTTPException) and (e.status == 413 or getattr(e, "code", 0) == 40005)
+
+
+# limiti di riprova quando Discord rifiuta un file (il tuo limite reale può essere più basso di MAX_UPLOAD:
+# dipende dall'account e dal server)
+LIMITI_RIPROVA = [x * 1024 * 1024 for x in (10, 7, 4)]
 
 
 def batches(files: list[Path]):
@@ -552,12 +565,21 @@ class ScegliBooru(discord.ui.View):
         try:
             with tempfile.TemporaryDirectory() as dd:
                 path = await graves.booru_file(self.post, dd)
-                pronto = await fit(path)
-                h = discord.File(pronto)
-                try:
-                    await interaction.followup.send(file=h, ephemeral=False)   # pubblico: lo vede la chat
-                finally:
-                    h.close()
+                limiti = [None] + [x for x in LIMITI_RIPROVA if x < MAX_UPLOAD]
+                for k, lim in enumerate(limiti):
+                    pronto = await fit(path, limite=lim)
+                    h = discord.File(pronto)
+                    try:
+                        await interaction.followup.send(file=h, ephemeral=False)   # pubblico: lo vede la chat
+                        break
+                    except Exception as e:
+                        if troppo_grande(e) and k < len(limiti) - 1:
+                            log(f"  Discord rifiuta {mb(pronto.stat().st_size)}: riprovo più piccolo "
+                                f"(max {mb(limiti[k + 1])})")
+                            continue
+                        raise
+                    finally:
+                        h.close()
             log(f"  /booru: inviato {self.post.etichetta()}")
             try:   # inviato: l'anteprima privata sparisce subito
                 await interaction.delete_original_response()

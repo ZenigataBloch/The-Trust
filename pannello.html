@@ -50,6 +50,12 @@ select.b{max-width:100%}
 #stato{flex:1;min-width:0}
 #gitmsg{padding:6px 14px;border-bottom:1px solid var(--ln);white-space:pre-wrap;word-break:break-word}
 #ck-rep div{padding:2px 0}
+.kb{background:var(--pn);border:1px solid var(--ln);border-radius:6px;padding:10px;margin-bottom:8px;display:flex;flex-direction:column;gap:6px}
+.kb h3{margin:0;font-size:15px}
+.kb label{color:var(--mu);font-size:13px}
+.kb .row input{flex:1;min-width:0;background:var(--in);color:var(--fg);border:1px solid var(--ln);border-radius:6px;padding:10px;font:14px ui-monospace,Consolas,monospace}
+.kb .row input:disabled{opacity:.4;text-decoration:line-through}
+.kb .tg{color:var(--er)}
 </style>
 </head>
 <body>
@@ -63,6 +69,7 @@ select.b{max-width:100%}
   <button id="n-p" class="sel">Discord</button>
   <button id="n-t">Telegram</button>
   <button id="n-c">Cookie</button>
+  <button id="n-k">Chiavi</button>
   <button id="n-l">Log</button>
 </nav>
 <main>
@@ -106,6 +113,13 @@ select.b{max-width:100%}
     <div class="row" style="margin-top:6px"><button class="b" id="ck-man-ok">Controlla</button></div></div>
   <div id="ck-rep"></div>
   <div id="msg-c" class="msg"></div>
+</section>
+<section id="s-k">
+  <div class="mu" id="k-file">…</div>
+  <div class="mu">Chiavi API per /booru e /ricerca, scritte in bots.env. Lascia vuoto per non cambiare; ✕ toglie la variabile. Nei campi della chiave puoi incollare la stringa <code>&amp;api_key=…&amp;user_id=…</code> del sito: ricavo chiave e user_id da sola. Le chiavi salvate non vengono mai mostrate per intero.</div>
+  <div id="k-box"></div>
+  <div class="row wrap"><button class="b p" id="k-sal">Salva</button><button class="b" id="k-salr">Salva e riavvia i bot</button></div>
+  <div id="msg-k" class="msg"></div>
 </section>
 <section id="s-l">
   <div class="row wrap"><select class="b grow" id="log-f"></select>
@@ -313,11 +327,12 @@ $("#agg").onclick=()=>{const t=prompt("Incolla ID (-100…), @username o link t.
 $("#nomi").onclick=()=>canaliOp("/api/tg/nomi",{},"Aggiorno i nomi…");
 
 /* ---------- schede, avvio, salvataggio automatico ---------- */
-const SCHEDE=["p","t","c","l"];
+const SCHEDE=["p","t","c","k","l"];
 for(const k of SCHEDE)$("#n-"+k).onclick=()=>{
   for(const j of SCHEDE){$("#n-"+j).classList.toggle("sel",j===k);$("#s-"+j).classList.toggle("sel",j===k);}
   if(k==="l")caricaLog(true);
   if(k==="c")ckStato();
+  if(k==="k")chiaviCarica();
 };
 /* ---------- cookie ---------- */
 const CK={testo:""};
@@ -355,6 +370,52 @@ $("#ck-ap").onclick=async()=>{
   try{await navigator.clipboard.writeText("");}catch(e){}   // i cookie sono sessioni: svuoto gli appunti
   ckStato();
 };
+/* ---------- chiavi API ---------- */
+const KE={campi:{},togli:new Set()};
+function kSay(t,c){const m=$("#msg-k");m.textContent=t;m.className="msg "+(c||"");}
+async function chiaviCarica(){
+  const r=await api("/api/chiavi");if(!r.siti)return;
+  $("#k-file").textContent=r.esiste?r.file:r.file+" non esiste ancora: lo creo al primo salvataggio.";
+  const box=$("#k-box");box.replaceChildren();KE.campi={};KE.togli=new Set();
+  for(const s of r.siti){
+    const d=el("div","kb");d.append(el("h3",0,s.sito));
+    for(const c of s.campi){
+      d.append(el("label",0,c.nome+" · "+c.etichetta+(c.impostata?"":" · non impostata")));
+      const row=el("div","row"),i=el("input");
+      i.type="text";i.autocomplete="off";i.spellcheck=false;i.autocapitalize="off";
+      i.dataset.orig=c.segreta?"":(c.valore||"");
+      i.value=c.segreta?"":(c.valore||c.suggerito||"");
+      i.placeholder=c.segreta?(c.impostata?c.valore+"  (vuoto = invariata)":"incolla la chiave"):"";
+      const x=el("button","b","✕");x.title="Togli questa variabile";
+      x.onclick=()=>{
+        if(KE.togli.has(c.nome)){KE.togli.delete(c.nome);i.disabled=false;x.classList.remove("tg");}
+        else{KE.togli.add(c.nome);i.disabled=true;x.classList.add("tg");}
+      };
+      KE.campi[c.nome]=i;row.append(i,x);d.append(row);
+    }
+    box.append(d);
+  }
+}
+async function chiaviSalva(riavvia){
+  const valori={};
+  for(const [n,i] of Object.entries(KE.campi))if(!KE.togli.has(n)&&i.value.trim()&&i.value!==i.dataset.orig)valori[n]=i.value;
+  const togli=[...KE.togli];
+  if(!Object.keys(valori).length&&!togli.length){
+    if(riavvia){const q=await api("/api/chiavi/riavvia",{});return kSay(q.errore?"⚠ "+q.errore:(q.riavviati?"Bot riavviati.":"I bot sono spenti: leggeranno le chiavi alla prossima accensione."),q.errore?"err":"ok");}
+    return kSay("Niente da cambiare.","warn");
+  }
+  const r=await api("/api/chiavi/salva",{valori,togli});
+  if(r.errore)return kSay("⚠ "+r.errore,"err");
+  let t="✓ Salvato in bots.env ("+hhmm()+"): "+(r.impostate.length?r.impostate.length+" impostate":"")+(r.impostate.length&&r.tolte.length?", ":"")+(r.tolte.length?r.tolte.length+" tolte":"")+".";
+  if(riavvia){
+    const q=await api("/api/chiavi/riavvia",{});
+    t+=q.errore?" ⚠ "+q.errore:(q.riavviati?" Bot riavviati.":" I bot sono spenti: leggeranno le chiavi alla prossima accensione.");
+    kSay(t,q.errore?"warn":"ok");
+  }else kSay(t+" Riavvia i bot per usarle (pulsante «Salva e riavvia i bot»).","ok");
+  chiaviCarica();
+}
+$("#k-sal").onclick=()=>chiaviSalva(false);
+$("#k-salr").onclick=()=>chiaviSalva(true);
 /* ---------- git pull ---------- */
 let gitT=null;
 function gitMsg(t,c,ms){   // ms: dopo quanto il riquadro si chiude da solo (senza ms resta)

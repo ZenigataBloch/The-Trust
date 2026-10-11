@@ -10,6 +10,8 @@ invio Telegram): la logica è quella di Branch, qui cambia solo l'interfaccia.
   - apri la pagina  -> accende i bot che non girano (e toglie il flag di arresto)
   - chiudi la pagina -> i bot restano accesi
   - scheda Cookie    -> incolla i cookie dagli appunti (JSON o cookies.txt), li controlla e aggiorna cookies.txt
+  - scheda Chiavi    -> chiavi API dei booru e dei provider di ricerca: aggiunge/sostituisce/toglie le righe in bots.env
+                        (le chiavi non tornano mai intere al browser) e, a richiesta, riavvia i bot
   - pulsante ⟳       -> git pull e, se serve, riavvio di bot e pannello
   - clic sul led     -> spegne i bot (crea bots_fermi.flag, lo stesso di avvia_bots.py stop)
 """
@@ -20,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path, PurePath
@@ -596,6 +599,192 @@ def r_c_applica(b):
     return 200, res
 
 
+# ------------------------------------------------------------ chiavi API (bots.env)
+# Solo queste variabili si possono leggere/scrivere dal pannello: (variabile, etichetta, valore suggerito se manca)
+CHIAVI_SITI = {
+    "rule34.xxx": [("GRAVES_R34_USER", "user_id", "marquise"), ("GRAVES_R34_KEY", "api key", "")],
+    "Gelbooru": [("GRAVES_GELBOORU_USER", "user_id", "marquise"), ("GRAVES_GELBOORU_KEY", "api key", "")],
+    "Danbooru (facoltativo)": [("GRAVES_DANBOORU_USER", "utente", ""), ("GRAVES_DANBOORU_KEY", "api key", "")],
+    "e621 (facoltativo)": [("GRAVES_E621_USER", "utente", ""), ("GRAVES_E621_KEY", "api key", "")],
+    "Ricerca Google: Serper": [("GRAVES_SERPER_KEY", "chiave", "")],
+    "Ricerca Google: SerpApi": [("GRAVES_SERPAPI_KEY", "chiave", "")],
+}
+CHIAVI_OK = {n: sito for sito, voci in CHIAVI_SITI.items() for n, _e, _s in voci}
+_RE_RIGA_ENV = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+_ENV_SICURO = re.compile(r"^[\w.@:/+,=-]*$")
+_chiavi_lock = threading.Lock()
+
+
+def env_file() -> Path:
+    return getattr(BM, "ENV_FILE", BM.BASE / "bots.env")
+
+
+def _env_pulisci(v: str) -> str:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1]
+    return v
+
+
+def _env_formatta(v: str) -> str:
+    return v if _ENV_SICURO.match(v) else "'" + v.replace("'", "'\\''") + "'"
+
+
+class EnvFile:
+    """bots.env letto come righe: cambia solo le variabili indicate, il resto (commenti, ordine, altre variabili,
+    tipo di fine riga) resta com'è. Una variabile ripetuta viene tenuta una volta sola (l'ultima vince, per i bot)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        try:
+            grezzo = path.read_bytes().decode("utf-8-sig")
+        except FileNotFoundError:
+            grezzo = ""
+        self.eol = "\r\n" if "\r\n" in grezzo else "\n"
+        self.righe = grezzo.replace("\r\n", "\n").split("\n")
+        if self.righe and self.righe[-1] == "":
+            self.righe.pop()
+        self.modificato = False
+
+    def _pos(self, nome: str) -> list:
+        out = []
+        for i, r in enumerate(self.righe):
+            m = _RE_RIGA_ENV.match(r)
+            if m and m.group(2) == nome and not r.lstrip().startswith("#"):
+                out.append(i)
+        return out
+
+    def leggi(self, nome: str):
+        pos = self._pos(nome)
+        return _env_pulisci(_RE_RIGA_ENV.match(self.righe[pos[-1]]).group(3)) if pos else None
+
+    def imposta(self, nome: str, valore: str):
+        pos = self._pos(nome)
+        if pos:
+            pref = _RE_RIGA_ENV.match(self.righe[pos[0]]).group(1)
+            self.righe[pos[0]] = f"{pref}{nome}={_env_formatta(valore)}"
+            for i in reversed(pos[1:]):
+                del self.righe[i]
+        else:
+            self.righe.append(f"{nome}={_env_formatta(valore)}")
+        self.modificato = True
+
+    def rimuovi(self, nome: str) -> bool:
+        pos = self._pos(nome)
+        for i in reversed(pos):
+            del self.righe[i]
+        self.modificato = self.modificato or bool(pos)
+        return bool(pos)
+
+    def salva(self):
+        if not self.modificato:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            shutil.copy2(self.path, self.path.with_name(self.path.name + ".bak"))
+        testo = self.eol.join(self.righe) + (self.eol if self.righe else "")
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".bots.env.")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(testo.encode("utf-8"))
+            with contextlib.suppress(OSError):
+                os.chmod(tmp, 0o600)                       # contiene chiavi: solo tu
+            os.replace(tmp, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        self.modificato = False
+
+
+def _maschera(nome: str, v):
+    """Le chiavi non escono mai intere dal server: solo gli ultimi 4 caratteri."""
+    if v is None:
+        return ""
+    if nome.endswith("_KEY"):
+        return ("•••• " + v[-4:]) if len(v) > 8 else "••••"
+    return v
+
+
+def _credenziali_incollate(testo: str) -> dict:
+    """Dal sito le credenziali sono '&api_key=XXXX&user_id=123': ne ricavo i due valori."""
+    out = {}
+    mk = re.search(r"api_key=([^&\s\"']+)", testo)
+    mu = re.search(r"user_id=([^&\s\"']+)", testo)
+    if mk:
+        out["key"] = mk.group(1)
+    if mu:
+        out["user"] = mu.group(1)
+    return out
+
+
+def r_chiavi(_):
+    env = EnvFile(env_file())
+    siti = []
+    for sito, voci in CHIAVI_SITI.items():
+        campi = []
+        for nome, etichetta, suggerito in voci:
+            v = env.leggi(nome)
+            campi.append({"nome": nome, "etichetta": etichetta, "impostata": bool(v), "valore": _maschera(nome, v),
+                          "segreta": nome.endswith("_KEY"), "suggerito": suggerito})
+        siti.append({"sito": sito, "campi": campi})
+    return 200, {"file": env.path.name, "esiste": env.path.exists(), "siti": siti}
+
+
+def r_k_salva(b):
+    valori, togli = b.get("valori") or {}, b.get("togli") or []
+    if not isinstance(valori, dict) or not isinstance(togli, list):
+        return 400, {"errore": "Richiesta non valida."}
+    estranei = [n for n in list(valori) + togli if n not in CHIAVI_OK]
+    if estranei:
+        return 400, {"errore": "Variabile non gestita dal pannello: " + ", ".join(map(str, estranei[:3]))}
+    with _chiavi_lock:
+        env = EnvFile(env_file())
+        nuovi, tolti = {}, []
+        for nome, v in valori.items():
+            v = str(v)
+            cred = _credenziali_incollate(v)
+            if cred:                                        # stringa &api_key=...&user_id=... incollata
+                voci = [n for n, _e, _s in CHIAVI_SITI[CHIAVI_OK[nome]]]
+                for n in voci:
+                    if n.endswith("_KEY") and "key" in cred:
+                        nuovi[n] = cred["key"]
+                    if n.endswith("_USER") and "user" in cred:
+                        nuovi[n] = cred["user"]
+            elif v.strip():
+                nuovi[nome] = _env_pulisci(v)
+        for nome, v in nuovi.items():
+            env.imposta(nome, v)
+        for nome in togli:
+            if nome not in nuovi and env.rimuovi(nome):
+                tolti.append(nome)
+        env.salva()
+    for nome, v in nuovi.items():                            # i bot partono con l'ambiente del pannello + bots.env
+        os.environ[nome] = v
+    for nome in tolti:
+        os.environ.pop(nome, None)
+    cambiati = sorted(set(nuovi) | set(tolti))
+    if cambiati:
+        log("chiavi: aggiornate " + ", ".join(cambiati))     # solo i nomi, mai i valori
+    return 200, {"cambiati": cambiati, "impostate": sorted(nuovi), "tolte": tolti}
+
+
+def r_k_riavvia(_):
+    """Riavvia i bot (se stanno girando) perché leggano le chiavi nuove."""
+    if g.occupato:
+        return 400, {"errore": "C'è un'operazione in corso: riprova tra qualche secondo."}
+    if inv.get("attivo"):
+        return 400, {"errore": "C'è un invio Telegram in corso: riavvia i bot quando finisce."}
+    if FLAG.exists() or MANUALE.exists() or not any(g.stato().values()):
+        return 200, {"riavviati": False}                     # spenti: leggeranno le chiavi alla prossima accensione
+
+    def corpo():
+        g.ferma_tutti()
+        g.avvia_mancanti()
+    bg(corpo)
+    return 200, {"riavviati": True}
+
+
 # ------------------------------------------------------------ git pull
 FILE_SERVER = {"pannello.py", "org_bot.py", "bot_manager.py", "bot_log.py", "sendbot_tema.py", "heartbeat.py", "sync_ctl.py"}
 FILE_BOT = {"telegram_bot.py", "discord_bot.py", "org_bot.py", "bot_log.py", "graves.py"}
@@ -701,13 +890,15 @@ MANIFEST = json.dumps({
 SW = "self.addEventListener('fetch',()=>{});"
 ICONE = {"/icon-192.png": BM.BASE / "icon-192.png", "/icon-512.png": BM.BASE / "icon-512.png"}
 
-GET = {"/api/bots": r_bots, "/api/persone": r_persone, "/api/persona": r_persona, "/api/tg": r_tg, "/api/log": r_log, "/api/cookie": r_cookie}
+GET = {"/api/bots": r_bots, "/api/persone": r_persone, "/api/persona": r_persona, "/api/tg": r_tg, "/api/log": r_log, "/api/cookie": r_cookie,
+       "/api/chiavi": r_chiavi}
 POST = {"/api/sync/apri": r_sync_apri, "/api/bots/start": r_bots_start, "/api/bots/apri": r_bots_apri, "/api/bots/stop": r_bots_stop, "/api/righe": r_righe,
         "/api/persona/salva": r_p_salva, "/api/persona/nuova": r_p_nuova, "/api/persona/elimina": r_p_elimina,
         "/api/persona/scollega": r_p_scollega, "/api/tg/salva": r_t_salva, "/api/tg/toggle": r_t_toggle,
         "/api/tg/rimuovi": r_t_rimuovi, "/api/tg/aggiungi": r_t_aggiungi, "/api/tg/nomi": r_t_nomi,
         "/api/tg/invia": r_t_invia, "/api/tg/ferma": r_t_ferma,
         "/api/cookie/analizza": r_c_analizza, "/api/cookie/applica": r_c_applica,
+        "/api/chiavi/salva": r_k_salva, "/api/chiavi/riavvia": r_k_riavvia,
         "/api/git/pull": r_git_pull, "/api/git/riavvia": r_git_riavvia}
 
 
