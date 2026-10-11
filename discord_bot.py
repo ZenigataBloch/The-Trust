@@ -1,5 +1,5 @@
 """
-Bot Discord personale (app installabile dall'utente): comando slash /url.
+Bot Discord personale (app installabile dall'utente): comandi slash /url e /ricerca.
 
 Uso:
   Scrivi  /url link:<url>  in qualsiasi DM, gruppo privato o server.
@@ -29,6 +29,10 @@ Variabili d'ambiente:
   DISCORD_CACHE_DIR  (opzionale) cartella della cache, default ~/.cache/discord_bot
   DISCORD_CACHE_MAX_MB (opzionale) tetto della cache, default 500
 
+Ricerca immagini su Google (modulo Graves, graves.py): /ricerca query:<testo> quante:<1-10>
+Serve una chiave di un provider in bots.env (GRAVES_SERPER_KEY, GRAVES_SERPAPI_KEY o
+GOOGLE_API_KEY+GOOGLE_CX): vedi graves.py. Le immagini vengono scaricate e postate come allegati.
+
 Cache: i file già scaricati/compressi restano su disco e, se rimandi lo stesso link
 (anche a un'altra persona), vengono inviati subito senza riscaricare. Per forzare un
 nuovo download usa  /url link:<url> ricarica:True
@@ -52,6 +56,7 @@ import sys
 import tempfile
 import time
 import weakref
+from typing import Optional
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -66,8 +71,8 @@ except ImportError:
 # riuso le funzioni di telegram_bot.py (download, compressione, log)
 try:
     from telegram_bot import (URL_RE, VIDEO_EXT, CookieError, compress_video, descrivi_cookie,
-                     download, gif_to_mp4, log, log_versioni, mb, normalizza_url, prendi_avvisi,
-                     rendi_riproducibile)
+                     download, gif_to_mp4, graves, log, log_versioni, mb, normalizza_url,
+                     prendi_avvisi, rendi_riproducibile)
 except Exception as e:
     sys.exit(f"Non riesco a importare telegram_bot.py (deve stare nella stessa cartella): {e!r}")
 
@@ -388,6 +393,70 @@ async def cmd_url(interaction: discord.Interaction, link: str, ricarica: bool = 
         try:
             await interaction.followup.send(("⚠️ " + "\n⚠️ ".join(problems))[:1900], ephemeral=True)
         except Exception as e:   # tipicamente il token di 15 minuti è già scaduto
+            log(f"  non riesco a inviare il riepilogo degli errori: {e}")
+
+
+@client.tree.command(name="ricerca", description="Cerca immagini su Google e le posta qui")
+@app_commands.describe(query="Cosa cercare", quante="Quante immagini (1-10, default 6)")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def cmd_ricerca(interaction: discord.Interaction, query: str,
+                      quante: Optional[app_commands.Range[int, 1, 10]] = None):
+    if interaction.user.id != OWNER:
+        log(f"Ignorato /ricerca da {interaction.user.id}: non è DISCORD_OWNER_ID")
+        await interaction.response.send_message("Non sei autorizzato.", ephemeral=True)
+        return
+    if graves is None:
+        await interaction.response.send_message(
+            "Il modulo Graves non è caricato: manca graves.py accanto a telegram_bot.py.", ephemeral=True)
+        return
+    try:
+        query, _ = graves.parse_richiesta(query)
+    except graves.GravesErrore as e:
+        await interaction.response.send_message(str(e), ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)   # la ricerca può superare i 3 secondi
+    log(f"/ricerca: {query}")
+    problems, sent = [], 0
+    t0 = time.time()
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            files = await asyncio.to_thread(graves.cerca_e_scarica, query, d, quante)
+        except Exception as e:
+            log(f"  ERRORE Graves: {e}")
+            problems.append(str(e))
+            files = []
+        ready = []
+        for p in files:
+            try:
+                ready.append(await fit(p))
+            except Exception as e:
+                log(f"  ERRORE {p.name}: {e}")
+                problems.append(f"{p.name}: {e}")
+        for i, batch in enumerate(batches(ready)):
+            handles = [discord.File(p) for p in batch]
+            extra = {"content": "🔎 " + discord.utils.escape_markdown(query)} if i == 0 else {}
+            try:
+                log(f"  invio {len(batch)} immagini su Discord…")
+                await interaction.followup.send(files=handles, **extra)
+                sent += len(batch)
+            except Exception as e:
+                log(f"  ERRORE invio: {e}")
+                problems.append(f"invio non riuscito: {e}")
+            finally:
+                for h in handles:
+                    h.close()
+    log(f"  completato in {time.time() - t0:.0f}s")
+    if problems:
+        if sent == 0:
+            try:
+                await interaction.delete_original_response()   # niente errori visibili agli altri
+            except Exception:
+                pass
+        try:
+            await interaction.followup.send(("⚠️ " + "\n⚠️ ".join(problems))[:1900], ephemeral=True)
+        except Exception as e:
             log(f"  non riesco a inviare il riepilogo degli errori: {e}")
 
 

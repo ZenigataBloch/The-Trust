@@ -24,6 +24,10 @@ Variabili d'ambiente:
   AUTO_CHANNEL_ID  (opzionale) canali in cui il bot funziona senza tag: ogni
               post con un link viene scaricato e il post originale cancellato.
 
+Ricerca immagini su Google (modulo Graves, file graves.py):  /ricerca <cosa cercare> [-n 1-10]
+Funziona solo per OWNER_ID, in chat privata e nei gruppi (non nei canali). Serve una chiave di un
+provider (GRAVES_SERPER_KEY, GRAVES_SERPAPI_KEY o GOOGLE_API_KEY+GOOGLE_CX in bots.env): vedi graves.py.
+
 Protezione Instagram (opzionale; 0 = disattivato). Troppe richieste ravvicinate fanno scattare
 «attività sospetta» sull'account dei cookie: il bot le conta (tutti i moduli, anche dopo un riavvio),
 ti avvisa, aspetta tra un download e l'altro e si ferma al raggiungimento di un tetto.
@@ -77,6 +81,7 @@ from telegram import (
 from telegram.constants import ChatType
 from telegram.ext import (
     ApplicationBuilder,
+    CommandHandler,
     ContextTypes,
     InlineQueryHandler,
     MessageHandler,
@@ -1547,6 +1552,70 @@ async def handle_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer([result], cache_time=0, is_personal=True)
 
 
+# ---------- Graves: /ricerca <cosa cercare> [-n 1-10] ----------
+# Modulo facoltativo (graves.py): se manca o non si carica, il bot parte lo stesso senza /ricerca.
+try:
+    import graves
+    graves.log = log
+except Exception as e:
+    graves = None
+    log(f"graves.py non si carica ({e!r}): il comando /ricerca non è attivo")
+
+
+async def cmd_ricerca(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not chat or not user:
+        return
+    if chat.type not in (ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if user.id != OWNER:
+        log(f"Ignorato /ricerca da {user.id}: non è OWNER_ID")
+        return
+    kw = {"message_thread_id": msg.message_thread_id} if msg.is_topic_message else {}
+
+    async def avvisa(testo: str):
+        # come per i link: gli errori vanno nella chat privata con il bot; se non è possibile, in questa
+        try:
+            await ctx.bot.send_message(OWNER, testo[:4000])
+        except Exception as e:
+            log(f"  non riesco a scrivere in privato ({e}): rispondo nella chat")
+            await ctx.bot.send_message(chat.id, testo[:4000], **kw)
+
+    if graves is None:
+        await avvisa("⚠️ Il modulo Graves non è caricato: manca graves.py accanto a telegram_bot.py.")
+        return
+    try:
+        query, n = graves.parse_richiesta(" ".join(ctx.args or []))
+    except graves.GravesErrore as e:
+        await avvisa(f"ℹ️ {e}")
+        return
+
+    where = chat.title or "chat privata"
+    log(f"/ricerca da «{where}»: {query}")
+    status = await ctx.bot.send_message(chat.id, f"🔎 Cerco «{query}»…", **kw)
+    t0 = time.time()
+    problems = []
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            files = await asyncio.to_thread(graves.cerca_e_scarica, query, d, n)
+        except Exception as e:
+            log(f"  ERRORE Graves: {e}")
+            problems.append(str(e))
+        else:
+            log(f"  trovate {len(files)} immagini, invio su Telegram…")
+            problems.extend(await send_files(ctx.bot, chat.id, files, **kw))
+    log(f"  completato in {time.time() - t0:.0f}s")
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    if problems:
+        err = "⚠️ " + "\n⚠️ ".join(problems)
+        if chat.type != ChatType.PRIVATE:
+            err = f"Errore in «{where}»:\n" + err
+        await avvisa(err)
+
+
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log(f"ERRORE: {ctx.error}")
 
@@ -1577,6 +1646,7 @@ def main():
         .build()
     )
     app.add_handler(InlineQueryHandler(handle_inline))
+    app.add_handler(CommandHandler("ricerca", cmd_ricerca))
     app.add_handler(
         MessageHandler(
             (filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST)

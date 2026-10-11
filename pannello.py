@@ -598,7 +598,7 @@ def r_c_applica(b):
 
 # ------------------------------------------------------------ git pull
 FILE_SERVER = {"pannello.py", "org_bot.py", "bot_manager.py", "bot_log.py", "sendbot_tema.py", "heartbeat.py", "sync_ctl.py"}
-FILE_BOT = {"telegram_bot.py", "discord_bot.py", "org_bot.py", "bot_log.py"}
+FILE_BOT = {"telegram_bot.py", "discord_bot.py", "org_bot.py", "bot_log.py", "graves.py"}
 
 
 def _git(*args, timeout=90):
