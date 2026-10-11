@@ -120,9 +120,14 @@ INLINE_TAG = os.environ.get("INLINE_TAG") == "1"
 
 # cookie per i siti che richiedono il login (Instagram, TikTok, X...). Si provano in ordine:
 #   COOKIES_BROWSER  uno o più browser separati da virgola, es. "firefox,chrome"
+#                    se manca, uso i browser installati (firefox, chrome, edge, brave); "none" li esclude
 #   COOKIES_FILE     file Netscape (es. C:\bot\cookies.txt), provato per ultimo
 COOKIES_FILE = os.environ.get("COOKIES_FILE")        # es. C:\bot\cookies.txt (formato Netscape)
 COOKIES_BROWSER = os.environ.get("COOKIES_BROWSER")  # es. firefox
+if not COOKIES_FILE:    # nessuna variabile impostata: se accanto allo script c'è un cookies.txt lo uso
+    _cookies_accanto = Path(__file__).resolve().with_name("cookies.txt")
+    if _cookies_accanto.is_file():
+        COOKIES_FILE = str(_cookies_accanto)
 
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
@@ -352,9 +357,47 @@ class CookieError(RuntimeError):
 
 
 # ---------- catena di cookie ----------
+def _browser_installati() -> list[str]:
+    """Browser che hanno una cartella profilo su questo computer (firefox, chrome, edge, brave).
+    Su Android/Termux non ce ne sono: resta solo il file dei cookie."""
+    home = Path.home()
+    if sys.platform == "win32":
+        roaming = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
+        local = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
+        cartelle = {"firefox": [roaming / "Mozilla" / "Firefox" / "Profiles"],
+                    "chrome": [local / "Google" / "Chrome" / "User Data"],
+                    "edge": [local / "Microsoft" / "Edge" / "User Data"],
+                    "brave": [local / "BraveSoftware" / "Brave-Browser" / "User Data"]}
+    elif sys.platform == "darwin":
+        sup = home / "Library" / "Application Support"
+        cartelle = {"firefox": [sup / "Firefox" / "Profiles"],
+                    "chrome": [sup / "Google" / "Chrome"],
+                    "edge": [sup / "Microsoft Edge"],
+                    "brave": [sup / "BraveSoftware" / "Brave-Browser"]}
+    else:
+        cfg = home / ".config"
+        cartelle = {"firefox": [home / ".mozilla" / "firefox", home / "snap" / "firefox" / "common" / ".mozilla" / "firefox"],
+                    "chrome": [cfg / "google-chrome"],
+                    "edge": [cfg / "microsoft-edge"],
+                    "brave": [cfg / "BraveSoftware" / "Brave-Browser"]}
+    return [b for b, dirs in cartelle.items() if any(d.is_dir() for d in dirs)]
+
+
+def _browser_cookie() -> tuple[list[str], bool]:
+    """(browser da provare, rilevati automaticamente?). COOKIES_BROWSER vince; 'none' li disattiva."""
+    cfg = (COOKIES_BROWSER or "").strip()
+    if cfg.lower() in ("none", "no", "off", "0"):
+        return [], False
+    if cfg:
+        return [b.strip() for b in cfg.split(",") if b.strip()], False
+    return _browser_installati(), True
+
+
 def sorgenti_cookie() -> list[tuple[str, str]]:
-    """Sorgenti da provare in ordine: i browser di COOKIES_BROWSER (es. 'firefox,chrome'), poi il file."""
-    s = [("browser", b.strip()) for b in (COOKIES_BROWSER or "").split(",") if b.strip()]
+    """Sorgenti da provare in ordine: prima i browser (quelli di COOKIES_BROWSER, es. 'firefox,chrome', o
+    quelli installati se la variabile manca), poi il file dei cookie. Se un browser non si legge si passa
+    alla sorgente dopo: così lo stesso bot funziona su desktop (browser) e su Android (file)."""
+    s = [("browser", b) for b in _browser_cookie()[0]]
     if COOKIES_FILE and Path(COOKIES_FILE).is_file():
         s.append(("file", COOKIES_FILE))
     return s
@@ -368,7 +411,8 @@ def etichetta_cookie(sorgente: tuple[str, str]) -> str:
 def descrivi_cookie() -> str:
     nomi = [etichetta_cookie(x) for x in sorgenti_cookie()]
     nota = f" (file {COOKIES_FILE} non trovato)" if COOKIES_FILE and not Path(COOKIES_FILE).is_file() else ""
-    return (" -> ".join(nomi) if nomi else "NESSUNO") + nota
+    auto = " [browser rilevati in automatico]" if _browser_cookie()[1] and any(x[0] == "browser" for x in sorgenti_cookie()) else ""
+    return (" -> ".join(nomi) if nomi else "NESSUNO") + auto + nota
 
 
 # segni nel testo degli errori: cookie che non si riescono a leggere / sito che chiede il login
@@ -405,7 +449,8 @@ def _messaggio_cookie(sito: str, fatti: list[tuple[str, str]], ultimo: "Download
     elif illeg:
         testo = f"COOKIE MANCANTI per {sito}: non riesco a leggere {', '.join(illeg)}."
     else:
-        testo = f"COOKIE MANCANTI per {sito}: nessuna sorgente configurata (imposta COOKIES_BROWSER o COOKIES_FILE)."
+        testo = (f"COOKIE MANCANTI per {sito}: nessuna sorgente configurata (imposta COOKIES_BROWSER o "
+                 "COOKIES_FILE in bots.env, oppure metti cookies.txt accanto a telegram_bot.py).")
     if not login and COOKIES_FILE and not Path(COOKIES_FILE).is_file():
         testo += f" File non trovato: {COOKIES_FILE}."
     righe = [r for r in (ultimo.dettagli if ultimo else "").splitlines() if r.strip()]
@@ -817,12 +862,10 @@ def _tg_utente_conta() -> int:
     return n + 1
 
 
-async def _tg_utente_scarica(cid: int, mid: int, folder: str) -> list[Path]:
+async def _tg_utente_client():
+    """Client Telethon dell'account personale, già connesso e controllato (mai codici interattivi)."""
     from telethon import TelegramClient
-    from telethon.errors import ChannelPrivateError, FloodWaitError
-    from telethon.tl.types import PeerChannel
 
-    peer = PeerChannel(cid)
     # flood_sleep_threshold=0: se Telegram chiede di aspettare non dormo in silenzio, mi fermo e lo dico
     client = TelegramClient(TG_SESSION, TG_API_ID, TG_API_HASH, flood_sleep_threshold=0)
     await client.connect()                       # niente start(): non deve mai chiedere codici da solo
@@ -834,6 +877,45 @@ async def _tg_utente_scarica(cid: int, mid: int, folder: str) -> list[Path]:
             raise RuntimeError("La sessione salvata è di un BOT, non del tuo account: cancella utente.session e "
                                "rilancia  python telegram_login.py  inserendo il tuo NUMERO DI TELEFONO "
                                "(non il token del bot).")
+    except BaseException:
+        await client.disconnect()
+        raise
+    return client
+
+
+def _tg_utente_esegui(descrizione: str, fabbrica):
+    """Controlli, lock, pausa minima e contatore comuni a tutte le richieste dell'account personale.
+    `fabbrica` è una funzione senza argomenti che restituisce la coroutine da eseguire."""
+    _tg_ricarica()
+    mancano = [n for n, v in (("TG_API_ID", TG_API_ID), ("TG_API_HASH", TG_API_HASH)) if not v]
+    if mancano:
+        raise RuntimeError("Per questo link serve l'account personale: mancano " + " e ".join(mancano) + " in "
+                           f"{Path(__file__).resolve().with_name('bots.env')} (vedi telegram_login.py).")
+    try:
+        import telethon  # noqa: F401
+    except ImportError:
+        raise RuntimeError("Manca la libreria telethon:  pip install telethon") from None
+    if not Path(TG_SESSION + ".session").exists():
+        raise RuntimeError("Account personale non collegato: lancia  python telegram_login.py  una volta.")
+    with _tg_utente_lock:                        # una richiesta alla volta, con pausa minima
+        attesa = TG_UTENTE_PAUSA - (time.time() - _tg_utente_ultima[0])
+        if attesa > 0:
+            time.sleep(attesa)
+        n = _tg_utente_conta()
+        log(f"  [account personale] richiesta n. {n} di oggi: {descrizione} (sola lettura)")
+        try:
+            return asyncio.run(fabbrica())
+        finally:
+            _tg_utente_ultima[0] = time.time()
+
+
+async def _tg_utente_scarica(cid: int, mid: int, folder: str) -> list[Path]:
+    from telethon.errors import ChannelPrivateError, FloodWaitError
+    from telethon.tl.types import PeerChannel
+
+    peer = PeerChannel(cid)
+    client = await _tg_utente_client()
+    try:
         try:
             try:
                 msg = await client.get_messages(peer, ids=mid)
@@ -870,35 +952,74 @@ async def _tg_utente_scarica(cid: int, mid: int, folder: str) -> list[Path]:
 def download_telegram_utente(url: str, folder: str) -> list[Path]:
     m = _TG_PRIV_RE.match(url.strip())
     cid, mid = int(m.group(1)), int(m.group(2))
-    _tg_ricarica()
-    mancano = [n for n, v in (("TG_API_ID", TG_API_ID), ("TG_API_HASH", TG_API_HASH)) if not v]
-    if mancano:
-        raise RuntimeError("Link di un canale privato: mancano " + " e ".join(mancano) + " in "
-                           f"{Path(__file__).resolve().with_name('bots.env')} (vedi telegram_login.py).")
-    try:
-        import telethon  # noqa: F401
-    except ImportError:
-        raise RuntimeError("Manca la libreria telethon:  pip install telethon") from None
-    if not Path(TG_SESSION + ".session").exists():
-        raise RuntimeError("Account personale non collegato: lancia  python telegram_login.py  una volta.")
-    with _tg_utente_lock:                        # una richiesta alla volta, con pausa minima
-        attesa = TG_UTENTE_PAUSA - (time.time() - _tg_utente_ultima[0])
-        if attesa > 0:
-            time.sleep(attesa)
-        n = _tg_utente_conta()
-        log(f"  [account personale] richiesta n. {n} di oggi: canale {cid}, post {mid} (sola lettura)")
-        try:
-            files = asyncio.run(_tg_utente_scarica(cid, mid, folder))
-        finally:
-            _tg_utente_ultima[0] = time.time()
+    files = _tg_utente_esegui(f"canale {cid}, post {mid}", lambda: _tg_utente_scarica(cid, mid, folder))
     if not files:
         raise RuntimeError("Nessuna foto o video in questo post (solo testo, o file oltre il tetto di dimensione).")
+    return files
+
+
+# ---------- fonte: storie di Telegram ----------
+# Link tipo https://t.me/utente/s/123. Le storie non sono visibili ai bot né dalla pagina pubblica: serve
+# l'account personale (Telethon), con la stessa sessione, lo stesso contatore e le stesse pause dei canali privati.
+# Funziona solo per le storie che il TUO account può vedere (attive, o fissate nel profilo).
+_TG_STORIA_RE = re.compile(r"^https?://(?:www\.)?(?:t|telegram)\.me/([A-Za-z][A-Za-z0-9_]{3,})/s/(\d+)(?:[/?#].*)?$", re.I)
+
+
+def _is_telegram_storia(url: str) -> bool:
+    return bool(_TG_STORIA_RE.match(url.strip()))
+
+
+async def _tg_utente_scarica_storia(utente: str, sid: int, folder: str) -> list[Path]:
+    from telethon.errors import FloodWaitError, RPCError
+    try:
+        from telethon.tl.functions.stories import GetStoriesByIDRequest
+    except ImportError:
+        raise RuntimeError("Questa versione di telethon non supporta le storie:  pip install -U telethon") from None
+
+    client = await _tg_utente_client()
+    try:
+        try:
+            peer = await client.get_input_entity(utente)
+            res = await client(GetStoriesByIDRequest(peer=peer, id=[sid]))
+        except ValueError:
+            raise RuntimeError(f"Utente o canale @{utente} non trovato.") from None
+        except FloodWaitError as e:
+            raise RuntimeError(f"Telegram chiede di aspettare {e.seconds} s per l'account personale: "
+                               "riprova più tardi.") from None
+        except RPCError as e:
+            raise RuntimeError(f"Telegram ha rifiutato la richiesta della storia: {e}") from None
+        files = []
+        for st in res.stories:
+            media = getattr(st, "media", None)   # le storie cancellate o saltate non hanno media
+            if media is None:
+                continue
+            size = getattr(getattr(media, "document", None), "size", 0) or 0
+            if TG_UTENTE_MAX_MB and size > TG_UTENTE_MAX_MB * 1_000_000:
+                log(f"  [account personale] salto una storia da {mb(size)} (tetto {TG_UTENTE_MAX_MB} MB)")
+                continue
+            p = await client.download_media(media, file=folder + os.sep)
+            if p and Path(p).suffix.lower() in ALL_EXT:
+                files.append(Path(p))
+        return files
+    finally:
+        await client.disconnect()
+
+
+def download_telegram_storia(url: str, folder: str) -> list[Path]:
+    m = _TG_STORIA_RE.match(url.strip())
+    utente, sid = m.group(1), int(m.group(2))
+    files = _tg_utente_esegui(f"storia {sid} di @{utente}", lambda: _tg_utente_scarica_storia(utente, sid, folder))
+    if not files:
+        raise RuntimeError("Nessun file in questa storia (scaduta, cancellata, non visibile al tuo account "
+                           "o oltre il tetto di dimensione).")
     return files
 
 
 def download(url: str, folder: str) -> list[Path]:
     """Punto d'ingresso dei download. Per i link Instagram aggiunge la protezione (conteggio, avviso,
     pausa minima, tetti e pausa dopo una segnalazione); poi scarica con _download_cookie."""
+    if _is_telegram_storia(url):        # storia di Telegram: account personale, in sola lettura
+        return download_telegram_storia(url, folder)
     if _is_telegram_private(url):       # canale privato: account personale, in sola lettura
         return download_telegram_utente(url, folder)
     if _is_telegram_post(url):          # post pubblico di Telegram: nessun cookie, nessun yt-dlp

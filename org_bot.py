@@ -24,6 +24,9 @@ Come si usa
   tra un invio e l'altro. Premendo /invia la lista si svuota subito (i link passano in una copia
   nascosta, invii/.in_invio.<nome>.lista); quello che non parte (link che non si scarica) torna in cima
   alla lista a fine invio, per il prossimo /invia.
+  A fine giro il bot ricontrolla la lista: i link aggiunti mentre lavorava (anche dalla GUI) partono
+  subito in un nuovo giro, in nuovi messaggi, finché la lista è vuota o scade il limite dei 13 minuti.
+  I link falliti NON si riprovano nello stesso /invia: tornano in lista per il prossimo.
   Scheda Telegram: premendo Invia la lista si svuota subito (i link passano in una copia nascosta,
   invii/telegram/.in_invio.txt) e a fine invio i link non partiti tornano in cima alla lista.
   La cronologia è in invii/<nome>.inviati.log
@@ -55,6 +58,7 @@ Variabili d'ambiente (opzionali)
   INVII_PAUSA_MIN     pausa minima tra due invii, in secondi (default 3)
   INVII_PAUSA_MAX     pausa massima tra due invii, in secondi (default 7)
   INVII_EXTRA_OGNI    ogni quanti messaggi fare una pausa più lunga (default 10)
+  INVII_RICONTROLLA   1 = a fine /invia ricontrolla la lista e invia i link nuovi (default); 0 = no
   INVII_AUTOSAVE_SEC  ogni quanti secondi la GUI salva da sola le modifiche (default 30, 0 = mai)
   INVII_BACKUP_MAX    quante copie di backup tenere per persona (default 30)
   INVII_BACKUP_OGNI_SEC  distanza minima tra due backup automatici, in secondi (default 300)
@@ -152,6 +156,7 @@ PAUSA_MAX = max(PAUSA_MIN, float(os.environ.get("INVII_PAUSA_MAX", "7")))
 EXTRA_OGNI = max(1, int(os.environ.get("INVII_EXTRA_OGNI", "10")))
 EXTRA_MIN, EXTRA_MAX = 15.0, 25.0          # pausa più lunga ogni EXTRA_OGNI messaggi
 LIMITE_SEC = 13 * 60                       # i token delle interazioni durano 15 minuti
+RICONTROLLA = os.environ.get("INVII_RICONTROLLA", "1").strip() != "0"   # /invia ricontrolla la lista a fine giro
 AUTOSAVE_SEC = max(0.0, float(os.environ.get("INVII_AUTOSAVE_SEC", "30")))   # 0 = disattivato
 BACKUP_DIR = INVII_DIR / "backup"
 BACKUP_MAX = max(1, int(os.environ.get("INVII_BACKUP_MAX", "30")))
@@ -608,6 +613,34 @@ def file_in_invio(nome: str) -> Path:
 def persona_prendi_lista(nome: str) -> list[tuple[str, str, list[str]]]:
     with _PERS_LOCK:
         return _prendi_da(file_persona(nome), file_in_invio(nome), nome, crea=False)
+
+
+def _prendi_nuovi_da(lista: Path, nascosta: Path, nome_backup: str) -> list[tuple[str, str, list[str]]]:
+    """Ricontrollo a fine giro: i link aggiunti alla lista visibile mentre l'invio lavorava passano in coda alla
+    copia nascosta e vengono restituiti. Ciò che c'è già nella copia nascosta (i link non partiti in questo
+    invio) resta lì e NON viene restituito: così un link fallito non si riprova all'infinito e a fine invio
+    torna in lista insieme a quelli non partiti."""
+    if not lista.exists():
+        return []
+    coda, restano = [], []
+    for r in _righe_file(lista):
+        c = classifica(r)
+        if c:
+            coda.append((r, c[0], c[1]))
+        else:
+            restano.append(r)
+    if not coda:
+        return []
+    fai_backup(nome_backup, forza=True, src=lista)
+    gia = [r for r in _righe_file(nascosta) if r.strip()]
+    scrivi_atomico(nascosta, "\n".join(gia + [r for r, _, _ in coda]) + "\n")
+    scrivi_atomico(lista, "\n".join(restano) + ("\n" if restano else ""))
+    return coda
+
+
+def persona_prendi_nuovi(nome: str) -> list[tuple[str, str, list[str]]]:
+    with _PERS_LOCK:
+        return _prendi_nuovi_da(file_persona(nome), file_in_invio(nome), nome)
 
 
 def persona_ripristina(nome: str) -> int:
@@ -1177,57 +1210,81 @@ def registra(client, owner: int, fit, batches):
         task_prog = asyncio.create_task(battito_prog())
         try:
             log(f"/invia «{nome}»: {len(coda)} elementi in coda")
-            for n, (riga, tipo, valori) in enumerate(coda, 1):
-                if time.time() - t0 > LIMITE_SEC:
-                    fermato = True
-                    break
-                scrivi_prog(n=n - 1, occupato=True,
-                            msg="messaggio di testo" if tipo == "testo"
-                            else valori[0][:60] + (f" (+{len(valori) - 1})" if len(valori) > 1 else ""))
-                prima = stat["pub"]
-                try:
-                    if tipo == "testo":
-                        await interaction.followup.send(valori[0])
-                        stat["pub"] += 1
-                        persona_togli_riga(nome, riga, None)
-                        cronologia(nome, riga)
-                    else:
-                        fatti = []
-                        try:
-                            if len(valori) > 1:     # più link sulla stessa riga = un solo messaggio
-                                log(f"  [{n}/{len(coda)}] gruppo di {len(valori)} link in un messaggio")
-                                await invia_gruppo(interaction, valori, scarica, stat, fatti, falliti,
-                                                   t0 + LIMITE_SEC, riduci)
-                            else:
-                                url = valori[0]
-                                log(f"  [{n}/{len(coda)}] {url}")
-                                try:
-                                    await invia_link(interaction, url, scarica, stat, riduci)
-                                    fatti.append(url)
-                                except _Fallito as e:
-                                    falliti.append(f"{url[:80]} ({str(e)[:60]})")
-                        finally:
-                            # tolgo dalla lista ciò che è partito, anche se mi interrompo a metà
-                            restanti = [u for u in valori if u not in fatti]
-                            persona_togli_riga(nome, riga, " ".join(restanti) if restanti else None)
-                            for u in fatti:
-                                cronologia(nome, u)
-                except IgLimite as e:     # soglia alta Instagram: mi fermo, il resto resta in lista
-                    stop_ig = str(e)
-                    log(f"  {e}")
-                    break
-                except discord.DiscordException as e:
-                    errore = str(e)[:150]
-                    log(f"  ERRORE Discord: {e}")
-                    break
-                scrivi_prog(n=n, occupato=False, msg="Pausa tra gli invii…")
-                if stat["pub"] > prima and n < len(coda):    # pausa tra un invio e l'altro
-                    pausa = random.uniform(PAUSA_MIN, PAUSA_MAX)
-                    if stat["pub"] // EXTRA_OGNI > prima // EXTRA_OGNI:
-                        pausa += random.uniform(EXTRA_MIN, EXTRA_MAX)
-                    await asyncio.sleep(pausa)
-            else:
-                completato = True
+            giri = 1
+            while True:   # a fine giro ricontrollo la lista: i link aggiunti nel frattempo partono in un nuovo giro
+                for n, (riga, tipo, valori) in enumerate(coda, 1):
+                    if time.time() - t0 > LIMITE_SEC:
+                        fermato = True
+                        break
+                    scrivi_prog(n=n - 1, occupato=True,
+                                msg="messaggio di testo" if tipo == "testo"
+                                else valori[0][:60] + (f" (+{len(valori) - 1})" if len(valori) > 1 else ""))
+                    prima = stat["pub"]
+                    try:
+                        if tipo == "testo":
+                            await interaction.followup.send(valori[0])
+                            stat["pub"] += 1
+                            persona_togli_riga(nome, riga, None)
+                            cronologia(nome, riga)
+                        else:
+                            fatti = []
+                            try:
+                                if len(valori) > 1:     # più link sulla stessa riga = un solo messaggio
+                                    log(f"  [{n}/{len(coda)}] gruppo di {len(valori)} link in un messaggio")
+                                    await invia_gruppo(interaction, valori, scarica, stat, fatti, falliti,
+                                                       t0 + LIMITE_SEC, riduci)
+                                else:
+                                    url = valori[0]
+                                    log(f"  [{n}/{len(coda)}] {url}")
+                                    try:
+                                        await invia_link(interaction, url, scarica, stat, riduci)
+                                        fatti.append(url)
+                                    except _Fallito as e:
+                                        falliti.append(f"{url[:80]} ({str(e)[:60]})")
+                            finally:
+                                # tolgo dalla lista ciò che è partito, anche se mi interrompo a metà
+                                restanti = [u for u in valori if u not in fatti]
+                                persona_togli_riga(nome, riga, " ".join(restanti) if restanti else None)
+                                for u in fatti:
+                                    cronologia(nome, u)
+                    except IgLimite as e:     # soglia alta Instagram: mi fermo, il resto resta in lista
+                        stop_ig = str(e)
+                        log(f"  {e}")
+                        break
+                    except discord.DiscordException as e:
+                        errore = str(e)[:150]
+                        log(f"  ERRORE Discord: {e}")
+                        break
+                    scrivi_prog(n=n, occupato=False, msg="Pausa tra gli invii…")
+                    if stat["pub"] > prima and n < len(coda):    # pausa tra un invio e l'altro
+                        pausa = random.uniform(PAUSA_MIN, PAUSA_MAX)
+                        if stat["pub"] // EXTRA_OGNI > prima // EXTRA_OGNI:
+                            pausa += random.uniform(EXTRA_MIN, EXTRA_MAX)
+                        await asyncio.sleep(pausa)
+                else:
+                    nuovi = []
+                    if RICONTROLLA:
+                        if time.time() - t0 > LIMITE_SEC:
+                            try:    # il tempo è finito: se sono arrivati altri link restano in lista e lo dico
+                                fermato = bool(leggi_coda(nome))
+                            except OSError:
+                                pass
+                        else:
+                            try:
+                                await salva_dalla_gui(nome)    # eventuali modifiche non ancora salvate nella GUI
+                                nuovi = await asyncio.to_thread(persona_prendi_nuovi, nome)
+                            except Exception as e:
+                                log(f"/invia «{nome}»: ricontrollo della lista non riuscito: {e!r}")
+                    if nuovi:
+                        coda = nuovi
+                        giri += 1
+                        log(f"/invia «{nome}»: ricontrollo la lista, {len(coda)} elementi nuovi (giro {giri})")
+                        scrivi_prog(n=0, tot=len(coda), t_inizio=time.time(), occupato=True,
+                                    msg="Nuovi link in lista…")
+                        continue
+                    if not fermato:
+                        completato = True
+                break
         finally:
             try:
                 persona_ripristina(nome)      # i link non partiti tornano in lista (prima di dire «finito»)
