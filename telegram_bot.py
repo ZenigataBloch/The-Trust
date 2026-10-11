@@ -1730,6 +1730,11 @@ async def cmd_booru(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status.delete()
     except Exception:
         pass
+    if trovati and len(problems) < len(trovati):
+        try:   # tolgo anche il comando digitato (mostrerebbe i tag): in un gruppo serve "Elimina messaggi"
+            await msg.delete()
+        except Exception:
+            log("  non riesco a cancellare il comando /booru (manca il permesso?)")
     if problems:
         await avvisa("⚠️ " + "\n⚠️ ".join(problems))
 
@@ -1758,6 +1763,14 @@ async def on_booru_scelta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log(f"  modifica dell'anteprima non riuscita: {e}")
 
     base = (q.message.caption or q.message.text or "").split("\n→")[0]
+
+    async def elimina(ripiego: str):
+        """L'anteprima privata sparisce subito; se Telegram non la lascia cancellare, la segno nel testo."""
+        try:
+            await q.message.delete()
+        except Exception as e:
+            log(f"  anteprima privata non eliminata: {e}")
+            await scrivi(ripiego)
     voce = _BOORU_PENDENTI.pop(token, None)     # pop subito: un doppio tocco non invia due volte
     if voce is None:
         await q.answer("Scaduta (il bot è stato riavviato): rilancia /booru.", show_alert=True)
@@ -1765,7 +1778,7 @@ async def on_booru_scelta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if azione == "no":
         await q.answer("Scartato")
-        await scrivi(base + "\n🗑 Scartato")
+        await elimina(base + "\n🗑 Scartato")
         return
 
     await q.answer("Scarico e invio…")
@@ -1775,7 +1788,7 @@ async def on_booru_scelta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             path = await graves.booru_file(voce["post"], d)
             await send_single(ctx.bot, voce["chat"], path, **voce["kw"])
         log(f"  /booru: inviato {voce['post'].etichetta()}")
-        await scrivi(base + "\n✅ Inviato")
+        await elimina(base + "\n✅ Inviato")
     except Exception as e:
         log(f"  ERRORE invio {voce['post'].etichetta()}: {e}")
         _BOORU_PENDENTI[token] = voce           # si può riprovare
