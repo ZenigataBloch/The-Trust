@@ -33,3 +33,4 @@ bots_spenti_a_mano.flag
 *.log
 *.session
 telegram_utente_uso.json
+diag_booru.py

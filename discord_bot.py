@@ -499,47 +499,87 @@ async def cmd_booru(interaction: discord.Interaction, tag: str,
         await interaction.response.send_message(str(e), ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
+    # tutto il flusso è PRIVATO (ephemeral): l'altra persona non vede né l'anteprima né i pulsanti
+    await interaction.response.defer(thinking=True, ephemeral=True)
     log(f"/booru ({rich.sito}, {len(rich.tags)} tag, n={rich.n})")
     t0 = time.time()
-
-    async def anteprima(path, post):
-        testo = f"{post.etichetta()}\n<{post.pagina}>"      # <> = niente embed del sito
-        if path is None:
-            await interaction.followup.send(testo)
-            return
-        h = discord.File(path)
-        try:
-            await interaction.followup.send(testo, file=h)
-        finally:
-            h.close()
-
-    async def invia(path, post):
-        pronto = await fit(path)
-        h = discord.File(pronto)
-        try:
-            await interaction.followup.send(file=h)
-        finally:
-            h.close()
-
-    inviati, problems = 0, []
     with tempfile.TemporaryDirectory() as dd:
         try:
-            inviati, problems = await graves.booru_esegui(rich, dd, anteprima, invia, scadenza=t0 + LIMITE_SEC)
+            trovati = await graves.booru_anteprime(rich, dd)
         except Exception as e:
             log(f"  ERRORE Graves: {e}")
-            problems = [str(e)]
-    log(f"  completato in {time.time() - t0:.0f}s ({inviati} inviati)")
-    if problems:
-        if inviati == 0:
+            await interaction.edit_original_response(content=f"⚠️ {e}"[:1900])
+            return
+        for post, path in trovati:
+            extra = {"file": discord.File(path)} if path else {}
             try:
-                await interaction.delete_original_response()   # niente errori visibili agli altri
+                await interaction.followup.send(f"{post.etichetta()}\n<{post.pagina}>", view=ScegliBooru(post),
+                                                ephemeral=True, **extra)
+            except Exception as e:
+                log(f"  anteprima di {post.etichetta()} non inviata: {e}")
+            finally:
+                if extra:
+                    extra["file"].close()
+    log(f"  anteprime pronte in {time.time() - t0:.0f}s ({len(trovati)})")
+    await interaction.edit_original_response(
+        content=f"🔎 {len(trovati)} risultati. Solo tu vedi questi messaggi: premi 📤 Invia sui "
+                "risultati da mandare in questa chat, 🗑 Scarta sugli altri.")
+
+
+class ScegliBooru(discord.ui.View):
+    """Pulsanti sotto un'anteprima privata: Invia scarica il file completo e lo posta nella chat."""
+
+    def __init__(self, post):
+        super().__init__(timeout=3600)
+        self.post = post
+        self.occupato = False
+
+    def _stato(self, disabilitati: bool):
+        for c in self.children:
+            c.disabled = disabilitati
+
+    @discord.ui.button(label="Invia", emoji="📤", style=discord.ButtonStyle.success)
+    async def invia(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != OWNER:
+            await interaction.response.send_message("Non sei autorizzato.", ephemeral=True)
+            return
+        if self.occupato:
+            await interaction.response.defer()
+            return
+        self.occupato = True
+        self._stato(True)
+        await interaction.response.edit_message(view=self)   # risposta subito (3 s); poi scarico
+        try:
+            with tempfile.TemporaryDirectory() as dd:
+                path = await graves.booru_file(self.post, dd)
+                pronto = await fit(path)
+                h = discord.File(pronto)
+                try:
+                    await interaction.followup.send(file=h, ephemeral=False)   # pubblico: lo vede la chat
+                finally:
+                    h.close()
+            log(f"  /booru: inviato {self.post.etichetta()}")
+            await interaction.edit_original_response(
+                content=f"✅ Inviato: {self.post.etichetta()}\n<{self.post.pagina}>", view=None)
+        except Exception as e:
+            log(f"  ERRORE invio {self.post.etichetta()}: {e}")
+            self.occupato = False
+            self._stato(False)
+            try:
+                await interaction.edit_original_response(view=self)
+                await interaction.followup.send(f"⚠️ Invio non riuscito: {e}"[:1900], ephemeral=True)
             except Exception:
                 pass
-        try:
-            await interaction.followup.send(("⚠️ " + "\n⚠️ ".join(problems))[:1900], ephemeral=True)
-        except Exception as e:
-            log(f"  non riesco a inviare il riepilogo degli errori: {e}")
+
+    @discord.ui.button(label="Scarta", emoji="🗑", style=discord.ButtonStyle.secondary)
+    async def scarta(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != OWNER:
+            await interaction.response.send_message("Non sei autorizzato.", ephemeral=True)
+            return
+        self.occupato = True
+        await interaction.response.edit_message(content=f"🗑 Scartato: {self.post.etichetta()}",
+                                                attachments=[], view=None)
+        self.stop()
 
 
 # --- supplemento facoltativo: liste per persona e comando /invia (file org_bot.py) ---

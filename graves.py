@@ -865,3 +865,24 @@ async def booru_esegui(rich: RichiestaBooru, cartella, anteprima_cb, file_cb,
                 if x:
                     x.unlink(missing_ok=True)
     return inviati, problemi
+
+
+# ---------- anteprima privata + scelta (usata da /booru dei bot) ----------
+async def booru_anteprime(rich: RichiestaBooru, cartella) -> list:
+    """Cerca e scarica SOLO le anteprime dei primi rich.n risultati (nessun file completo).
+    Restituisce [(post, path_anteprima | None)]. Solleva GravesErrore se la ricerca fallisce o non trova niente."""
+    cartella = Path(cartella)
+    candidati = (await asyncio.to_thread(booru_cerca, rich))[:rich.n]
+    con_anteprima = _env("GRAVES_BOORU_ANTEPRIMA", "1").lower() not in ("0", "no", "off", "false")
+
+    async def una(i: int, p: PostBooru):
+        if not con_anteprima:
+            return p, None
+        return p, await asyncio.to_thread(_scarica_anteprima, p, cartella, i)
+
+    return list(await asyncio.gather(*(una(i, p) for i, p in enumerate(candidati))))
+
+
+async def booru_file(post: PostBooru, cartella, i: int = 0) -> Path:
+    """Scarica il file completo di un post scelto dall'utente."""
+    return await asyncio.to_thread(post.scarica, Path(cartella), i)

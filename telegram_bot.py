@@ -76,6 +76,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import yt_dlp
 from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InlineQueryResultArticle,
     InputMediaDocument,
     InputMediaPhoto,
@@ -86,6 +88,7 @@ from telegram import (
 from telegram.constants import ChatType
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
@@ -1654,8 +1657,11 @@ async def cmd_ricerca(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await avvisa(err)
 
 
+_BOORU_PENDENTI: dict = {}   # token -> {post, chat, kw}: risultati in attesa di Invia/Scarta (si perdono al riavvio)
+
+
 async def cmd_booru(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/booru <tag> [-n 1-5] [-s r34|gb|db|e621] [-r]: per ogni risultato prima l'anteprima, poi il file."""
+    """/booru <tag> [-n 1-5] [-s r34|gb|db|e621] [-r]: anteprime PRIVATE (chat col bot) con Invia/Scarta; il file parte nella chat solo se scegli Invia."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not msg or not chat or not user:
         return
@@ -1682,42 +1688,100 @@ async def cmd_booru(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await avvisa(f"ℹ️ {e}")
         return
 
-    async def anteprima(path, post):
-        testo = f"{post.etichetta()}\n{post.pagina}"
-        if path is None:
-            await ctx.bot.send_message(chat.id, testo, **kw)
-            return
-        with open(path, "rb") as f:
-            try:
-                await ctx.bot.send_photo(chat.id, f, caption=testo, **kw)
-            except Exception:       # per esempio una gif: la mando come documento
-                f.seek(0)
-                await ctx.bot.send_document(chat.id, f, caption=testo, **kw)
-
-    async def invia(path, post):
-        await send_single(ctx.bot, chat.id, path, **kw)
-
     where = chat.title or "chat privata"
     log(f"/booru da «{where}» ({rich.sito}, {len(rich.tags)} tag, n={rich.n})")
-    status = await ctx.bot.send_message(chat.id, "🔎 Cerco…", **kw)
+    # anteprime e pulsanti vanno SOLO nella chat privata con il bot; il file parte in «chat» solo se scegli Invia
+    try:
+        status = await ctx.bot.send_message(OWNER, "🔎 Cerco…")
+    except Exception as e:
+        await ctx.bot.send_message(chat.id, f"⚠️ Non riesco a scriverti in privato ({e}): apri il bot e premi Start.", **kw)
+        return
     t0 = time.time()
     problems = []
     with tempfile.TemporaryDirectory() as d:
         try:
-            _, problems = await graves.booru_esegui(rich, d, anteprima, invia)
+            trovati = await graves.booru_anteprime(rich, d)
         except Exception as e:
             log(f"  ERRORE Graves: {e}")
-            problems = [str(e)]
-    log(f"  completato in {time.time() - t0:.0f}s")
+            trovati, problems = [], [str(e)]
+        for post, path in trovati:
+            token = uuid.uuid4().hex[:10]
+            while len(_BOORU_PENDENTI) >= 200:
+                _BOORU_PENDENTI.pop(next(iter(_BOORU_PENDENTI)))
+            _BOORU_PENDENTI[token] = {"post": post, "chat": chat.id, "kw": kw}
+            tastiera = InlineKeyboardMarkup([[InlineKeyboardButton("📤 Invia", callback_data=f"bo:{token}:ok"),
+                                              InlineKeyboardButton("🗑 Scarta", callback_data=f"bo:{token}:no")]])
+            testo = f"{post.etichetta()}\n{post.pagina}\n→ destinazione: «{where}»"
+            try:
+                if path is None:
+                    await ctx.bot.send_message(OWNER, testo, reply_markup=tastiera)
+                else:
+                    with open(path, "rb") as f:
+                        try:
+                            await ctx.bot.send_photo(OWNER, f, caption=testo, reply_markup=tastiera)
+                        except Exception:       # per esempio una gif: la mando come documento
+                            f.seek(0)
+                            await ctx.bot.send_document(OWNER, f, caption=testo, reply_markup=tastiera)
+            except Exception as e:
+                _BOORU_PENDENTI.pop(token, None)
+                problems.append(f"{post.etichetta()}: anteprima non inviata ({e})")
+    log(f"  anteprime pronte in {time.time() - t0:.0f}s ({len(trovati)})")
     try:
         await status.delete()
     except Exception:
         pass
     if problems:
-        err = "⚠️ " + "\n⚠️ ".join(problems)
-        if chat.type != ChatType.PRIVATE:
-            err = f"Errore in «{where}»:\n" + err
-        await avvisa(err)
+        await avvisa("⚠️ " + "\n⚠️ ".join(problems))
+
+
+async def on_booru_scelta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Pulsanti 📤 Invia / 🗑 Scarta sotto le anteprime private di /booru."""
+    q = update.callback_query
+    if not q or not q.data or not q.data.startswith("bo:") or not q.message:
+        return
+    if q.from_user.id != OWNER:
+        await q.answer("Non autorizzato.", show_alert=True)
+        return
+    try:
+        _, token, azione = q.data.split(":")
+    except ValueError:
+        await q.answer()
+        return
+
+    async def scrivi(testo: str, tastiera=None):
+        try:
+            if q.message.photo or q.message.document or q.message.animation or q.message.video:
+                await q.edit_message_caption(caption=testo, reply_markup=tastiera)
+            else:
+                await q.edit_message_text(testo, reply_markup=tastiera)
+        except Exception as e:
+            log(f"  modifica dell'anteprima non riuscita: {e}")
+
+    base = (q.message.caption or q.message.text or "").split("\n→")[0]
+    voce = _BOORU_PENDENTI.pop(token, None)     # pop subito: un doppio tocco non invia due volte
+    if voce is None:
+        await q.answer("Scaduta (il bot è stato riavviato): rilancia /booru.", show_alert=True)
+        await scrivi(base + "\n(scaduta)")
+        return
+    if azione == "no":
+        await q.answer("Scartato")
+        await scrivi(base + "\n🗑 Scartato")
+        return
+
+    await q.answer("Scarico e invio…")
+    await scrivi(base + "\n⏳ Invio in corso…")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            path = await graves.booru_file(voce["post"], d)
+            await send_single(ctx.bot, voce["chat"], path, **voce["kw"])
+        log(f"  /booru: inviato {voce['post'].etichetta()}")
+        await scrivi(base + "\n✅ Inviato")
+    except Exception as e:
+        log(f"  ERRORE invio {voce['post'].etichetta()}: {e}")
+        _BOORU_PENDENTI[token] = voce           # si può riprovare
+        tastiera = InlineKeyboardMarkup([[InlineKeyboardButton("📤 Riprova", callback_data=f"bo:{token}:ok"),
+                                          InlineKeyboardButton("🗑 Scarta", callback_data=f"bo:{token}:no")]])
+        await scrivi(base + f"\n⚠️ Invio non riuscito: {str(e)[:200]}", tastiera)
 
 
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1752,6 +1816,7 @@ def main():
     app.add_handler(InlineQueryHandler(handle_inline))
     app.add_handler(CommandHandler("ricerca", cmd_ricerca))
     app.add_handler(CommandHandler("booru", cmd_booru))
+    app.add_handler(CallbackQueryHandler(on_booru_scelta, pattern=r"^bo:"))
     app.add_handler(
         MessageHandler(
             (filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST)
