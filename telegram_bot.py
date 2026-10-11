@@ -27,7 +27,8 @@ Variabili d'ambiente:
 Ricerca immagini su Google (modulo Graves, file graves.py):  /ricerca <cosa cercare> [-n 1-10]
 Funziona solo per OWNER_ID, in chat privata e nei gruppi (non nei canali). Serve una chiave di un
 provider (GRAVES_SERPER_KEY, GRAVES_SERPAPI_KEY o GOOGLE_API_KEY+GOOGLE_CX in bots.env): vedi graves.py.
-GRAVES_ORIGINALE=1 manda le immagini come file, senza la ricompressione che Telegram applica alle foto.
+GRAVES_ORIGINALE=1 manda le immagini come file (prima un album, poi uno per uno se l'album fallisce), senza
+la ricompressione che Telegram applica alle foto.
 
 Protezione Instagram (opzionale; 0 = disattivato). Troppe richieste ravvicinate fanno scattare
 «attività sospetta» sull'account dei cookie: il bot le conta (tutti i moduli, anche dopo un riavvio),
@@ -1565,24 +1566,32 @@ except Exception as e:
 
 
 async def _invia_come_file(bot, chat_id, files: list[Path], **kw) -> list[str]:
-    """GRAVES_ORIGINALE=1: le immagini partono come documenti (a gruppi di 10), senza la ricompressione
-    che Telegram applica alle foto."""
+    """GRAVES_ORIGINALE=1: le immagini partono come documenti, senza la ricompressione che Telegram applica
+    alle foto. Prima provo un album (a gruppi di 10); se Telegram lo rifiuta le mando una per una."""
     errori = []
     for i in range(0, len(files), 10):
         gruppo = files[i:i + 10]
-        handles = [open(p, "rb") for p in gruppo]
-        try:
-            if len(gruppo) == 1:
-                await bot.send_document(chat_id, handles[0], filename=gruppo[0].name, **kw)
-            else:
-                await bot.send_media_group(
-                    chat_id, [InputMediaDocument(h, filename=p.name) for h, p in zip(handles, gruppo)], **kw)
-        except Exception as e:
-            log(f"    ERRORE invio come file: {e}")
-            errori.append(f"invio non riuscito: {e}")
-        finally:
-            for h in handles:
-                h.close()
+        if len(gruppo) > 1:
+            handles = [open(p, "rb") for p in gruppo]
+            try:
+                log(f"    invio album di {len(gruppo)} file (come documenti)…")
+                await bot.send_media_group(chat_id, [InputMediaDocument(media=h) for h in handles], **kw)
+                await asyncio.sleep(0.3)
+                continue
+            except Exception as e:
+                log(f"    album di documenti non riuscito ({e}), li mando uno per uno")
+            finally:
+                for h in handles:
+                    h.close()
+        for p in gruppo:
+            try:
+                log(f"    invio come file: {p.name} ({mb(p.stat().st_size)})")
+                with open(p, "rb") as f:
+                    await bot.send_document(chat_id, f, **kw)
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                log(f"    ERRORE invio come file di {p.name}: {e}")
+                errori.append(f"{p.name}: {e}")
     return errori
 
 
