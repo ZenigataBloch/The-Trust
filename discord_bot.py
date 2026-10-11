@@ -559,8 +559,15 @@ class ScegliBooru(discord.ui.View):
                 finally:
                     h.close()
             log(f"  /booru: inviato {self.post.etichetta()}")
-            await interaction.edit_original_response(
-                content=f"✅ Inviato: {self.post.etichetta()}\n<{self.post.pagina}>", view=None)
+            try:   # inviato: l'anteprima privata sparisce subito
+                await interaction.delete_original_response()
+            except Exception as e:
+                log(f"  anteprima privata non eliminata: {e}")
+                try:
+                    await interaction.edit_original_response(
+                        content=f"✅ Inviato: {self.post.etichetta()}", attachments=[], view=None)
+                except Exception:
+                    pass
         except Exception as e:
             log(f"  ERRORE invio {self.post.etichetta()}: {e}")
             self.occupato = False
@@ -577,8 +584,16 @@ class ScegliBooru(discord.ui.View):
             await interaction.response.send_message("Non sei autorizzato.", ephemeral=True)
             return
         self.occupato = True
-        await interaction.response.edit_message(content=f"🗑 Scartato: {self.post.etichetta()}",
-                                                attachments=[], view=None)
+        await interaction.response.defer()
+        try:   # scartato: l'anteprima privata sparisce subito
+            await interaction.delete_original_response()
+        except Exception as e:
+            log(f"  anteprima privata non eliminata: {e}")
+            try:
+                await interaction.edit_original_response(content=f"🗑 Scartato: {self.post.etichetta()}",
+                                                         attachments=[], view=None)
+            except Exception:
+                pass
         self.stop()
 
 
