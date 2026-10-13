@@ -215,6 +215,13 @@ def persona_ok(n):
     return isinstance(n, str) and O.nome_valido(n) and O.file_persona(n).exists()
 
 
+def _mt(p) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0
+
+
 def r_persone(_):
     out = []
     for n in O.nomi_persone():
@@ -222,7 +229,7 @@ def r_persone(_):
             link, _t = O.conta(O.leggi_coda(n))
         except Exception:
             link = 0
-        out.append({"nome": n, "link": link})
+        out.append({"nome": n, "link": link, "av": _mt(O.avatar_persona(n))})
     return 200, {"persone": out}
 
 
@@ -298,7 +305,7 @@ def r_tg(_):
         link = testi = 0
     return 200, {
         "token": bool(os.environ.get("BOT_TOKEN")),
-        "canali": [{"id": c["id"], "tipo": c["tipo"], "attivo": c["attivo"],
+        "canali": [{"id": c["id"], "tipo": c["tipo"], "attivo": c["attivo"], "av": _mt(O.avatar_tg(c["id"])),
                     "nome": O.semplifica_nome(c["nome"], f"Canale {c['id']}")} for c in O.carica_canali()],
         "testo": O.TG_LISTA.read_text(encoding="utf-8-sig"), "mtime": O.TG_LISTA.stat().st_mtime,
         "link": link, "testi": testi, "inviati": O.conta_cronologia(O.TG_NOME, O.TG_DIR),
@@ -923,6 +930,16 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if SY:
             SY.viva()                        # la pagina è viva: azzera il conto alla rovescia di Syncthing
+        if u.path in ("/avatar/p", "/avatar/t"):
+            try:
+                q = {k: v[0] for k, v in parse_qs(u.query).items()}
+                f = (O.avatar_persona(q["nome"]) if u.path.endswith("p") and O.nome_valido(q["nome"])
+                     else O.avatar_tg(int(q["id"])) if u.path.endswith("t") else None)
+                if f and f.is_file():
+                    return self._send(200, f.read_bytes(), "image/png" if f.suffix == ".png" else "image/jpeg")
+            except Exception:
+                pass
+            return self._send(404, {})
         if u.path in GET:
             try:
                 q = {k: v[0] for k, v in parse_qs(u.query).items()}
@@ -959,7 +976,7 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     try:
-        srv = ThreadingHTTPServer(("127.0.0.1", PORTA), H)
+        srv = ThreadingHTTPServer((os.environ.get("PANNELLO_BIND", "127.0.0.1"), PORTA), H)
     except OSError:
         raise SystemExit(f"Porta {PORTA} occupata: il pannello è probabilmente già in esecuzione.")
     if not FLAG.exists() and not any(g.stato().values()):

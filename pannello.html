@@ -88,6 +88,10 @@ textarea:focus,.kb input:focus{outline:0;border-color:var(--ro);box-shadow:0 0 0
 .msg{padding:2px 2px}
 #info-p,#info-t{font-size:14px;padding:0 2px}
 @media(min-width:760px){main{max-width:900px;width:100%;margin:0 auto}}
+.av{width:38px;height:38px;border-radius:50%;flex:none;display:inline-flex;align-items:center;justify-content:center;overflow:hidden;font-weight:700;color:#fff;font-size:16px}
+.av img{width:100%;height:100%;object-fit:cover;display:block}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:5px 16px 5px 5px}
+.chip .av{width:32px;height:32px;font-size:14px}
 </style>
 </head>
 <body>
@@ -168,6 +172,13 @@ async function api(p,b){
     const r=await fetch(p,{method:b===undefined?"GET":"POST",headers:{"X-Panel":"1","Content-Type":"application/json"},body:b===undefined?undefined:JSON.stringify(b)});
     const j=await r.json().catch(()=>({}));j._s=r.status;return j;
   }catch(e){return{errore:"Server non raggiungibile",_s:0};}
+}
+function av(url,nome){
+  const d=el("span","av",(nome.match(/[\p{L}\p{N}]/u)||["?"])[0].toUpperCase());
+  let h=0;for(const ch of nome)h=(h*31+ch.codePointAt(0))%360;
+  d.style.background="hsl("+h+",35%,32%)";
+  if(url){const i=new Image();i.alt="";i.onload=()=>d.replaceChildren(i);i.src=url;}
+  return d;
 }
 function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;}
 function bar(id,n,tot,txt){
@@ -253,7 +264,8 @@ async function listaP(){
   const r=await api("/api/persone");if(!r.persone)return;
   const sig=JSON.stringify([r.persone,P.nome]);if(sig===P.sig)return;P.sig=sig;
   $("#chips").replaceChildren(...r.persone.map(p=>{
-    const b=el("button","b chip"+(p.nome===P.nome?" sel":""),p.nome+(p.link?"  ("+p.link+")":""));
+    const b=el("button","b chip"+(p.nome===P.nome?" sel":""));
+    b.append(av(p.av?"/avatar/p?nome="+encodeURIComponent(p.nome)+"&v="+p.av:null,p.nome),el("span",0,p.nome+(p.link?"  ("+p.link+")":"")));
     b.onclick=()=>scegliP(p.nome);return b;}));
 }
 async function caricaP(nome){
@@ -312,7 +324,7 @@ function renderCanali(cs){
     const s=el("span",0,c.nome);if(c.tipo)s.append(" ",el("small",0,c.tipo));
     const x=el("button",0,"✕");x.setAttribute("aria-label","Rimuovi");
     x.onclick=async()=>{if(confirm("Togliere «"+c.nome+"» dall'elenco?\n(Non lascia il canale: toglie solo la voce.)")){await api("/api/tg/rimuovi",{id:c.id});T.sig="";pollT1();}};
-    d.append(cb,s,x);return d;}):[el("div","mu","Nessun canale: usa «Aggiungi ID…».")]));
+    d.append(cb,av(c.av?"/avatar/t?id="+c.id+"&v="+c.av:null,c.nome),s,x);return d;}):[el("div","mu","Nessun canale: usa «Aggiungi ID…».")]));
 }
 async function pollT1(){
   const r=await api("/api/tg");
