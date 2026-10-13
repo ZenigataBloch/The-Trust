@@ -485,7 +485,8 @@ async def cmd_ricerca(interaction: discord.Interaction, query: str,
 @app_commands.choices(sito=[app_commands.Choice(name="rule34.xxx", value="r34"),
                             app_commands.Choice(name="gelbooru", value="gelbooru"),
                             app_commands.Choice(name="danbooru", value="danbooru"),
-                            app_commands.Choice(name="e621", value="e621")])
+                            app_commands.Choice(name="e621", value="e621"),
+                            app_commands.Choice(name="redgifs", value="redgifs")])
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def cmd_booru(interaction: discord.Interaction, tag: str,
@@ -523,10 +524,11 @@ async def cmd_booru(interaction: discord.Interaction, tag: str,
             log(f"  ERRORE Graves: {e}")
             await interaction.edit_original_response(content=f"⚠️ {e}"[:1900])
             return
+        visti = {p.id for p, _ in trovati}
         for post, path in trovati:
             extra = {"file": discord.File(path)} if path else {}
             try:
-                await interaction.followup.send(f"{post.etichetta()}\n<{post.pagina}>", view=ScegliBooru(post),
+                await interaction.followup.send(f"{post.etichetta()}\n<{post.pagina}>", view=ScegliBooru(post, rich, visti),
                                                 ephemeral=True, **extra)
             except Exception as e:
                 log(f"  anteprima di {post.etichetta()} non inviata: {e}")
@@ -542,9 +544,11 @@ async def cmd_booru(interaction: discord.Interaction, tag: str,
 class ScegliBooru(discord.ui.View):
     """Pulsanti sotto un'anteprima privata: Invia scarica il file completo e lo posta nella chat."""
 
-    def __init__(self, post):
+    def __init__(self, post, rich=None, visti=None):
         super().__init__(timeout=3600)
         self.post = post
+        self.rich = rich
+        self.visti = visti if visti is not None else {post.id}
         self.occupato = False
 
     def _stato(self, disabilitati: bool):
@@ -599,6 +603,42 @@ class ScegliBooru(discord.ui.View):
                 await interaction.followup.send(f"⚠️ Invio non riuscito: {e}"[:1900], ephemeral=True)
             except Exception:
                 pass
+
+    @discord.ui.button(label="Altro", emoji="🔄", style=discord.ButtonStyle.primary)
+    async def altro(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != OWNER:
+            await interaction.response.send_message("Non sei autorizzato.", ephemeral=True)
+            return
+        if self.occupato or self.rich is None:
+            await interaction.response.defer()
+            return
+        self.occupato = True
+        self._stato(True)
+        await interaction.response.edit_message(view=self)   # risposta subito (3 s); poi cerco
+        try:
+            with tempfile.TemporaryDirectory() as dd:
+                post, path = await graves.booru_altro(self.rich, dd, self.visti)
+                self.visti.add(post.id)
+                self.post = post
+                h = discord.File(path) if path else None
+                self._stato(False)
+                try:
+                    await interaction.edit_original_response(
+                        content=f"{post.etichetta()}\n<{post.pagina}>", attachments=[h] if h else [], view=self)
+                finally:
+                    if h:
+                        h.close()
+            log(f"  /booru: altro risultato {post.etichetta()}")
+        except Exception as e:
+            log(f"  ERRORE nuovo risultato: {e}")
+            self._stato(False)
+            try:
+                await interaction.edit_original_response(view=self)
+                await interaction.followup.send(f"⚠️ {e}"[:1900], ephemeral=True)
+            except Exception:
+                pass
+        finally:
+            self.occupato = False
 
     @discord.ui.button(label="Scarta", emoji="🗑", style=discord.ButtonStyle.secondary)
     async def scarta(self, interaction: discord.Interaction, button: discord.ui.Button):

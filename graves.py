@@ -42,12 +42,14 @@ redirect) controllo che l'indirizzo sia pubblico: niente localhost, rete di casa
 Le chiavi API non finiscono mai nei messaggi di errore né nel log.
 
 BOORU (modulo per tag su rule34.xxx e siti simili)
-  telegram_bot.py   /booru <tag> [-n 1-5] [-s r34|gb|db|e621] [-r]
+  telegram_bot.py   /booru <tag> [-n 1-5] [-s r34|gb|db|e621|rg] [-r]
   discord_bot.py    /booru tag:<tag> sito:<...> quante:<1-5> casuale:<si/no>
 Per ogni risultato arriva prima l'ANTEPRIMA (immagine leggera con sito, id, tipo, punteggio e link al post)
 e poi il file completo (immagine, gif o video). L'anteprima e il file si scaricano in parallelo.
 Tag: separati da spazio (hatsune_miku solo -cat) oppure da virgola se hanno spazi (hatsune miku, solo).
 -n quanti risultati (default 3, max 5), -s il sito, -r risultati casuali invece dei più recenti.
+RedGifs (-s rg): nessuna chiave. I tag sono testo libero (hatsune_miku diventa 'hatsune miku') e le
+esclusioni -tag vengono applicate in locale ai risultati. Il token ospite resta in graves_redgifs_token.json.
 Chiavi in bots.env (rule34.xxx e Gelbooru NON funzionano senza: l'API vuole account e chiave):
   GRAVES_R34_KEY, GRAVES_R34_USER            rule34.xxx (Account -> Options -> API Access Credentials)
   GRAVES_GELBOORU_KEY, GRAVES_GELBOORU_USER  Gelbooru
@@ -71,6 +73,7 @@ import datetime
 import ipaddress
 import json
 import os
+import random
 import re
 import socket
 import struct
@@ -485,7 +488,7 @@ def cerca_e_scarica(query: str, cartella: str | Path, n: int | None = None) -> l
 _IMG_EXT = {"jpg", "jpeg", "png", "gif", "webp"}
 _VID_EXT = {"mp4", "webm"}
 MAX_BOORU = 5
-USO_BOORU = "Uso: /booru <tag> [-n 1-5] [-s r34|gb|db|e621] [-r]"
+USO_BOORU = "Uso: /booru <tag> [-n 1-5] [-s r34|gb|db|e621|rg] [-r]"
 
 # Tag che riguardano minori. Elenco FISSO e non disattivabile: una ricerca che li contiene viene rifiutata
 # e i post che li hanno vengono scartati dai risultati (si può solo ampliare con GRAVES_BOORU_BLACKLIST).
@@ -675,6 +678,71 @@ def _e621(tags: list, quanti: int, casuale: bool) -> list:
     return out
 
 
+# RedGifs: nessuna chiave da registrare, ma serve un token "ospite" (GET /v2/auth/temporary) legato a IP e
+# user-agent, che dura circa un giorno. C'e' un limite orario alle richieste di token (se lo superi il blocco
+# dura a lungo), quindi lo salvo su file e lo riuso; se l'API risponde 401 ne chiedo uno nuovo, una volta sola.
+_RG_H = {"User-Agent": UA, "Accept": "application/json",
+         "Referer": "https://www.redgifs.com/", "Origin": "https://www.redgifs.com"}
+
+
+def _rg_token(rinnova: bool = False) -> str:
+    f = STATO.with_name("graves_redgifs_token.json")
+    if not rinnova:
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            if d.get("token") and time.time() - float(d.get("t", 0)) < 20 * 3600:
+                return d["token"]
+        except Exception:
+            pass
+    dati = _http_json("RedGifs", urllib.request.Request("https://api.redgifs.com/v2/auth/temporary", headers=_RG_H))
+    tok = dati.get("token") if isinstance(dati, dict) else None
+    if not tok:
+        raise GravesErrore("RedGifs: non sono riuscito a ottenere il token temporaneo.")
+    try:
+        tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"token": tok, "t": time.time()}), encoding="utf-8")
+        os.replace(tmp, f)
+    except OSError as e:
+        log(f"    Graves: token RedGifs non salvato ({e})")
+    return tok
+
+
+def _redgifs(tags: list, quanti: int, casuale: bool) -> list:
+    """Ricerca testuale: i tag diventano testo (_ -> spazio). Le esclusioni '-tag' non esistono lato server:
+    le applico io ai tag dei risultati."""
+    positivi = [t.lstrip("~") for t in tags if not t.startswith("-")]
+    esclusi = {t[1:].lower() for t in tags if t.startswith("-") and len(t) > 1}
+    testo = " ".join(t.replace("_", " ") for t in positivi if t)
+    if not testo:
+        raise GravesErrore("RedGifs: serve almeno un tag in positivo (le sole esclusioni -tag non bastano).")
+    pagina = random.randint(1, 3) if casuale else 1
+
+    def chiedi(rinnova: bool):
+        p = {"search_text": testo, "order": "trending", "count": min(100, quanti), "page": pagina}
+        h = {**_RG_H, "Authorization": "Bearer " + _rg_token(rinnova)}
+        return _http_json("RedGifs", urllib.request.Request(
+            "https://api.redgifs.com/v2/gifs/search?" + urllib.parse.urlencode(p), headers=h), 25)
+
+    try:
+        dati = chiedi(False)
+    except GravesErrore as e:
+        if "HTTP 401" not in str(e):
+            raise
+        dati = chiedi(True)             # token scaduto o legato a un altro IP
+    gifs = [x for x in (dati.get("gifs") if isinstance(dati, dict) else None) or [] if isinstance(x, dict)]
+    if casuale:
+        random.shuffle(gifs)
+    out = []
+    for gif in gifs:
+        u = gif.get("urls") or {}
+        tag = [str(x).lower().replace(" ", "_") for x in gif.get("tags") or []]
+        if esclusi & set(tag):
+            continue
+        out.append(_post("redgifs", gif.get("id"), u.get("hd") or u.get("sd"),
+                         (u.get("poster"), u.get("thumbnail")), tag, gif.get("likes")))
+    return out
+
+
 _SITI = {
     "r34": {"nome": "rule34", "cerca": _r34, "referer": "https://rule34.xxx/",
             "link": "https://rule34.xxx/index.php?page=post&s=view&id={id}"},
@@ -682,11 +750,14 @@ _SITI = {
                  "link": "https://gelbooru.com/index.php?page=post&s=view&id={id}"},
     "danbooru": {"nome": "danbooru", "cerca": _danbooru, "referer": "https://danbooru.donmai.us/",
                  "link": "https://danbooru.donmai.us/posts/{id}"},
+    "redgifs": {"nome": "redgifs", "cerca": _redgifs, "referer": "https://www.redgifs.com/",
+                "link": "https://www.redgifs.com/watch/{id}"},
     "e621": {"nome": "e621", "cerca": _e621, "referer": "https://e621.net/",
              "link": "https://e621.net/posts/{id}"},
 }
 _ALIAS_SITI = {"r34": "r34", "rule34": "r34", "gb": "gelbooru", "gelbooru": "gelbooru",
-               "db": "danbooru", "danbooru": "danbooru", "e621": "e621", "e6": "e621"}
+               "db": "danbooru", "danbooru": "danbooru", "e621": "e621", "e6": "e621",
+               "rg": "redgifs", "redgifs": "redgifs", "redgif": "redgifs"}
 
 
 # ---------- richiesta ----------
@@ -725,7 +796,7 @@ def parse_booru(testo: str, n: int | None = None, sito: str | None = None, casua
         raise GravesErrore("Ricerca non eseguita: contiene tag che riguardano minori.")
     nome = _ALIAS_SITI.get((sito or _env("GRAVES_BOORU_SITO", "r34")).strip().lower())
     if not nome:
-        raise GravesErrore("Sito non valido: usa r34, gelbooru (gb), danbooru (db) o e621.")
+        raise GravesErrore("Sito non valido: usa r34, gelbooru (gb), danbooru (db), e621 o redgifs (rg).")
     n = max(1, min(MAX_BOORU, n or _int_env("GRAVES_BOORU_RISULTATI", 3) or 3))
     return RichiestaBooru(tags=tags, n=n, sito=nome, casuale=bool(casuale))
 
@@ -886,3 +957,17 @@ async def booru_anteprime(rich: RichiestaBooru, cartella) -> list:
 async def booru_file(post: PostBooru, cartella, i: int = 0) -> Path:
     """Scarica il file completo di un post scelto dall'utente."""
     return await asyncio.to_thread(post.scarica, Path(cartella), i)
+
+
+async def booru_altro(rich: RichiestaBooru, cartella, visti) -> tuple:
+    """Un altro risultato casuale con gli stessi tag, diverso da quelli gia' mostrati (`visti`: set di id).
+    Restituisce (post, path_anteprima | None). Solleva GravesErrore se non ne trova altri."""
+    cartella = Path(cartella)
+    r = RichiestaBooru(tags=list(rich.tags), n=1, sito=rich.sito, casuale=True)
+    nuovi = [p for p in await asyncio.to_thread(booru_cerca, r) if p.id not in visti]
+    if not nuovi:
+        raise GravesErrore("Nessun altro risultato diverso da quelli già visti.")
+    p = random.choice(nuovi)
+    if _env("GRAVES_BOORU_ANTEPRIMA", "1").lower() in ("0", "no", "off", "false"):
+        return p, None
+    return p, await asyncio.to_thread(_scarica_anteprima, p, cartella, len(visti) + 100)
