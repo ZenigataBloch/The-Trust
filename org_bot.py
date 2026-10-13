@@ -1583,6 +1583,17 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
         testo.see("end")
         msg.config(text=f"Aggiunte {len(nuove)} righe: ricorda di salvare.", fg=T.WARN)
 
+    def svuota():
+        if st["invio"]:
+            messagebox.showinfo("Svuota", "C'è un invio in corso: fermalo prima di svuotare la lista.")
+            return
+        if not testo.get("1.0", "end-1c").strip():
+            return
+        if not messagebox.askyesno("Svuota", "Svuotare la lista Telegram?\n(Resta una copia in backup/)"):
+            return
+        testo.delete("1.0", "end")
+        salva(motivo="Lista svuotata")
+
     def apri_cartella():
         try:
             if sys.platform == "win32":
@@ -1870,7 +1881,7 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
     riga2 = tk.Frame(bt_dx)     # invio: su una riga a parte, così non sparisce a finestra stretta
     riga2.pack(fill="x", pady=(4, 0))
     for txt, cmd in (("Incolla dagli appunti", incolla), ("Incolla in 1 riga", lambda: incolla(True)),
-                     ("Salva", salva), ("Apri cartella", apri_cartella)):
+                     ("Salva", salva), ("Svuota", svuota), ("Apri cartella", apri_cartella)):
         tk.Button(riga1, text=txt, command=cmd).pack(side="left", padx=(0, 4))
     ico_log = icona_log(tk)
     bt_log = tk.Button(riga2, image=ico_log, command=lambda: apri_log(root, tk, ttk, "telegram"))

@@ -137,6 +137,7 @@ textarea:focus,.kb input:focus{outline:0;border-color:var(--ro);box-shadow:0 0 0
     <button class="b" id="inc-t">Incolla</button>
     <button class="b" id="inc1-t">Incolla in 1 riga</button>
     <button class="b" id="sal-t">Salva</button>
+    <button class="b" id="svuota-t">Svuota</button>
     <span class="grow"></span>
     <button class="b" id="ferma" disabled>Ferma</button>
     <button class="b p" id="invia">Invia ora</button>
@@ -364,6 +365,13 @@ $("#invia").onclick=async()=>{
   if(r.errore)LT.say("⚠ "+r.errore,"err");else pollT1();
 };
 $("#ferma").onclick=async()=>{await api("/api/tg/ferma",{});pollT1();};
+$("#svuota-t").onclick=async()=>{
+  if(T.era)return alert("C'è un invio in corso: fermalo prima di svuotare la lista.");
+  if(!LT.ta.value.trim())return;
+  if(!confirm("Svuotare la lista Telegram?\n(Resta una copia in backup/)"))return;
+  LT.ta.value="";LT.dirty=true;
+  if(await LT.salva(false)){await pollT1();LT.say("Lista svuotata ("+hhmm()+").","ok");}
+};
 async function canaliOp(url,body,attesa){
   LT.say(attesa,"info");const r=await api(url,body);
   if(r.errore&&r.aggiunti===undefined)return LT.say("⚠ "+r.errore,"err");
