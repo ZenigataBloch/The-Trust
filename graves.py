@@ -707,39 +707,76 @@ def _rg_token(rinnova: bool = False) -> str:
     return tok
 
 
-def _redgifs(tags: list, quanti: int, casuale: bool) -> list:
-    """Ricerca testuale: i tag diventano testo (_ -> spazio). Le esclusioni '-tag' non esistono lato server:
-    le applico io ai tag dei risultati."""
-    positivi = [t.lstrip("~") for t in tags if not t.startswith("-")]
-    esclusi = {t[1:].lower() for t in tags if t.startswith("-") and len(t) > 1}
-    testo = " ".join(t.replace("_", " ") for t in positivi if t)
-    if not testo:
-        raise GravesErrore("RedGifs: serve almeno un tag in positivo (le sole esclusioni -tag non bastano).")
-    pagina = random.randint(1, 3) if casuale else 1
+def _rg_sq(s) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
 
-    def chiedi(rinnova: bool):
-        p = {"search_text": testo, "order": "trending", "count": min(100, quanti), "page": pagina}
+
+def _rg_corrisponde(positivo: str, tag_sq: list) -> bool:
+    p = _rg_sq(positivo)
+    return not p or any(p == t or (len(p) >= 4 and p in t) for t in tag_sq)
+
+
+def _redgifs(tags: list, quanti: int, casuale: bool) -> list:
+    """Il '_' diventa spazio. Provo piu' formulazioni (prima '#lisa ann', poi 'lisa ann', poi con il parametro
+    tags) e mi fermo alla prima che da' risultati con TUTTI i tag richiesti (nei tag del post, nel nome della
+    creator o nella descrizione, senza badare a spazi, underscore e maiuscole). Niente ripieghi su risultati
+    che non corrispondono. Le esclusioni '-tag' le applico io."""
+    positivi = [t.lstrip("~") for t in tags if not t.startswith("-") and t.lstrip("~")]
+    esclusi = [_rg_sq(t[1:]) for t in tags if t.startswith("-") and len(t) > 1]
+    nomi = [t.replace("_", " ") for t in positivi]
+    if not nomi:
+        raise GravesErrore("RedGifs: serve almeno un tag in positivo (le sole esclusioni -tag non bastano).")
+    varianti = [{"search_text": " ".join("#" + n for n in nomi)},
+                {"search_text": " ".join(nomi)},
+                {"search_text": " ".join(nomi), "tags": ",".join(n.title() for n in nomi)}]
+
+    def chiedi(extra: dict, pagina: int, rinnova: bool):
+        p = {**extra, "order": "trending", "count": 100, "page": pagina}
         h = {**_RG_H, "Authorization": "Bearer " + _rg_token(rinnova)}
         return _http_json("RedGifs", urllib.request.Request(
             "https://api.redgifs.com/v2/gifs/search?" + urllib.parse.urlencode(p), headers=h), 25)
 
-    try:
-        dati = chiedi(False)
-    except GravesErrore as e:
-        if "HTTP 401" not in str(e):
-            raise
-        dati = chiedi(True)             # token scaduto o legato a un altro IP
-    gifs = [x for x in (dati.get("gifs") if isinstance(dati, dict) else None) or [] if isinstance(x, dict)]
-    if casuale:
-        random.shuffle(gifs)
-    out = []
-    for gif in gifs:
-        u = gif.get("urls") or {}
-        tag = [str(x).lower().replace(" ", "_") for x in gif.get("tags") or []]
-        if esclusi & set(tag):
+    def pagina_gifs(extra: dict, pagina: int) -> list:
+        try:
+            dati = chiedi(extra, pagina, False)
+        except GravesErrore as e:
+            if "HTTP 401" not in str(e):
+                raise
+            dati = chiedi(extra, pagina, True)      # token scaduto o legato a un altro IP
+        return [x for x in (dati.get("gifs") if isinstance(dati, dict) else None) or [] if isinstance(x, dict)]
+
+    def filtra(gifs: list) -> list:
+        out = []
+        for gif in gifs:
+            u = gif.get("urls") or {}
+            tag = [str(x).lower().replace(" ", "_") for x in gif.get("tags") or []]
+            sq = [_rg_sq(x) for x in tag] + [_rg_sq(gif.get("userName")), _rg_sq(gif.get("description"))]
+            if any(e in sq for e in esclusi) or not all(_rg_corrisponde(p, sq) for p in positivi):
+                continue
+            out.append(_post("redgifs", gif.get("id"), u.get("hd") or u.get("sd"),
+                             (u.get("poster"), u.get("thumbnail")), tag, gif.get("likes")))
+        return out
+
+    pagina = random.randint(1, 3) if casuale else 1
+    out, riuscite, ultimo = [], 0, None
+    for i, extra in enumerate(varianti, 1):
+        try:
+            gifs = pagina_gifs(extra, pagina)
+            if not gifs and pagina > 1:
+                gifs = pagina_gifs(extra, 1)
+        except GravesErrore as e:
+            ultimo = e
+            log(f"    Graves: RedGifs variante {i}: {e}")
             continue
-        out.append(_post("redgifs", gif.get("id"), u.get("hd") or u.get("sd"),
-                         (u.get("poster"), u.get("thumbnail")), tag, gif.get("likes")))
+        riuscite += 1
+        out = filtra(gifs)
+        log(f"    Graves: RedGifs variante {i}/{len(varianti)}: {len(gifs)} risultati, {len(out)} con tutti i tag")
+        if out:
+            break
+    if not riuscite and ultimo:
+        raise ultimo
+    if casuale:
+        random.shuffle(out)
     return out
 
 
@@ -797,6 +834,10 @@ def parse_booru(testo: str, n: int | None = None, sito: str | None = None, casua
     nome = _ALIAS_SITI.get((sito or _env("GRAVES_BOORU_SITO", "r34")).strip().lower())
     if not nome:
         raise GravesErrore("Sito non valido: usa r34, gelbooru (gb), danbooru (db), e621 o redgifs (rg).")
+    if nome == "redgifs" and "," not in riga:       # su RedGifs "lisa ann" e' un nome solo, non due tag
+        pos = [t.lstrip("~") for t in tags if not t.startswith("-")]
+        if len(pos) > 1:
+            tags = ["_".join(pos)] + [t for t in tags if t.startswith("-")]
     n = max(1, min(MAX_BOORU, n or _int_env("GRAVES_BOORU_RISULTATI", 3) or 3))
     return RichiestaBooru(tags=tags, n=n, sito=nome, casuale=bool(casuale))
 
