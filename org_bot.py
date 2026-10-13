@@ -2702,7 +2702,7 @@ def avvia_gui():
         nome = st["nome"]
         if not nome:
             return
-        if not messagebox.askyesno("Elimina", f"Eliminare «{nome}» e la sua lista?"):
+        if not messagebox.askyesno("Elimina chat", f"Eliminare la chat «{nome}», scollegarla e cancellare la sua lista?"):
             return
         fai_backup(nome, forza=True)    # la lista eliminata resta recuperabile in backup/
         try:
@@ -2736,13 +2736,14 @@ def avvia_gui():
         testo.see("end")
         msg.config(text=f"Aggiunte {len(nuove)} righe: ricorda di salvare.", fg=T.WARN)
 
-    def scollega_chat():
+    def svuota():
         nome = st["nome"]
-        if not nome:
+        if not nome or not testo.get("1.0", "end-1c").strip():
             return
-        n = scollega(nome)
-        msg.config(text=f"Scollegate {n} chat da «{nome}»." if n else "Nessuna chat collegata.", fg=T.OK)
-        aggiorna_info()
+        if not messagebox.askyesno("Svuota", f"Svuotare la lista di «{nome}»?\n(Resta una copia in invii/backup/)"):
+            return
+        testo.delete("1.0", "end")
+        salva(motivo="Lista svuotata")
 
     def apri_cartella():
         try:
@@ -2898,10 +2899,10 @@ def avvia_gui():
         else:
             salva()
 
-    for txt, cmd in (("Nuova persona", nuova), ("Elimina", elimina)):
+    for txt, cmd in (("Nuova persona", nuova), ("Elimina chat", elimina)):
         tk.Button(bt_sx, text=txt, command=cmd).pack(side="left", expand=True, fill="x", padx=1)
     for txt, cmd in (("Incolla dagli appunti", incolla), ("Incolla in 1 riga", lambda: incolla(True)),
-                     ("Salva", salva), ("Scollega chat", scollega_chat), ("Apri cartella", apri_cartella)):
+                     ("Salva", salva), ("Svuota", svuota), ("Apri cartella", apri_cartella)):
         b = tk.Button(bt_dx, text=txt, command=cmd)
         b.pack(side="left", padx=(0, 4))
         if cmd is not apri_cartella:

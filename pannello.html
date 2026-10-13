@@ -121,8 +121,8 @@ textarea:focus,.kb input:focus{outline:0;border-color:var(--ro);box-shadow:0 0 0
     <button class="b pp" id="inc1-p">Incolla in 1 riga</button>
     <button class="b pp p" id="sal-p">Salva</button>
     <span class="grow"></span>
-    <button class="b pp" id="scol">Scollega chat</button>
-    <button class="b pp" id="elim">Elimina</button>
+    <button class="b pp" id="scol">Svuota</button>
+    <button class="b pp" id="elim">Elimina chat</button>
   </div>
 </section>
 <section id="s-t">
@@ -287,14 +287,16 @@ $("#nuova").onclick=async()=>{
   caricaP(r.nome);
 };
 $("#elim").onclick=async()=>{
-  if(!P.nome||!confirm("Eliminare «"+P.nome+"» e la sua lista?\n(Resta una copia in invii/backup/)"))return;
+  if(!P.nome||!confirm("Eliminare la chat «"+P.nome+"», scollegarla e cancellare la sua lista?\n(Resta una copia in invii/backup/)"))return;
   await api("/api/persona/elimina",{nome:P.nome});
   P.nome=null;P.sig="";LP.set("",0);editorP(false);bar("p");
   $("#info-p").textContent="Scegli una persona o creane una nuova.";listaP();
 };
 $("#scol").onclick=async()=>{
-  if(!P.nome)return;const r=await api("/api/persona/scollega",{nome:P.nome});
-  LP.say(r.n?"Scollegate "+r.n+" chat da «"+P.nome+"».":"Nessuna chat collegata.","ok");caricaP(P.nome);
+  if(!P.nome||!LP.ta.value.trim())return;
+  if(!confirm("Svuotare la lista di «"+P.nome+"»?\n(Resta una copia in invii/backup/)"))return;
+  LP.ta.value="";LP.dirty=true;
+  if(await LP.salva(false)){await caricaP(P.nome);LP.say("Lista svuotata ("+hhmm()+").","ok");}
 };
 async function pollP(){
   try{
