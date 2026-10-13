@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <link rel="manifest" href="/manifest.json">
-<meta name="theme-color" content="#1b1718">
+<meta name="theme-color" content="#0f0d0e">
 <link rel="icon" href="/icon-192.png">
 <link rel="apple-touch-icon" href="/icon-192.png">
 <title>Branch</title>
@@ -56,6 +56,38 @@ select.b{max-width:100%}
 .kb .row input{flex:1;min-width:0;background:var(--in);color:var(--fg);border:1px solid var(--ln);border-radius:6px;padding:10px;font:14px ui-monospace,Consolas,monospace}
 .kb .row input:disabled{opacity:.4;text-decoration:line-through}
 .kb .tg{color:var(--er)}
+/* ---- grafica mobile ---- */
+:root{--bg:#0f0d0e;--pn:#1d1819;--in:#0a0809;--ln:#2f2728;--r:14px}
+body{font-size:16px}
+header{background:linear-gradient(180deg,#201a1b,#0f0d0e);border-bottom:0;padding:12px 16px;position:sticky;top:0;z-index:5}
+header::after{content:"";position:absolute;left:0;right:0;bottom:0;height:2px;background:linear-gradient(90deg,var(--ro),transparent)}
+#led{width:48px;height:48px;border:3px solid rgba(255,255,255,.12)}
+#stato b{font-size:17px;letter-spacing:.04em}
+#git{width:44px;height:44px;padding:0;font-size:20px;border-radius:50%}
+main{padding:14px 14px 18px;scroll-padding-bottom:90px}
+nav{order:3;position:sticky;bottom:0;background:#171213;border-top:1px solid var(--ln);border-bottom:0;padding-bottom:2px;z-index:5}
+nav button{display:flex;flex-direction:column;align-items:center;gap:2px;padding:8px 2px 7px;font-size:11px;border-bottom:0;border-top:3px solid transparent;letter-spacing:.03em}
+nav button::before{font-size:21px;line-height:1.1}
+#n-p::before{content:"💬"}#n-t::before{content:"✈️"}#n-c::before{content:"🍪"}#n-k::before{content:"🔑"}#n-l::before{content:"📜"}
+nav button.sel{color:#fff;border-top-color:var(--ro);background:rgba(200,55,45,.12)}
+.b{min-height:46px;border-radius:var(--r);padding:10px 16px;font-size:15px;background:#251f20;transition:transform .08s,background .15s}
+.b:active{transform:scale(.96);background:#33292a}
+.b.p{background:linear-gradient(180deg,#d8443a,#b52b22);border:0;box-shadow:0 2px 8px rgba(200,55,45,.35)}
+.row.wrap .b{flex:1 1 auto}
+.chips{gap:8px;padding:2px 0 6px;scrollbar-width:none}.chips::-webkit-scrollbar{display:none}
+.chip{border-radius:999px;min-height:42px;padding:8px 18px}
+#nuova{width:46px;padding:0;border-radius:50%;font-size:22px}
+textarea,#log{border-radius:var(--r);font-size:14px;padding:12px;background:var(--in)}
+textarea:focus,.kb input:focus{outline:0;border-color:var(--ro);box-shadow:0 0 0 2px rgba(200,55,45,.25)}
+.canale{border-radius:var(--r);padding:12px 14px;min-height:56px}
+.canale input{width:24px;height:24px}
+.canale button{font-size:22px;padding:8px 12px}
+.kb{border-radius:var(--r);padding:14px}
+.kb .row input{padding:12px;border-radius:10px}
+.bar{height:10px;border-radius:5px}
+.msg{padding:2px 2px}
+#info-p,#info-t{font-size:14px;padding:0 2px}
+@media(min-width:760px){main{max-width:900px;width:100%;margin:0 auto}}
 </style>
 </head>
 <body>
