@@ -80,6 +80,8 @@ riga resta e al prossimo invio i canali che l'hanno già ricevuta vengono saltat
 
 Avvio dei bot da Branch
 -----------------------
+Se i bot girano già sul telefono (Android) il led diventa BLU con la scritta «BOT ATTIVI SU ANDROID» e
+all'apertura Branch NON li accende sul PC (niente istanze doppie); vedi heartbeat.py.
 Sotto l'intestazione c'è un led: all'apertura Branch accende telegram_bot.py e discord_bot.py (se non
 girano già). Chiudendo Branch i bot RESTANO accesi; riaprendo Branch li ritrova (led verde) e si
 spengono solo cliccando il led (diventa rosso). Clic sul led rosso = li riaccende.
@@ -119,6 +121,11 @@ attiva_log_su_file()
 
 import branch_tema as T   # aspetto grafico, immagini e avatar (deve stare accanto a questo file)
 import bot_manager as BM   # avvio/arresto dei bot Telegram e Discord (deve stare accanto a questo file)
+try:
+    import heartbeat as HB    # «i bot girano già sul telefono?» (letto da Telegram, vedi heartbeat.py)
+except Exception as _e:       # senza heartbeat.py l'app funziona come prima, senza led blu
+    HB = None
+    print(f"heartbeat non disponibile: {_e!r}")
 
 import asyncio
 import contextlib
@@ -2311,15 +2318,24 @@ def crea_barra_bot(root, tk):
     cv = tk.Canvas(barra, height=34, bg=T.BG, highlightthickness=0, cursor="hand2")
     cv.pack(side="left", fill="x", expand=True, padx=10)
     ultimo = {"firma": None, "stato": {}, "occupato": False, "msg": ""}
+    BLU = getattr(T, "BLU", "#3b9eff")
+    if HB is not None:
+        HB.LA.avvia(None, _log_gui)      # parte solo col ruolo «desktop» (HB_RUOLO in bots.env)
+
+    def su_android() -> bool:
+        return bool(HB is not None and HB.LA.attivo)
 
     def disegna(stato: dict, occupato: bool, msg: str):
-        firma = (tuple(sorted(stato.items())), occupato, msg, cv.winfo_width(), SCALA["k"])
+        android = su_android()
+        firma = (tuple(sorted(stato.items())), occupato, msg, cv.winfo_width(), SCALA["k"], android)
         if firma == ultimo["firma"]:
             return
         ultimo["firma"] = firma
         accesi = sum(1 for v in stato.values() if v)
         if occupato:
             colore, titolo = T.WARN, msg or "BOT IN CORSO…"
+        elif android:
+            colore, titolo = BLU, "BOT ATTIVI SU ANDROID"
         elif accesi == len(stato):
             colore, titolo = T.OK, "BOT ATTIVI"
         elif accesi == 0:
@@ -2344,9 +2360,15 @@ def crea_barra_bot(root, tk):
                                fill=T.FG if on else T.MUTED, font=f_piccolo)
             x = cv.bbox(t)[2] + int(18 * k)
         errori = [f"{BM.MODULI[n][0]}: {e}" for n, e in gestore.errori.items()]
-        cv.create_text(max(cv.winfo_width() - 8, x), cy, anchor="e", fill=T.ERR if errori else T.MUTED,
-                       font=f_piccolo,
-                       text=("  ·  ".join(errori) if errori else "clic sul led per accendere/spegnere i bot"))
+        if android and accesi and not occupato:
+            hint, col = "⚠ girano anche sul PC: spegni quelli di uno dei due", T.WARN
+        elif android:
+            host = HB.LA.host
+            hint, col = f"girano sul telefono{f' ({host})' if host else ''}: sul PC restano spenti", T.MUTED
+        else:
+            hint, col = "clic sul led per accendere/spegnere i bot", T.MUTED
+        cv.create_text(max(cv.winfo_width() - 8, x), cy, anchor="e", fill=T.ERR if errori else col,
+                       font=f_piccolo, text=("  ·  ".join(errori) if errori else hint))
 
     def aggiorna():
         try:
@@ -2377,6 +2399,14 @@ def crea_barra_bot(root, tk):
         if any(gestore.stato().values()):
             in_thread(gestore.ferma_tutti, "SPEGNIMENTO…")
         else:
+            if su_android():
+                from tkinter import messagebox
+                if not messagebox.askyesno(
+                        "Bot già attivi su Android",
+                        "I bot risultano accesi sul telefono. Accenderli anche sul PC crea istanze doppie "
+                        "(messaggi ripetuti, conflitti sul polling di Telegram).\n\nAccenderli comunque?",
+                        default="no"):
+                    return
             in_thread(gestore.avvia_mancanti, "AVVIO…")
 
     # ---- pulsante «Aggiorna da GitHub»
@@ -2464,6 +2494,11 @@ def crea_barra_bot(root, tk):
     def avvio_con_update():
         ricorda_head_avvio()
         gestore.aggiorna()
+        if HB is not None:
+            HB.LA.attendi(8)             # prima lettura da Telegram (o timeout se non risponde)
+        if su_android():
+            _log_gui("bot attivi su Android: non li accendo sul PC (clic sul led per accenderli lo stesso)")
+            return
         gestore.avvia_mancanti()
     root.after(400, lambda: in_thread(avvio_con_update, "AGGIORNAMENTO…"))
 

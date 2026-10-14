@@ -259,7 +259,7 @@ class GestoreBot:
             self.occupato = False
 
     def _heartbeat(self):
-        """Sul PC fa partire (se manca) il mittente dell'heartbeat; sul telefono non fa nulla (vedi heartbeat.py)."""
+        """Fa partire (se manca) il mittente dell'heartbeat: sul PC pubblica «desktop», sul telefono «android» (vedi heartbeat.py)."""
         try:
             import heartbeat as HB
             HB.assicura_sender(self.log)

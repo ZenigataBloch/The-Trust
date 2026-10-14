@@ -1,5 +1,6 @@
 """
-heartbeat.py - dice al telefono che i bot girano già sul PC, passando da Telegram.
+heartbeat.py - dice al telefono che i bot girano già sul PC (e al PC che girano già sul telefono),
+passando da Telegram.
 
 Come funziona
 -------------
@@ -13,6 +14,14 @@ Come funziona
                           "Desktop attivo" = ON e il valore cambia entro 70 s (non conta l'orologio del PC).
                           Torna "spento" dopo 2 letture di fila senza heartbeat valido.
                           Se Telegram non è raggiungibile lo stato NON cambia (senza rete i bot non girano comunque).
+
+  Direzione inversa (telefono -> PC): c'è UN SOLO messaggio fissato per chat, quindi lo condividono. Ognuno
+  riscrive solo la propria metà, leggendo prima il messaggio com'è adesso:
+      BRANCH|ON|<pc>|<epoch>|ANDROID|ON|<telefono>|<epoch>
+  Le prime quattro voci sono quelle di sempre (un lettore vecchio le capisce ancora). Il telefono ora
+  pubblica anche lui (il processo staccato parte con i bot, come sul PC) e il PC lo legge con heartbeat.LA:
+  app desktop -> led blu «BOT ATTIVI SU ANDROID». Se due scritture si sovrappongono una metà può andare
+  persa, ma viene riscritta al giro dopo (20 s).
 
 Configurazione (bots.env, tutto facoltativo):
   HB_RUOLO=desktop|telefono|off   default: "telefono" se gira in Termux, altrimenti "desktop"
@@ -36,7 +45,6 @@ import bot_manager as BM
 
 BASE = BM.BASE
 PID_FILE = BASE / "hb_pid.json"
-MSG_FILE = BASE / "hb_msg.json"
 LOG_FILE = BASE / "heartbeat.log"
 PREFISSO = "BRANCH"
 INVIO_S = 20          # ogni quanto il PC aggiorna il messaggio
@@ -44,6 +52,7 @@ CONTROLLO_S = 5       # ogni quanto il PC guarda se i bot sono accesi/spenti (pe
 LETTURA_S = 15        # ogni quanto il telefono legge
 FRESCO_S = 70         # un heartbeat che non cambia da più di così è considerato morto
 CONFERME_OFF = 2      # letture "non valide" di fila prima di dichiarare il desktop spento
+TOLLERANZA_S = 300    # alla prima lettura: scarto massimo tra l'ora scritta dall'altro dispositivo e la mia
 
 
 class ApiErr(Exception):
@@ -94,20 +103,40 @@ def _nome_pc():
     return "".join(c for c in socket.gethostname() if c.isalnum() or c in "-_.")[:30] or "pc"
 
 
-class _Pubblicatore:
-    def __init__(self, token, chat):
-        self.token, self.chat = token, chat
+def _parti(testo) -> dict:
+    """'BRANCH|ON|pc|t[|ANDROID|ON|tel|t]' -> {'desktop': (stato, host, t), 'android': (...)} (vuoto se non è nostro)."""
+    p = (testo or "").split("|")
+    out = {}
+    if len(p) < 4 or p[0] != PREFISSO:
+        return out
+    if p[1] in ("ON", "OFF"):
+        out["desktop"] = (p[1], p[2], p[3])
+    if len(p) >= 8 and p[4] == "ANDROID" and p[5] in ("ON", "OFF"):
+        out["android"] = (p[5], p[6], p[7])
+    return out
 
-    def _mid(self):
-        try:
-            d = json.loads(MSG_FILE.read_text(encoding="utf-8"))
-            return d["message_id"] if str(d.get("chat")) == str(self.chat) else None
-        except Exception:
-            return None
+
+def _testo(parti: dict) -> str:
+    d = parti.get("desktop") or ("OFF", "", "0")
+    t = f"{PREFISSO}|{d[0]}|{d[1]}|{d[2]}"
+    a = parti.get("android")
+    if a:
+        t += f"|ANDROID|{a[0]}|{a[1]}|{a[2]}"
+    return t
+
+
+class _Pubblicatore:
+    def __init__(self, token, chat, parte="desktop"):
+        self.token, self.chat, self.parte = token, chat, parte    # parte: "desktop" | "android"
 
     def pubblica(self, acceso: bool):
-        testo = f"{PREFISSO}|{'ON' if acceso else 'OFF'}|{_nome_pc()}|{int(time.time())}"
-        mid = self._mid()
+        mio = ("ON" if acceso else "OFF", _nome_pc(), str(int(time.time())))
+        # leggo il messaggio fissato com'è adesso: l'altra metà non va persa (se getChat fallisce non scrivo)
+        m = _api(self.token, "getChat", chat_id=self.chat).get("pinned_message") or {}
+        parti = _parti(m.get("text"))
+        mid = m.get("message_id") if parti else None      # fissato e nostro -> lo modifico
+        parti[self.parte] = mio
+        testo = _testo(parti)
         if mid:
             try:
                 _api(self.token, "editMessageText", chat_id=self.chat, message_id=mid, text=testo)
@@ -120,15 +149,11 @@ class _Pubblicatore:
                     raise
                 _log("messaggio heartbeat sparito: ne creo uno nuovo")
         r = _api(self.token, "sendMessage", chat_id=self.chat, text=testo, disable_notification=True)
-        mid = r["message_id"]
         try:
-            MSG_FILE.write_text(json.dumps({"chat": str(self.chat), "message_id": mid}), encoding="utf-8")
-        except OSError:
-            pass
-        try:
-            _api(self.token, "pinChatMessage", chat_id=self.chat, message_id=mid, disable_notification=True)
+            _api(self.token, "pinChatMessage", chat_id=self.chat, message_id=r["message_id"],
+                 disable_notification=True)
         except ApiErr as e:
-            _log(f"fissaggio non riuscito (il telefono non vedrà il messaggio): {e}")
+            _log(f"fissaggio non riuscito (l'altro dispositivo non vedrà il messaggio): {e}")
 
 
 def _leggi_pid():
@@ -146,12 +171,12 @@ def _vivo(v):
 def sender():
     """Ciclo del processo staccato (python heartbeat.py --sender)."""
     ruolo, token, chat = _cfg()
-    if ruolo != "desktop" or not token or not chat:
+    if ruolo not in ("desktop", "telefono") or not token or not chat:
         return
     v = _leggi_pid()
     if _vivo(v) and int(v["pid"]) != os.getpid():
         return                                   # c'è già un mittente
-    pub = _Pubblicatore(token, chat)
+    pub = _Pubblicatore(token, chat, "desktop" if ruolo == "desktop" else "android")
     g = BM.GestoreBot(log=_log)
     _log(f"mittente avviato (pid {os.getpid()})")
     ultimo = None            # ultimo stato pubblicato (True/False)
@@ -168,9 +193,9 @@ def sender():
 
 
 def assicura_sender(log=print) -> bool:
-    """Chiamata da bot_manager dopo l'avvio/adozione dei bot: sul PC fa partire il mittente se non c'è."""
+    """Chiamata da bot_manager dopo l'avvio/adozione dei bot: fa partire il mittente (PC o telefono) se non c'è."""
     ruolo, token, chat = _cfg()
-    if ruolo != "desktop" or not token or not chat:
+    if ruolo not in ("desktop", "telefono") or not token or not chat:
         return False
     if _vivo(_leggi_pid()):
         return True
@@ -228,8 +253,10 @@ def riavvia_sender(log=print):
 
 # ================================================================ telefono: lettore
 class Lettore:
-    def __init__(self):
-        self.attivo = False          # True = il desktop ha i bot accesi
+    def __init__(self, parte="desktop"):
+        self.parte = parte           # metà letta: "desktop" (lo usa il telefono) o "android" (lo usa il PC)
+        self.ruolo = "telefono" if parte == "desktop" else "desktop"      # ruolo di chi legge
+        self.attivo = False          # True = l'altro dispositivo ha i bot accesi
         self.host = ""
         self.errore = None
         self._letto = threading.Event()   # settato dopo la prima lettura riuscita
@@ -241,12 +268,13 @@ class Lettore:
         self._log = _log
 
     def avvia(self, su_cambio=None, log=None) -> bool:
-        """Parte solo con ruolo 'telefono'. su_cambio(attivo: bool) viene chiamata a ogni cambio di stato."""
+        """Parte solo con il ruolo di chi legge (telefono per L, desktop per LA). su_cambio(attivo: bool)
+        viene chiamata a ogni cambio di stato."""
         self._su_cambio = su_cambio
         if log:
             self._log = log
         ruolo, token, chat = _cfg()
-        if ruolo != "telefono" or not token or not chat:
+        if ruolo != self.ruolo or not token or not chat:
             self._letto.set()
             return False
         threading.Thread(target=self._ciclo, args=(token, chat), daemon=True).start()
@@ -273,15 +301,21 @@ class Lettore:
     def elabora(self, m: dict, adesso=None):
         """Aggiorna lo stato da un messaggio fissato (separato da _ciclo per poterlo provare)."""
         adesso = time.monotonic() if adesso is None else adesso
-        p = (m.get("text") or "").split("|")
-        acceso = len(p) >= 4 and p[0] == PREFISSO and p[1] == "ON"
+        h = _parti(m.get("text")).get(self.parte)
+        acceso = bool(h) and h[0] == "ON"
         if acceso:
-            self.host = p[2]
-            t = p[3]
+            self.host = h[1]
+            t = h[2]
             if self._ultimo_t is None:
-                # primo ON visto: mi fido dell'ora di Telegram solo per decidere se è recente
+                # primo ON visto: mi fido dell'ora di Telegram solo per decidere se è recente. Il messaggio
+                # è condiviso (l'altro dispositivo lo modifica di continuo), quindi controllo anche l'ora
+                # scritta nella metà letta, con ampia tolleranza per gli orologi sfasati
                 eta = time.time() - float(m.get("edit_date") or m.get("date") or 0)
-                self._visto = adesso if eta <= FRESCO_S else -1e9
+                try:
+                    sfasamento = abs(time.time() - float(t))
+                except ValueError:
+                    sfasamento = 1e9
+                self._visto = adesso if (eta <= FRESCO_S and sfasamento <= TOLLERANZA_S) else -1e9
             elif t != self._ultimo_t:
                 self._visto = adesso               # il valore è cambiato: il PC è vivo
             self._ultimo_t = t
@@ -297,7 +331,7 @@ class Lettore:
         self._primo = False
         if nuovo != self.attivo:
             self.attivo = nuovo
-            self._log(f"heartbeat: desktop {'ATTIVO' if nuovo else 'spento'}")
+            self._log(f"heartbeat: {self.parte} {'ATTIVO' if nuovo else 'spento'}")
             if self._su_cambio:
                 try:
                     self._su_cambio(nuovo)
@@ -305,7 +339,8 @@ class Lettore:
                     self._log(f"heartbeat: errore nel callback {e!r}")
 
 
-L = Lettore()
+L = Lettore("desktop")       # per il telefono: il PC ha i bot accesi?
+LA = Lettore("android")      # per il PC: il telefono ha i bot accesi?
 
 if __name__ == "__main__":
     if "--sender" in sys.argv:
