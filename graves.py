@@ -50,6 +50,9 @@ Tag: separati da spazio (hatsune_miku solo -cat) oppure da virgola se hanno spaz
 -n quanti risultati (default 3, max 5), -s il sito, -r risultati casuali invece dei più recenti.
 RedGifs (-s rg): nessuna chiave. I tag sono testo libero (hatsune_miku diventa 'hatsune miku') e le
 esclusioni -tag vengono applicate in locale ai risultati. Il token ospite resta in graves_redgifs_token.json.
+Variabili RedGifs (opzionali): GRAVES_RG_ORDINE = trending (default), latest, top, top28, best, oldest;
+GRAVES_RG_PAGINE = quante pagine di risultati scorrere per trovare abbastanza post con tutti i tag (default 3,
+massimo 8). Le risposte dell'API restano in memoria 5 minuti (il tasto «altro» non rifà le richieste).
 Chiavi in bots.env (rule34.xxx e Gelbooru NON funzionano senza: l'API vuole account e chiave):
   GRAVES_R34_KEY, GRAVES_R34_USER            rule34.xxx (Account -> Options -> API Access Credentials)
   GRAVES_GELBOORU_KEY, GRAVES_GELBOORU_USER  Gelbooru
@@ -542,6 +545,7 @@ class PostBooru:
     ext: str
     tags: frozenset
     score: int = 0
+    alt: str = ""               # file di riserva (es. RedGifs sd) se quello principale non si scarica
 
     @property
     def video(self) -> bool:
@@ -558,11 +562,17 @@ class PostBooru:
     def scarica(self, cartella: Path, i: int = 0) -> Path:
         """Scarica il file completo (SSRF e redirect controllati come per le immagini di Google)."""
         mb = _int_env("GRAVES_BOORU_MAX_MB", 100) or 100
-        return _scarica_media(self.url, Path(cartella) / f"booru_{i:02d}", _SITI[self.sito]["referer"],
-                              mb * 1024 * 1024, solo_immagini=False)
+        base, ref = Path(cartella) / f"booru_{i:02d}", _SITI[self.sito]["referer"]
+        try:
+            return _scarica_media(self.url, base, ref, mb * 1024 * 1024, solo_immagini=False)
+        except Exception as e:
+            if not self.alt:
+                raise
+            log(f"    Graves: {self.etichetta()}: file principale non scaricato ({e}), provo la versione ridotta")
+            return _scarica_media(self.alt, base, ref, mb * 1024 * 1024, solo_immagini=False)
 
 
-def _post(sito, id_, url, anteprime, tags, score):
+def _post(sito, id_, url, anteprime, tags, score, alt=""):
     url = _https(url)
     ext = _ext_url(url) if url else ""
     if ext not in _IMG_EXT | _VID_EXT or id_ in (None, ""):
@@ -571,7 +581,8 @@ def _post(sito, id_, url, anteprime, tags, score):
     if isinstance(tags, str):
         tags = tags.split()
     return PostBooru(sito=sito, id=str(id_), url=url, anteprima=prev, ext=ext,
-                     tags=frozenset(str(t).lower() for t in tags or ()), score=_num(score))
+                     tags=frozenset(str(t).lower() for t in tags or ()), score=_num(score),
+                     alt=_https(alt) if _ext_url(_https(alt)) in _IMG_EXT | _VID_EXT else "")
 
 
 def _con_esclusioni(tags: list) -> list:
@@ -716,11 +727,17 @@ def _rg_corrisponde(positivo: str, tag_sq: list) -> bool:
     return not p or any(p == t or (len(p) >= 4 and p in t) for t in tag_sq)
 
 
+_RG_ORDINI = ("trending", "latest", "top", "top28", "best", "oldest")
+_RG_CACHE: dict = {}
+_RG_CACHE_S = 300
+
+
 def _redgifs(tags: list, quanti: int, casuale: bool) -> list:
     """Il '_' diventa spazio. Provo piu' formulazioni (prima '#lisa ann', poi 'lisa ann', poi con il parametro
-    tags) e mi fermo alla prima che da' risultati con TUTTI i tag richiesti (nei tag del post, nel nome della
-    creator o nella descrizione, senza badare a spazi, underscore e maiuscole). Niente ripieghi su risultati
-    che non corrispondono. Le esclusioni '-tag' le applico io."""
+    tags) e mi fermo alla prima che da' risultati con TUTTI i tag richiesti (nei tag del post, nei niche, nel
+    nome della creator o nella descrizione, senza badare a spazi, underscore e maiuscole). Per ogni formulazione
+    scorro fino a GRAVES_RG_PAGINE pagine finche' non ho abbastanza candidati. Niente ripieghi su risultati che
+    non corrispondono. Le esclusioni '-tag' le applico io. Ogni post porta anche la versione sd come riserva."""
     positivi = [t.lstrip("~") for t in tags if not t.startswith("-") and t.lstrip("~")]
     esclusi = [_rg_sq(t[1:]) for t in tags if t.startswith("-") and len(t) > 1]
     nomi = [t.replace("_", " ") for t in positivi]
@@ -729,48 +746,82 @@ def _redgifs(tags: list, quanti: int, casuale: bool) -> list:
     varianti = [{"search_text": " ".join("#" + n for n in nomi)},
                 {"search_text": " ".join(nomi)},
                 {"search_text": " ".join(nomi), "tags": ",".join(n.title() for n in nomi)}]
+    o = _env("GRAVES_RG_ORDINE", "trending").lower()
+    ordine = o if o in _RG_ORDINI else "trending"
+    max_pag = max(1, min(8, _int_env("GRAVES_RG_PAGINE", 3) or 3))
 
     def chiedi(extra: dict, pagina: int, rinnova: bool):
-        p = {**extra, "order": "trending", "count": 100, "page": pagina}
+        p = {**extra, "order": ordine, "count": 100, "page": pagina}
         h = {**_RG_H, "Authorization": "Bearer " + _rg_token(rinnova)}
         return _http_json("RedGifs", urllib.request.Request(
             "https://api.redgifs.com/v2/gifs/search?" + urllib.parse.urlencode(p), headers=h), 25)
 
-    def pagina_gifs(extra: dict, pagina: int) -> list:
+    def pagina_dati(extra: dict, pagina: int) -> tuple:
+        """(gifs, numero di pagine totali); con cache di 5 minuti."""
+        chiave = (tuple(sorted(extra.items())), ordine, pagina)
+        with _lock:
+            hit = _RG_CACHE.get(chiave)
+        if hit and time.time() - hit[0] < _RG_CACHE_S:
+            return hit[1], hit[2]
         try:
             dati = chiedi(extra, pagina, False)
         except GravesErrore as e:
-            if "HTTP 401" not in str(e):
+            if "HTTP 401" in str(e):
+                dati = chiedi(extra, pagina, True)      # token scaduto o legato a un altro IP
+            elif "limite di richieste" in str(e):
+                time.sleep(2)                            # limite al secondo: riprovo una volta
+                dati = chiedi(extra, pagina, False)
+            else:
                 raise
-            dati = chiedi(extra, pagina, True)      # token scaduto o legato a un altro IP
-        return [x for x in (dati.get("gifs") if isinstance(dati, dict) else None) or [] if isinstance(x, dict)]
+        d = dati if isinstance(dati, dict) else {}
+        gifs = [x for x in d.get("gifs") or [] if isinstance(x, dict)]
+        pagine = _num(d.get("pages")) or 1
+        with _lock:
+            if len(_RG_CACHE) > 40:
+                _RG_CACHE.clear()
+            _RG_CACHE[chiave] = (time.time(), gifs, pagine)
+        return gifs, pagine
 
     def filtra(gifs: list) -> list:
         out = []
         for gif in gifs:
             u = gif.get("urls") or {}
             tag = [str(x).lower().replace(" ", "_") for x in gif.get("tags") or []]
-            sq = [_rg_sq(x) for x in tag] + [_rg_sq(gif.get("userName")), _rg_sq(gif.get("description"))]
+            niche = [str(x).lower().replace(" ", "_") for x in gif.get("niches") or [] if isinstance(x, str)]
+            sq = ([_rg_sq(x) for x in tag + niche]
+                  + [_rg_sq(gif.get("userName")), _rg_sq(gif.get("description"))])
             if any(e in sq for e in esclusi) or not all(_rg_corrisponde(p, sq) for p in positivi):
                 continue
-            out.append(_post("redgifs", gif.get("id"), u.get("hd") or u.get("sd"),
-                             (u.get("poster"), u.get("thumbnail")), tag, gif.get("likes")))
+            hd, sd = u.get("hd"), u.get("sd")
+            out.append(_post("redgifs", gif.get("id"), hd or sd, (u.get("poster"), u.get("thumbnail")),
+                             tag, gif.get("likes"), alt=sd if hd and sd and sd != hd else ""))
         return out
 
-    pagina = random.randint(1, 3) if casuale else 1
-    out, riuscite, ultimo = [], 0, None
+    inizio = random.randint(1, 3) if casuale else 1
+    out, visti, riuscite, ultimo = [], set(), 0, None
     for i, extra in enumerate(varianti, 1):
-        try:
-            gifs = pagina_gifs(extra, pagina)
-            if not gifs and pagina > 1:
-                gifs = pagina_gifs(extra, 1)
-        except GravesErrore as e:
-            ultimo = e
-            log(f"    Graves: RedGifs variante {i}: {e}")
-            continue
-        riuscite += 1
-        out = filtra(gifs)
-        log(f"    Graves: RedGifs variante {i}/{len(varianti)}: {len(gifs)} risultati, {len(out)} con tutti i tag")
+        pagina, ini, letti, ok = inizio, inizio, 0, False
+        while pagina < ini + max_pag:
+            try:
+                gifs, pagine = pagina_dati(extra, pagina)
+            except GravesErrore as e:
+                ultimo = e
+                log(f"    Graves: RedGifs variante {i}, pagina {pagina}: {e}")
+                break
+            ok = True
+            if not gifs and pagina == ini and ini > 1:      # pagina casuale oltre la fine: riparto dalla 1
+                ini = pagina = 1
+                continue
+            letti += len(gifs)
+            for p in filtra(gifs):
+                if p and p.id not in visti:
+                    visti.add(p.id)
+                    out.append(p)
+            if len(out) >= quanti or not gifs or pagina >= pagine:
+                break
+            pagina += 1
+        riuscite += ok
+        log(f"    Graves: RedGifs variante {i}/{len(varianti)}: {letti} risultati letti, {len(out)} con tutti i tag")
         if out:
             break
     if not riuscite and ultimo:
