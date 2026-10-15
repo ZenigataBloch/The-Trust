@@ -122,6 +122,11 @@ attiva_log_su_file()
 import branch_tema as T   # aspetto grafico, immagini e avatar (deve stare accanto a questo file)
 import bot_manager as BM   # avvio/arresto dei bot Telegram e Discord (deve stare accanto a questo file)
 try:
+    import impostazioni as IMP   # cookie, chiavi API e tetto ricerche (la stessa logica del pannello web)
+except Exception as _e:
+    IMP = None
+    print(f"impostazioni non disponibile: {_e!r}")
+try:
     import heartbeat as HB    # «i bot girano già sul telefono?» (letto da Telegram, vedi heartbeat.py)
 except Exception as _e:       # senza heartbeat.py l'app funziona come prima, senza led blu
     HB = None
@@ -2515,6 +2520,317 @@ def crea_barra_bot(root, tk):
             "ridisegna": ridisegna}
 
 
+def crea_scheda_impostazioni(root, scheda, tk, ttk, messagebox, barra_bot):
+    """Scheda IMPOSTAZIONI: Cookie, Chiavi API e Tetto ricerche. La logica sta in impostazioni.py, la stessa
+    del pannello web (Android): qui c'è solo l'interfaccia."""
+    if IMP is None:
+        tk.Label(scheda, text="impostazioni.py non trovato (deve stare accanto a org_bot.py).",
+                 fg=T.ERR).pack(pady=20)
+        return
+    IMP.log = _log_gui
+    sub = ttk.Notebook(scheda)
+    sub.pack(fill="both", expand=True, padx=6, pady=6)
+    f_ck, f_k, f_t = tk.Frame(sub), tk.Frame(sub), tk.Frame(sub)
+    sub.add(f_ck, text="  Cookie  ")
+    sub.add(f_k, text="  Chiavi API  ")
+    sub.add(f_t, text="  Tetto ricerche  ")
+    colori = {"ok": T.OK, "warn": T.WARN, "err": T.ERR, "mu": T.MUTED}
+    larg = 640
+
+    def etichetta(parent, testo="", **kw):
+        lab = tk.Label(parent, text=testo, anchor="w", justify="left", wraplength=larg, **kw)
+        lab.pack(fill="x", padx=10, pady=(6, 0))
+        return lab
+
+    def di(lab, testo, tipo=""):
+        lab.config(text=testo, fg=colori.get(tipo, T.MUTED))
+
+    scorri = {}                                    # canvas delle schede scorrevoli, per la rotella
+
+    def scorrevole(parent, chiave):
+        cv = tk.Canvas(parent, highlightthickness=0)
+        sb = tk.Scrollbar(parent, command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(cv)
+        win = cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+        scorri[chiave] = cv
+        return inner
+
+    def rotella(e):
+        cv = scorri.get({1: "k", 2: "t"}.get(sub.index(sub.select())))
+        if cv is not None:
+            su = getattr(e, "num", 0) == 4 or getattr(e, "delta", 0) > 0
+            cv.yview_scroll(-3 if su else 3, "units")
+
+    def aggancia_rotella(_=None):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            root.bind_all(seq, rotella)
+
+    def sgancia_rotella(_=None):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            root.unbind_all(seq)
+
+    def riavvia_bot() -> str:
+        g = barra_bot["gestore"]
+        if g.occupato:
+            return "⚠ C'è un'operazione in corso sui bot: riprova tra qualche secondo."
+        if not any(g.stato().values()):
+            return "I bot sono spenti: leggeranno le chiavi alla prossima accensione."
+
+        def corpo():
+            g.ferma_tutti()
+            g.avvia_mancanti()
+        threading.Thread(target=corpo, daemon=True).start()
+        return "Bot in riavvio."
+
+    # ------------------------------------------------------------ Cookie
+    ck = {"testo": ""}
+    etichetta(f_ck, "Esporta i cookie dal browser (JSON o cookies.txt), poi «Incolla dagli appunti». Controllo che "
+                    "siano cookie, tengo solo i siti dei bot e scarto il resto.", fg=T.MUTED).pack_configure(pady=(10, 0))
+    ck_stato = etichetta(f_ck, "", fg=T.MUTED)
+    ck_box = tk.Text(f_ck, height=4, wrap="word", font=("Consolas", 9))
+    ck_box.pack(fill="x", padx=10, pady=(6, 0))
+    riga_ck = tk.Frame(f_ck)
+    riga_ck.pack(fill="x", padx=10, pady=6)
+    ck_rep = tk.Text(f_ck, height=8, wrap="word", state="disabled", relief="flat", font=("Segoe UI", 9))
+    ck_rep.pack(fill="x", padx=10)
+    for tag, col in colori.items():
+        ck_rep.tag_config(tag, foreground=col)
+    ck_msg = etichetta(f_ck, "")
+
+    def ck_stato_aggiorna():
+        r = IMP.cookie_stato()
+        parti = []
+        for sito, v in r["siti"].items():
+            if not v["n"]:
+                parti.append(f"{sito.split('.')[0]} —")
+            else:
+                nota = " (scaduti)" if v["scaduti"] == v["n"] else f" ({v['scaduti']} scaduti)" if v["scaduti"] else ""
+                parti.append(f"{sito.split('.')[0]} {v['n']}{nota}")
+        di(ck_stato, (r["file"] + ": " if r["esiste"] else "cookies.txt non esiste ancora. ") + " · ".join(parti)
+           + (" · modificato " + time.strftime("%d/%m %H:%M", time.localtime(r["mtime"])) if r["esiste"] else ""), "mu")
+
+    def ck_rapporto(righe):
+        ck_rep.config(state="normal")
+        ck_rep.delete("1.0", "end")
+        for testo, tag in righe:
+            ck_rep.insert("end", testo + "\n", tag)
+        ck_rep.config(state="disabled")
+
+    def ck_analizza(testo):
+        di(ck_msg, "")
+        ck["testo"] = testo
+        r = IMP.cookie_analizza(testo)
+        if r.get("errore"):
+            ck_rapporto([("⚠ " + r["errore"], "err")])
+            bt_ap.config(state="disabled")
+            return
+        righe = [(f"✓ Formato {r['formato']}: {r['validi']} cookie riconosciuti.", "ok")]
+        for sito, v in r["siti"].items():
+            righe.append((("⚠ " if v.get("avviso") else "✓ ") + f"{sito}: {v['n']} cookie"
+                          + (f", {v['scaduti']} scaduti" if v.get("scaduti") else "")
+                          + (f" — {v['avviso']}" if v.get("avviso") else ""), "warn" if v.get("avviso") else "ok"))
+        if r.get("altri"):
+            righe.append((f"Scartati {r['altri']} cookie di altri siti.", "mu"))
+        if r.get("scartati"):
+            righe.append((f"Ignorate {r['scartati']} righe che non sono cookie.", "mu"))
+        ck_rapporto(righe)
+        bt_ap.config(state="normal")
+
+    def ck_incolla():
+        try:
+            t = root.clipboard_get()
+        except tk.TclError:
+            di(ck_msg, "Appunti vuoti o non testuali: incolla a mano nel riquadro e premi «Controlla».", "warn")
+            return
+        ck_analizza(t)                       # i cookie sono sessioni: non li mostro nel riquadro
+
+    def ck_applica():
+        r = IMP.cookie_applica(ck["testo"])
+        if r.get("errore"):
+            di(ck_msg, "⚠ " + r["errore"], "err")
+            return
+        di(ck_msg, "✓ Aggiornati: " + ", ".join(f"{s.split('.')[0]} ({d['n']})" for s, d in r["siti"].items())
+           + f". Salvato in {IMP.cookie_file().name} (copia precedente in .bak): i bot lo rileggono al prossimo "
+             "download.", "ok")
+        ck["testo"] = ""
+        ck_box.delete("1.0", "end")
+        ck_rapporto([])
+        bt_ap.config(state="disabled")
+        try:
+            root.clipboard_clear()           # svuoto gli appunti: erano sessioni
+        except tk.TclError:
+            pass
+        ck_stato_aggiorna()
+
+    tk.Button(riga_ck, text="Incolla dagli appunti", command=ck_incolla).pack(side="left", padx=(0, 4))
+    tk.Button(riga_ck, text="Controlla", command=lambda: ck_analizza(ck_box.get("1.0", "end"))).pack(side="left", padx=(0, 4))
+    bt_ap = tk.Button(riga_ck, text="Applica a cookies.txt", command=ck_applica, state="disabled")
+    bt_ap.pack(side="left")
+
+    # ------------------------------------------------------------ Chiavi API
+    kb = {"campi": {}, "togli": {}, "orig": {}}
+    k_file = etichetta(f_k, "", fg=T.MUTED)
+    etichetta(f_k, "Chiavi API per /booru e /ricerca, scritte in bots.env. Lascia vuoto per non cambiare; «Togli» "
+                   "toglie la variabile. Nei campi della chiave puoi incollare la stringa &api_key=…&user_id=… del "
+                   "sito: ricavo chiave e user_id da sola. Le chiavi salvate non vengono mai mostrate per intero.",
+              fg=T.MUTED)
+    k_bt = tk.Frame(f_k)
+    k_bt.pack(side="bottom", fill="x", padx=10, pady=6)
+    k_msg = tk.Label(f_k, text="", anchor="w", justify="left", wraplength=larg)
+    k_msg.pack(side="bottom", fill="x", padx=10)
+    k_area = tk.Frame(f_k)
+    k_area.pack(fill="both", expand=True, padx=10, pady=(6, 0))
+    k_inner = scorrevole(k_area, "k")
+
+    def k_carica():
+        r = IMP.chiavi_leggi()
+        di(k_file, r["file"] if r["esiste"] else r["file"] + " non esiste ancora: lo creo al primo salvataggio.", "mu")
+        for w in k_inner.winfo_children():
+            w.destroy()
+        for d in (kb["campi"], kb["togli"], kb["orig"]):
+            d.clear()
+        for sito in r["siti"]:
+            lf = tk.LabelFrame(k_inner, text=sito["sito"], padx=8, pady=4)
+            lf.pack(fill="x", pady=4, padx=(0, 6))
+            for c in sito["campi"]:
+                tk.Label(lf, anchor="w", fg=T.MUTED, text=f"{c['nome']} · {c['etichetta']}"
+                         + ("" if c["impostata"] else " · non impostata")).pack(fill="x")
+                if c["segreta"] and c["impostata"]:
+                    tk.Label(lf, anchor="w", fg=T.MUTED, font=T.F_PICCOLO,
+                             text=c["valore"] + "  (vuoto = invariata)").pack(fill="x")
+                riga = tk.Frame(lf)
+                riga.pack(fill="x", pady=(0, 4))
+                e = tk.Entry(riga, font=("Consolas", 10))
+                e.pack(side="left", fill="x", expand=True)
+                e.insert(0, "" if c["segreta"] else (c["valore"] or c["suggerito"] or ""))
+                var = tk.BooleanVar(value=False)
+                tk.Checkbutton(riga, text="Togli", variable=var,
+                               command=lambda e=e, v=var: e.config(state="disabled" if v.get() else "normal")
+                               ).pack(side="left", padx=(6, 0))
+                kb["campi"][c["nome"]] = e
+                kb["togli"][c["nome"]] = var
+                kb["orig"][c["nome"]] = "" if c["segreta"] else (c["valore"] or "")
+
+    def k_salva(riavvia):
+        valori = {n: e.get() for n, e in kb["campi"].items()
+                  if not kb["togli"][n].get() and e.get().strip() and e.get() != kb["orig"][n]}
+        togli = [n for n, v in kb["togli"].items() if v.get()]
+        if not valori and not togli:
+            if riavvia:
+                q = riavvia_bot()
+                di(k_msg, q, "err" if q.startswith("⚠") else "ok")
+            else:
+                di(k_msg, "Niente da cambiare.", "warn")
+            return
+        try:
+            r = IMP.chiavi_salva(valori, togli)
+        except ValueError as e:
+            di(k_msg, "⚠ " + str(e), "err")
+            return
+        t = (f"✓ Salvato in bots.env ({time.strftime('%H:%M')}): "
+             + ", ".join(x for x in (f"{len(r['impostate'])} impostate" if r["impostate"] else "",
+                                     f"{len(r['tolte'])} tolte" if r["tolte"] else "") if x) + ".")
+        t += (" " + riavvia_bot()) if riavvia else " Riavvia i bot per usarle (pulsante «Salva e riavvia i bot»)."
+        di(k_msg, t, "ok")
+        k_carica()
+
+    tk.Button(k_bt, text="Salva", command=lambda: k_salva(False)).pack(side="left", padx=(0, 4))
+    tk.Button(k_bt, text="Salva e riavvia i bot", command=lambda: k_salva(True)).pack(side="left")
+
+    # ------------------------------------------------------------ Tetto ricerche
+    cp = {"campi": {}, "orig": {}}
+    c_file = etichetta(f_t, "", fg=T.MUTED)
+    etichetta(f_t, "Quante ricerche al giorno può fare ogni provider (/booru e /ricerca). Il conteggio riparte a ogni "
+                   "nuovo giorno. Vuoto = tetto predefinito; 0 = nessun tetto. Le modifiche valgono subito, senza "
+                   "riavviare i bot.", fg=T.MUTED)
+    c_bt = tk.Frame(f_t)
+    c_bt.pack(side="bottom", fill="x", padx=10, pady=6)
+    c_msg = tk.Label(f_t, text="", anchor="w", justify="left", wraplength=larg)
+    c_msg.pack(side="bottom", fill="x", padx=10)
+    c_area = tk.Frame(f_t)
+    c_area.pack(fill="both", expand=True, padx=10, pady=(6, 0))
+    c_inner = scorrevole(c_area, "t")
+
+    def c_campo(parent, chiave, orig):
+        e = tk.Entry(parent, width=10, font=("Consolas", 10))
+        e.insert(0, orig)
+        cp["campi"][chiave] = e
+        cp["orig"][chiave] = orig
+        return e
+
+    def c_carica():
+        r = IMP.cap_leggi()
+        di(c_file, f"{r['file']} · conteggi di oggi ({r['giorno']})", "mu")
+        for w in c_inner.winfo_children():
+            w.destroy()
+        cp["campi"].clear()
+        cp["orig"].clear()
+        lf = tk.LabelFrame(c_inner, text="Tutti i provider", padx=8, pady=4)
+        lf.pack(fill="x", pady=4, padx=(0, 6))
+        tk.Label(lf, anchor="w", fg=T.MUTED, justify="left", wraplength=larg - 60,
+                 text=f"Tetto predefinito · ricerche al giorno per provider (vuoto = {r['base']}, "
+                      "da GRAVES_MAX_GIORNO o standard)").pack(fill="x")
+        c_campo(lf, "*", "" if r["predefinito"] is None else str(r["predefinito"])).pack(anchor="w", pady=(0, 4))
+        for p in r["providers"]:
+            lim = p["effettivo"]
+            lf = tk.LabelFrame(c_inner, text=p["etichetta"], padx=8, pady=4)
+            lf.pack(fill="x", pady=4, padx=(0, 6))
+            pb = ttk.Progressbar(lf, maximum=max(lim, 1), value=min(p["usate"], lim) if lim else 0)
+            pb.pack(fill="x", pady=(0, 2))
+            pieno = bool(lim) and p["usate"] >= lim
+            tk.Label(lf, anchor="w", fg=T.ERR if pieno else T.MUTED,
+                     text=f"Oggi: {p['usate']} / {lim if lim else 'nessun tetto'}"
+                          + (" (predefinito)" if p["tetto"] is None else " (tetto proprio)")).pack(fill="x")
+            riga = tk.Frame(lf)
+            riga.pack(fill="x", pady=(2, 4))
+            c_campo(riga, p["nome"], "" if p["tetto"] is None else str(p["tetto"])).pack(side="left")
+            tk.Label(riga, text="  tetto proprio (vuoto = predefinito)", fg=T.MUTED).pack(side="left")
+            tk.Button(riga, text="Azzera", command=lambda n=p["nome"], t=p["etichetta"]: c_azzera(n, t)
+                      ).pack(side="right")
+
+    def c_salva():
+        tetti = {k: e.get().strip() for k, e in cp["campi"].items() if e.get().strip() != cp["orig"][k]}
+        if not tetti:
+            di(c_msg, "Niente da cambiare.", "warn")
+            return
+        try:
+            IMP.cap_salva(tetti)
+        except ValueError as e:
+            di(c_msg, "⚠ " + str(e), "err")
+            return
+        di(c_msg, f"✓ Salvato ({time.strftime('%H:%M')}). Vale subito, senza riavviare i bot.", "ok")
+        c_carica()
+
+    def c_azzera(nome=None, etichetta_=""):
+        dom = f"Azzero il conteggio di oggi per {etichetta_}?" if nome else "Azzero i conteggi di oggi per tutti i provider?"
+        if not messagebox.askyesno("Azzera conteggio", dom):
+            return
+        IMP.cap_azzera(nome)
+        di(c_msg, "✓ Conteggio azzerato.", "ok")
+        c_carica()
+
+    tk.Button(c_bt, text="Salva", command=c_salva).pack(side="left", padx=(0, 4))
+    tk.Button(c_bt, text="Azzera tutti i conteggi", command=lambda: c_azzera()).pack(side="left", padx=(0, 4))
+    tk.Button(c_bt, text="Aggiorna", command=c_carica).pack(side="left")
+
+    # ------------------------------------------------------------ caricamento
+    def carica_attiva(_=None):
+        try:
+            i = sub.index(sub.select())
+            (ck_stato_aggiorna, k_carica, c_carica)[i]()
+        except Exception as e:
+            _log_gui(f"impostazioni: errore {e!r}")
+
+    sub.bind("<<NotebookTabChanged>>", carica_attiva)
+    scheda.bind("<Map>", lambda e: (aggancia_rotella(), carica_attiva()) if e.widget is scheda else None)
+    scheda.bind("<Unmap>", lambda e: sgancia_rotella() if e.widget is scheda else None)
+
+
 def avvia_gui():
     import subprocess
     import tkinter as tk
@@ -2541,8 +2857,11 @@ def avvia_gui():
     nb.pack(fill="both", expand=True)
     scheda_dc = tk.Frame(nb)
     scheda_tg = tk.Frame(nb)
+    scheda_imp = tk.Frame(nb)
     nb.add(scheda_dc, text="  Discord  ")
     nb.add(scheda_tg, text="  Telegram  ")
+    nb.add(scheda_imp, text="  IMPOSTAZIONI  ")
+    crea_scheda_impostazioni(root, scheda_imp, tk, ttk, messagebox, barra_bot)
     tg = crea_scheda_telegram(root, scheda_tg, tk, ttk, messagebox, simpledialog, subprocess)
 
     st = {"nome": None, "mtime": 0.0, "nomi": [], "etichette": None}

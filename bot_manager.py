@@ -300,7 +300,7 @@ class GestoreBot:
             return msg
 
         da_riavviare = set()
-        if cambiati & {"org_bot.py", "bot_log.py"}:      # org_bot è caricato anche da discord_bot
+        if cambiati & {"org_bot.py", "bot_log.py", "graves.py"}:      # org_bot e graves sono caricati anche dai bot
             da_riavviare = set(MODULI)
         if "telegram_bot.py" in cambiati:
             da_riavviare.add("telegram")
@@ -319,7 +319,7 @@ class GestoreBot:
         msg = f"aggiornato a {remoto[:7]}"
         if da_riavviare:
             msg += ", riavviati: " + ", ".join(sorted(da_riavviare))
-        if cambiati & {"bot_manager.py", "branch_tema.py", "org_bot.py"}:
+        if cambiati & {"bot_manager.py", "branch_tema.py", "org_bot.py", "impostazioni.py"}:
             msg += " (riavvia Branch per applicare le modifiche a Branch stesso)"
         self.log(msg)
         return msg

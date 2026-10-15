@@ -56,6 +56,10 @@ select.b{max-width:100%}
 .kb .row input{flex:1;min-width:0;background:var(--in);color:var(--fg);border:1px solid var(--ln);border-radius:6px;padding:10px;font:14px ui-monospace,Consolas,monospace}
 .kb .row input:disabled{opacity:.4;text-decoration:line-through}
 .kb .tg{color:var(--er)}
+.sub{display:flex;gap:6px}
+.sub button{flex:1;min-height:42px;border-radius:999px;border:1px solid var(--ln);background:var(--pn);color:var(--mu);font:inherit;cursor:pointer}
+.sub button.sel{background:var(--ro);border-color:var(--ro);color:#fff;font-weight:600}
+.sp{display:none;flex-direction:column;gap:8px}.sp.sel{display:flex}
 /* ---- grafica mobile ---- */
 :root{--bg:#0f0d0e;--pn:#1d1819;--in:#0a0809;--ln:#2f2728;--r:14px}
 body{font-size:16px}
@@ -68,7 +72,7 @@ main{padding:14px 14px 18px;scroll-padding-bottom:90px}
 nav{order:3;position:sticky;bottom:0;background:#171213;border-top:1px solid var(--ln);border-bottom:0;padding-bottom:2px;z-index:5}
 nav button{display:flex;flex-direction:column;align-items:center;gap:2px;padding:8px 2px 7px;font-size:11px;border-bottom:0;border-top:3px solid transparent;letter-spacing:.03em}
 nav button::before{font-size:21px;line-height:1.1}
-#n-p::before{content:"💬"}#n-t::before{content:"✈️"}#n-c::before{content:"🍪"}#n-k::before{content:"🔑"}#n-l::before{content:"📜"}
+#n-p::before{content:"💬"}#n-t::before{content:"✈️"}#n-i::before{content:"⚙️"}#n-l::before{content:"📜"}
 nav button.sel{color:#fff;border-top-color:var(--ro);background:rgba(200,55,45,.12)}
 .b{min-height:46px;border-radius:var(--r);padding:10px 16px;font-size:15px;background:#251f20;transition:transform .08s,background .15s}
 .b:active{transform:scale(.96);background:#33292a}
@@ -105,8 +109,7 @@ textarea:focus,.kb input:focus{outline:0;border-color:var(--ro);box-shadow:0 0 0
 <nav>
   <button id="n-p" class="sel">Discord</button>
   <button id="n-t">Telegram</button>
-  <button id="n-c">Cookie</button>
-  <button id="n-k">Chiavi</button>
+  <button id="n-i">Impostazioni</button>
   <button id="n-l">Log</button>
 </nav>
 <main>
@@ -143,7 +146,9 @@ textarea:focus,.kb input:focus{outline:0;border-color:var(--ro);box-shadow:0 0 0
     <button class="b p" id="invia">Invia ora</button>
   </div>
 </section>
-<section id="s-c">
+<section id="s-i">
+  <div class="sub"><button id="i-c" class="sel">Cookie</button><button id="i-k">Chiavi API</button><button id="i-t">Tetto ricerche</button></div>
+<div class="sp sel" id="p-c">
   <div class="mu" id="ck-stato">…</div>
   <div class="mu">Esporta i cookie dal browser (JSON o cookies.txt), premi Copia, poi qui «Incolla dagli appunti». Controllo che siano cookie, tengo solo i siti dei bot e scarto il resto.</div>
   <div class="row wrap"><button class="b p" id="ck-inc">Incolla dagli appunti</button><button class="b" id="ck-ap" disabled>Applica a cookies.txt</button></div>
@@ -151,13 +156,21 @@ textarea:focus,.kb input:focus{outline:0;border-color:var(--ro);box-shadow:0 0 0
     <div class="row" style="margin-top:6px"><button class="b" id="ck-man-ok">Controlla</button></div></div>
   <div id="ck-rep"></div>
   <div id="msg-c" class="msg"></div>
-</section>
-<section id="s-k">
+</div>
+<div class="sp" id="p-k">
   <div class="mu" id="k-file">…</div>
   <div class="mu">Chiavi API per /booru e /ricerca, scritte in bots.env. Lascia vuoto per non cambiare; ✕ toglie la variabile. Nei campi della chiave puoi incollare la stringa <code>&amp;api_key=…&amp;user_id=…</code> del sito: ricavo chiave e user_id da sola. Le chiavi salvate non vengono mai mostrate per intero.</div>
   <div id="k-box"></div>
   <div class="row wrap"><button class="b p" id="k-sal">Salva</button><button class="b" id="k-salr">Salva e riavvia i bot</button></div>
   <div id="msg-k" class="msg"></div>
+</div>
+<div class="sp" id="p-t">
+  <div class="mu" id="cap-file">…</div>
+  <div class="mu">Quante ricerche al giorno può fare ogni provider (/booru e /ricerca). Il conteggio riparte a ogni nuovo giorno. Vuoto = tetto predefinito; <b>0 = nessun tetto</b>. Le modifiche valgono subito, senza riavviare i bot.</div>
+  <div id="cap-box"></div>
+  <div class="row wrap"><button class="b p" id="cap-sal">Salva</button><button class="b" id="cap-az">Azzera tutti i conteggi</button></div>
+  <div id="msg-cap" class="msg"></div>
+</div>
 </section>
 <section id="s-l">
   <div class="row wrap"><select class="b grow" id="log-f"></select>
@@ -382,13 +395,17 @@ $("#agg").onclick=()=>{const t=prompt("Incolla ID (-100…), @username o link t.
 $("#nomi").onclick=()=>canaliOp("/api/tg/nomi",{},"Aggiorno i nomi…");
 
 /* ---------- schede, avvio, salvataggio automatico ---------- */
-const SCHEDE=["p","t","c","k","l"];
+const SCHEDE=["p","t","i","l"];
 for(const k of SCHEDE)$("#n-"+k).onclick=()=>{
   for(const j of SCHEDE){$("#n-"+j).classList.toggle("sel",j===k);$("#s-"+j).classList.toggle("sel",j===k);}
   if(k==="l")caricaLog(true);
-  if(k==="c")ckStato();
-  if(k==="k")chiaviCarica();
+  if(k==="i")impCarica();
 };
+/* ---------- impostazioni: cookie · chiavi API · tetto ricerche ---------- */
+const SUB=["c","k","t"];let subAtt="c";
+function impCarica(){if(subAtt==="c")ckStato();else if(subAtt==="k")chiaviCarica();else capCarica();}
+function impVai(x){subAtt=x;for(const j of SUB){$("#i-"+j).classList.toggle("sel",j===x);$("#p-"+j).classList.toggle("sel",j===x);}impCarica();}
+for(const x of SUB)$("#i-"+x).onclick=()=>impVai(x);
 /* ---------- cookie ---------- */
 const CK={testo:""};
 function ckSay(t,c){const m=$("#msg-c");m.textContent=t;m.className="msg "+(c||"");}
@@ -471,6 +488,46 @@ async function chiaviSalva(riavvia){
 }
 $("#k-sal").onclick=()=>chiaviSalva(false);
 $("#k-salr").onclick=()=>chiaviSalva(true);
+/* ---------- tetto ricerche ---------- */
+const CP={campi:{}};
+function capSay(t,c){const m=$("#msg-cap");m.textContent=t;m.className="msg "+(c||"");}
+async function capCarica(){
+  const r=await api("/api/cap");if(!r.providers)return;
+  $("#cap-file").textContent=r.file+" · conteggi di oggi ("+r.giorno+")";
+  const box=$("#cap-box");box.replaceChildren();CP.campi={};
+  const camp=(chiave,orig,ph)=>{
+    const i=el("input");i.type="text";i.inputMode="numeric";i.autocomplete="off";i.spellcheck=false;
+    i.value=orig;i.dataset.orig=orig;i.placeholder=ph;CP.campi[chiave]=i;return i;
+  };
+  const d0=el("div","kb");
+  d0.append(el("h3",0,"Tutti i provider"),el("label",0,"Tetto predefinito · ricerche al giorno per provider (vuoto = "+r.base+", da GRAVES_MAX_GIORNO o standard)"));
+  d0.append(camp("*",r.predefinito==null?"":String(r.predefinito),String(r.base)));box.append(d0);
+  for(const p of r.providers){
+    const d=el("div","kb"),lim=p.effettivo;d.append(el("h3",0,p.etichetta));
+    const b=el("div","bar"),f=el("i");f.style.width=(lim?Math.min(100,p.usate/lim*100):0)+"%";
+    if(lim&&p.usate>=lim)f.style.background="var(--er)";b.append(f);
+    d.append(b,el("label",0,"Oggi: "+p.usate+" / "+(lim?lim:"nessun tetto")+(p.tetto==null?" (predefinito)":" (tetto proprio)")));
+    const row=el("div","row"),az=el("button","b","Azzera");az.title="Azzera il conteggio di oggi";
+    az.onclick=()=>capAzzera(p.nome,p.etichetta);
+    row.append(camp(p.nome,p.tetto==null?"":String(p.tetto),"come il predefinito"),az);d.append(row);box.append(d);
+  }
+}
+async function capSalva(){
+  const tetti={};
+  for(const [k,i] of Object.entries(CP.campi))if(i.value.trim()!==i.dataset.orig)tetti[k]=i.value.trim();
+  if(!Object.keys(tetti).length)return capSay("Niente da cambiare.","warn");
+  const r=await api("/api/cap/salva",{tetti});
+  if(r.errore)return capSay("⚠ "+r.errore,"err");
+  capSay("✓ Salvato ("+hhmm()+"). Vale subito, senza riavviare i bot.","ok");capCarica();
+}
+async function capAzzera(nome,etichetta){
+  if(!confirm(nome?"Azzero il conteggio di oggi per "+etichetta+"?":"Azzero i conteggi di oggi per tutti i provider?"))return;
+  const r=await api("/api/cap/azzera",nome?{provider:nome}:{});
+  if(r.errore)return capSay("⚠ "+r.errore,"err");
+  capSay("✓ Conteggio azzerato.","ok");capCarica();
+}
+$("#cap-sal").onclick=capSalva;
+$("#cap-az").onclick=()=>capAzzera(null);
 /* ---------- git pull ---------- */
 let gitT=null;
 function gitMsg(t,c,ms){   // ms: dopo quanto il riquadro si chiude da solo (senza ms resta)

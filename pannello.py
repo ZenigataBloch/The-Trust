@@ -9,9 +9,12 @@ invio Telegram): la logica è quella di Branch, qui cambia solo l'interfaccia.
   - avvio del server -> se nessun bot gira crea il flag di arresto: i bot partono solo quando apri l'app
   - apri la pagina  -> accende i bot che non girano (e toglie il flag di arresto)
   - chiudi la pagina -> i bot restano accesi
-  - scheda Cookie    -> incolla i cookie dagli appunti (JSON o cookies.txt), li controlla e aggiorna cookies.txt
-  - scheda Chiavi    -> chiavi API dei booru e dei provider di ricerca: aggiunge/sostituisce/toglie le righe in bots.env
-                        (le chiavi non tornano mai intere al browser) e, a richiesta, riavvia i bot
+  - scheda Impostazioni (la logica sta in impostazioni.py, la stessa dell'app desktop):
+      Cookie  -> incolla i cookie dagli appunti (JSON o cookies.txt), li controlla e aggiorna cookies.txt
+      Chiavi  -> chiavi API dei booru e dei provider di ricerca: aggiunge/sostituisce/toglie le righe in bots.env
+                 (le chiavi non tornano mai intere al browser) e, a richiesta, riavvia i bot
+      Tetto   -> ricerche al giorno per provider (graves_uso.json): si vedono i conteggi, si cambiano i tetti,
+                 si azzera; vale subito senza riavviare i bot
   - pulsante ⟳       -> git pull e, se serve, riavvio di bot e pannello
   - clic sul led     -> spegne i bot (crea bots_fermi.flag, lo stesso di avvia_bots.py stop)
 """
@@ -418,362 +421,58 @@ def r_t_ferma(_):
     return 200, {}
 
 
-# ------------------------------------------------------------ cookie
-# Siti tenuti (gli altri cookie dell'export vengono scartati). Modificabili con COOKIE_DOMINI in bots.env.
-COOKIE_DOMINI = [d.strip().lower().lstrip(".") for d in
-                 os.environ.get("COOKIE_DOMINI", "tiktok.com,instagram.com,reddit.com,x.com").split(",") if d.strip()]
-# cookie che provano il login: se mancano, probabilmente non eri loggato quando hai esportato
-COOKIE_LOGIN = {"tiktok.com": ("sessionid", "sid_tt"), "instagram.com": ("sessionid",),
-                "reddit.com": ("reddit_session", "token_v2"), "x.com": ("auth_token",)}
-HTTPONLY = "#HttpOnly_"
-HEADER_COOKIE = "# Netscape HTTP Cookie File"
-_HOST_RE = re.compile(r"[A-Za-z0-9._\-]+")
-
-
-def cookie_file() -> Path:
-    f = os.environ.get("COOKIES_FILE")
-    return Path(f).expanduser() if f else BM.BASE / "cookies.txt"
-
-
-def _dominio(campo: str) -> str:
-    return campo.removeprefix(HTTPONLY).lstrip(".").lower()
-
-
-def _sito(dominio: str):
-    for s in COOKIE_DOMINI:
-        if dominio == s or dominio.endswith("." + s):
-            return s
-    return None
-
-
-def _campi_valido(c):
-    """I 7 campi Netscape normalizzati, oppure None se la riga non è un cookie."""
-    if len(c) < 7:
-        return None
-    c = c[:6] + ["\t".join(c[6:])] if len(c) > 7 else list(c)
-    dom = _dominio(c[0])
-    if not dom or "." not in dom or not _HOST_RE.fullmatch(dom):
-        return None
-    if c[1].upper() not in ("TRUE", "FALSE") or c[3].upper() not in ("TRUE", "FALSE"):
-        return None
-    if not re.fullmatch(r"\d+", c[4].strip()) or not c[2].startswith("/") or not c[5].strip():
-        return None
-    return [c[0], c[1].upper(), c[2], c[3].upper(), c[4].strip(), c[5], c[6]]
-
-
-def _da_json(testo: str):
-    """Export JSON (Cookie-Editor...) -> (cookie in campi Netscape, quanti elementi scartati)."""
-    dati = json.loads(testo)
-    if isinstance(dati, dict):
-        dati = dati["cookies"] if isinstance(dati.get("cookies"), list) else [dati]
-    if not isinstance(dati, list):
-        raise ValueError("json")
-    ok, scartati = [], 0
-    for c in dati:
-        try:
-            dom, nome = str(c["domain"]), str(c["name"])
-            solo_host = bool(c.get("hostOnly", not dom.startswith(".")))
-            if not solo_host and not dom.startswith("."):
-                dom = "." + dom
-            scad = 0 if c.get("session") else max(0, int(float(c.get("expirationDate") or c.get("expires") or 0)))
-            riga = _campi_valido([(HTTPONLY if c.get("httpOnly") else "") + dom, "FALSE" if solo_host else "TRUE",
-                                  str(c.get("path") or "/"), "TRUE" if c.get("secure") else "FALSE",
-                                  str(scad), nome, str(c.get("value", ""))])
-        except (KeyError, TypeError, ValueError, AttributeError):
-            riga = None
-        if riga:
-            ok.append(riga)
-        else:
-            scartati += 1
-    return ok, scartati
-
-
-def _da_netscape(testo: str):
-    ok, scartati = [], 0
-    for riga in testo.splitlines():
-        r = riga.rstrip("\r\n")
-        s = r.lstrip()
-        if not s or (s.startswith("#") and not s.startswith(HTTPONLY)):
-            continue                                   # righe vuote e commenti non contano
-        c = _campi_valido(r.split("\t")) or _campi_valido(re.split(r"\s+", s, maxsplit=6))   # tab persi negli appunti
-        if c:
-            ok.append(c)
-        else:
-            scartati += 1
-    return ok, scartati
-
-
-def cookie_analizza(testo: str) -> dict:
-    """Controlla che il testo siano cookie (JSON o cookies.txt) e tiene solo i siti di COOKIE_DOMINI.
-    Non restituisce mai il contenuto dei cookie negli errori."""
-    testo = (testo or "").lstrip("\ufeff").strip()
-    res = {"formato": None, "validi": 0, "altri": 0, "scartati": 0, "siti": {}, "righe": [], "errore": None}
-    if not testo:
-        res["errore"] = "Gli appunti sono vuoti."
-        return res
-    if testo[0] in "[{":
-        res["formato"] = "JSON"
-        try:
-            campi, res["scartati"] = _da_json(testo)
-        except ValueError:
-            res["errore"] = "Sembra JSON ma non è valido: la copia è incompleta? Riesporta e riprova."
-            return res
-    else:
-        res["formato"] = "Netscape (cookies.txt)"
-        campi, res["scartati"] = _da_netscape(testo)
-    res["validi"] = len(campi)
-    if not campi:
-        res["errore"] = "Non sono cookie: il testo non è un export di cookie (né JSON né cookies.txt)."
-        return res
-    ora, nomi = time.time(), {}
-    for c in campi:
-        s = _sito(_dominio(c[0]))
-        if not s:
-            res["altri"] += 1
-            continue
-        d = res["siti"].setdefault(s, {"n": 0, "scaduti": 0, "avviso": ""})
-        d["n"] += 1
-        if 0 < int(c[4]) < ora:
-            d["scaduti"] += 1
-        nomi.setdefault(s, set()).add(c[5])
-        res["righe"].append("\t".join(c))
-    if not res["siti"]:
-        res["errore"] = (f"{len(campi)} cookie riconosciuti, ma nessuno dei siti supportati "
-                         f"({', '.join(COOKIE_DOMINI)}). Hai esportato dal sito giusto?")
-        return res
-    for s, d in res["siti"].items():
-        if s in COOKIE_LOGIN and not (set(COOKIE_LOGIN[s]) & nomi.get(s, set())):
-            d["avviso"] = f"manca il cookie di accesso ({COOKIE_LOGIN[s][0]}): forse non eri loggato"
-        elif d["scaduti"] == d["n"]:
-            d["avviso"] = "sono tutti scaduti"
-    return res
-
-
-def cookie_applica(testo: str) -> dict:
-    """Sostituisce in cookies.txt i cookie dei siti presenti nell'export e lascia intatti gli altri.
-    Il vecchio file resta come cookies.txt.bak."""
-    res = cookie_analizza(testo)
-    if res["errore"]:
-        return res
-    out = cookie_file()
-    tenute = []
-    if out.exists():
-        vecchio = out.read_text(encoding="utf-8-sig")
-        shutil.copy2(out, out.with_name(out.name + ".bak"))
-        for r in vecchio.splitlines():
-            c = _campi_valido(r.split("\t"))
-            if c and _sito(_dominio(c[0])) not in res["siti"]:
-                tenute.append(r.rstrip("\r\n"))
-    O.scrivi_atomico(out, HEADER_COOKIE + "\n" + "\n".join(tenute + res["righe"]) + "\n")
-    try:
-        os.chmod(out, 0o600)                           # i cookie sono sessioni: solo tu
-    except OSError:
-        pass
-    log("cookie: aggiornati " + ", ".join(f"{s} ({d['n']})" for s, d in res["siti"].items()))
-    return res
+# ------------------------------------------------------------ cookie, chiavi API, tetto ricerche
+# La logica sta in impostazioni.py (condivisa con la scheda IMPOSTAZIONI dell'app desktop): qui solo i gestori.
+import impostazioni as IMP
+IMP.log = log
 
 
 def r_cookie(_):
-    out = cookie_file()
-    siti = {s: {"n": 0, "scaduti": 0} for s in COOKIE_DOMINI}
-    if out.exists():
-        ora = time.time()
-        for r in out.read_text(encoding="utf-8-sig").splitlines():
-            c = _campi_valido(r.split("\t"))
-            s = _sito(_dominio(c[0])) if c else None
-            if s:
-                siti[s]["n"] += 1
-                if 0 < int(c[4]) < ora:
-                    siti[s]["scaduti"] += 1
-    return 200, {"esiste": out.exists(), "file": out.name, "siti": siti,
-                 "mtime": out.stat().st_mtime if out.exists() else 0}
+    return 200, IMP.cookie_stato()
 
 
 def r_c_analizza(b):
-    res = cookie_analizza(str(b.get("testo", "")))
+    res = IMP.cookie_analizza(str(b.get("testo", "")))
     res.pop("righe")
     return 200, res
 
 
 def r_c_applica(b):
-    res = cookie_applica(str(b.get("testo", "")))
+    res = IMP.cookie_applica(str(b.get("testo", "")))
     if res["errore"]:
         return 400, {"errore": res["errore"]}
     res.pop("righe")
     res["riepilogo"] = ("Aggiornati: " + ", ".join(f"{s.split('.')[0]} ({d['n']})" for s, d in res["siti"].items())
-                        + f". Salvato in {cookie_file().name} (copia precedente in .bak): "
+                        + f". Salvato in {IMP.cookie_file().name} (copia precedente in .bak): "
                           "i bot lo rileggono al prossimo download.")
     return 200, res
 
 
-# ------------------------------------------------------------ chiavi API (bots.env)
-# Solo queste variabili si possono leggere/scrivere dal pannello: (variabile, etichetta, valore suggerito se manca)
-CHIAVI_SITI = {
-    "rule34.xxx": [("GRAVES_R34_USER", "user_id", "marquise"), ("GRAVES_R34_KEY", "api key", "")],
-    "Gelbooru": [("GRAVES_GELBOORU_USER", "user_id", "marquise"), ("GRAVES_GELBOORU_KEY", "api key", "")],
-    "Danbooru (facoltativo)": [("GRAVES_DANBOORU_USER", "utente", ""), ("GRAVES_DANBOORU_KEY", "api key", "")],
-    "e621 (facoltativo)": [("GRAVES_E621_USER", "utente", ""), ("GRAVES_E621_KEY", "api key", "")],
-    "Ricerca Google: Serper": [("GRAVES_SERPER_KEY", "chiave", "")],
-    "Ricerca Google: SerpApi": [("GRAVES_SERPAPI_KEY", "chiave", "")],
-}
-CHIAVI_OK = {n: sito for sito, voci in CHIAVI_SITI.items() for n, _e, _s in voci}
-_RE_RIGA_ENV = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
-_ENV_SICURO = re.compile(r"^[\w.@:/+,=-]*$")
-_chiavi_lock = threading.Lock()
-
-
-def env_file() -> Path:
-    return getattr(BM, "ENV_FILE", BM.BASE / "bots.env")
-
-
-def _env_pulisci(v: str) -> str:
-    v = v.strip()
-    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-        v = v[1:-1]
-    return v
-
-
-def _env_formatta(v: str) -> str:
-    return v if _ENV_SICURO.match(v) else "'" + v.replace("'", "'\\''") + "'"
-
-
-class EnvFile:
-    """bots.env letto come righe: cambia solo le variabili indicate, il resto (commenti, ordine, altre variabili,
-    tipo di fine riga) resta com'è. Una variabile ripetuta viene tenuta una volta sola (l'ultima vince, per i bot)."""
-
-    def __init__(self, path: Path):
-        self.path = path
-        try:
-            grezzo = path.read_bytes().decode("utf-8-sig")
-        except FileNotFoundError:
-            grezzo = ""
-        self.eol = "\r\n" if "\r\n" in grezzo else "\n"
-        self.righe = grezzo.replace("\r\n", "\n").split("\n")
-        if self.righe and self.righe[-1] == "":
-            self.righe.pop()
-        self.modificato = False
-
-    def _pos(self, nome: str) -> list:
-        out = []
-        for i, r in enumerate(self.righe):
-            m = _RE_RIGA_ENV.match(r)
-            if m and m.group(2) == nome and not r.lstrip().startswith("#"):
-                out.append(i)
-        return out
-
-    def leggi(self, nome: str):
-        pos = self._pos(nome)
-        return _env_pulisci(_RE_RIGA_ENV.match(self.righe[pos[-1]]).group(3)) if pos else None
-
-    def imposta(self, nome: str, valore: str):
-        pos = self._pos(nome)
-        if pos:
-            pref = _RE_RIGA_ENV.match(self.righe[pos[0]]).group(1)
-            self.righe[pos[0]] = f"{pref}{nome}={_env_formatta(valore)}"
-            for i in reversed(pos[1:]):
-                del self.righe[i]
-        else:
-            self.righe.append(f"{nome}={_env_formatta(valore)}")
-        self.modificato = True
-
-    def rimuovi(self, nome: str) -> bool:
-        pos = self._pos(nome)
-        for i in reversed(pos):
-            del self.righe[i]
-        self.modificato = self.modificato or bool(pos)
-        return bool(pos)
-
-    def salva(self):
-        if not self.modificato:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            shutil.copy2(self.path, self.path.with_name(self.path.name + ".bak"))
-        testo = self.eol.join(self.righe) + (self.eol if self.righe else "")
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".bots.env.")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(testo.encode("utf-8"))
-            with contextlib.suppress(OSError):
-                os.chmod(tmp, 0o600)                       # contiene chiavi: solo tu
-            os.replace(tmp, self.path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
-            raise
-        self.modificato = False
-
-
-def _maschera(nome: str, v):
-    """Le chiavi non escono mai intere dal server: solo gli ultimi 4 caratteri."""
-    if v is None:
-        return ""
-    if nome.endswith("_KEY"):
-        return ("•••• " + v[-4:]) if len(v) > 8 else "••••"
-    return v
-
-
-def _credenziali_incollate(testo: str) -> dict:
-    """Dal sito le credenziali sono '&api_key=XXXX&user_id=123': ne ricavo i due valori."""
-    out = {}
-    mk = re.search(r"api_key=([^&\s\"']+)", testo)
-    mu = re.search(r"user_id=([^&\s\"']+)", testo)
-    if mk:
-        out["key"] = mk.group(1)
-    if mu:
-        out["user"] = mu.group(1)
-    return out
-
-
 def r_chiavi(_):
-    env = EnvFile(env_file())
-    siti = []
-    for sito, voci in CHIAVI_SITI.items():
-        campi = []
-        for nome, etichetta, suggerito in voci:
-            v = env.leggi(nome)
-            campi.append({"nome": nome, "etichetta": etichetta, "impostata": bool(v), "valore": _maschera(nome, v),
-                          "segreta": nome.endswith("_KEY"), "suggerito": suggerito})
-        siti.append({"sito": sito, "campi": campi})
-    return 200, {"file": env.path.name, "esiste": env.path.exists(), "siti": siti}
+    return 200, IMP.chiavi_leggi()
 
 
 def r_k_salva(b):
-    valori, togli = b.get("valori") or {}, b.get("togli") or []
-    if not isinstance(valori, dict) or not isinstance(togli, list):
-        return 400, {"errore": "Richiesta non valida."}
-    estranei = [n for n in list(valori) + togli if n not in CHIAVI_OK]
-    if estranei:
-        return 400, {"errore": "Variabile non gestita dal pannello: " + ", ".join(map(str, estranei[:3]))}
-    with _chiavi_lock:
-        env = EnvFile(env_file())
-        nuovi, tolti = {}, []
-        for nome, v in valori.items():
-            v = str(v)
-            cred = _credenziali_incollate(v)
-            if cred:                                        # stringa &api_key=...&user_id=... incollata
-                voci = [n for n, _e, _s in CHIAVI_SITI[CHIAVI_OK[nome]]]
-                for n in voci:
-                    if n.endswith("_KEY") and "key" in cred:
-                        nuovi[n] = cred["key"]
-                    if n.endswith("_USER") and "user" in cred:
-                        nuovi[n] = cred["user"]
-            elif v.strip():
-                nuovi[nome] = _env_pulisci(v)
-        for nome, v in nuovi.items():
-            env.imposta(nome, v)
-        for nome in togli:
-            if nome not in nuovi and env.rimuovi(nome):
-                tolti.append(nome)
-        env.salva()
-    for nome, v in nuovi.items():                            # i bot partono con l'ambiente del pannello + bots.env
-        os.environ[nome] = v
-    for nome in tolti:
-        os.environ.pop(nome, None)
-    cambiati = sorted(set(nuovi) | set(tolti))
-    if cambiati:
-        log("chiavi: aggiornate " + ", ".join(cambiati))     # solo i nomi, mai i valori
-    return 200, {"cambiati": cambiati, "impostate": sorted(nuovi), "tolte": tolti}
+    try:
+        return 200, IMP.chiavi_salva(b.get("valori"), b.get("togli"))
+    except ValueError as e:
+        return 400, {"errore": str(e)}
+
+
+def r_cap(_):
+    return 200, IMP.cap_leggi()
+
+
+def r_cap_salva(b):
+    try:
+        return 200, IMP.cap_salva(b.get("tetti"))
+    except ValueError as e:
+        return 400, {"errore": str(e)}
+
+
+def r_cap_azzera(b):
+    p = b.get("provider")
+    return 200, IMP.cap_azzera(p if isinstance(p, str) and p else None)
 
 
 def r_k_riavvia(_):
@@ -793,7 +492,8 @@ def r_k_riavvia(_):
 
 
 # ------------------------------------------------------------ git pull
-FILE_SERVER = {"pannello.py", "org_bot.py", "bot_manager.py", "bot_log.py", "sendbot_tema.py", "heartbeat.py", "sync_ctl.py"}
+FILE_SERVER = {"pannello.py", "org_bot.py", "bot_manager.py", "bot_log.py", "sendbot_tema.py", "heartbeat.py", "sync_ctl.py",
+               "impostazioni.py"}
 FILE_BOT = {"telegram_bot.py", "discord_bot.py", "org_bot.py", "bot_log.py", "graves.py"}
 
 
@@ -898,7 +598,7 @@ SW = "self.addEventListener('fetch',()=>{});"
 ICONE = {"/icon-192.png": BM.BASE / "icon-192.png", "/icon-512.png": BM.BASE / "icon-512.png"}
 
 GET = {"/api/bots": r_bots, "/api/persone": r_persone, "/api/persona": r_persona, "/api/tg": r_tg, "/api/log": r_log, "/api/cookie": r_cookie,
-       "/api/chiavi": r_chiavi}
+       "/api/chiavi": r_chiavi, "/api/cap": r_cap}
 POST = {"/api/sync/apri": r_sync_apri, "/api/bots/start": r_bots_start, "/api/bots/apri": r_bots_apri, "/api/bots/stop": r_bots_stop, "/api/righe": r_righe,
         "/api/persona/salva": r_p_salva, "/api/persona/nuova": r_p_nuova, "/api/persona/elimina": r_p_elimina,
         "/api/persona/scollega": r_p_scollega, "/api/tg/salva": r_t_salva, "/api/tg/toggle": r_t_toggle,
@@ -906,6 +606,7 @@ POST = {"/api/sync/apri": r_sync_apri, "/api/bots/start": r_bots_start, "/api/bo
         "/api/tg/invia": r_t_invia, "/api/tg/ferma": r_t_ferma,
         "/api/cookie/analizza": r_c_analizza, "/api/cookie/applica": r_c_applica,
         "/api/chiavi/salva": r_k_salva, "/api/chiavi/riavvia": r_k_riavvia,
+        "/api/cap/salva": r_cap_salva, "/api/cap/azzera": r_cap_azzera,
         "/api/git/pull": r_git_pull, "/api/git/riavvia": r_git_riavvia}
 
 

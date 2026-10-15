@@ -34,7 +34,8 @@ Altre variabili (tutte opzionali):
                       come foto: Telegram ricomprime le foto a circa 1280 px. Niente galleria in chat
   GRAVES_MAX_MB       non scarica immagini più grandi di così (default 15)
   GRAVES_MAX_GIORNO   tetto di ricerche al giorno, contate a parte per ogni provider
-                      (default 80; 0 = nessun tetto)
+                      (default 80; 0 = nessun tetto). I tetti scelti dalle interfacce (IMPOSTAZIONI -> Tetto,
+                      salvati in graves_uso.json sotto "tetti") hanno la precedenza e valgono subito
   GRAVES_STATO_FILE   contatore (default: graves_uso.json accanto allo script)
 
 Sicurezza: gli URL delle immagini arrivano da pagine web qualsiasi. Prima di scaricarli (e a ogni
@@ -174,27 +175,117 @@ def configurato() -> bool:
 
 
 # ---------- tetto giornaliero ----------
+# graves_uso.json: {"giorno": "2026-10-16", "booru-r34": 12, ..., "tetti": {"*": 200, "booru-r34": 80}}
+# I contatori ripartono a ogni nuovo giorno, "tetti" resta. Ordine: tetto del provider -> tetto "*" (per tutti)
+# -> GRAVES_MAX_GIORNO -> 80. Il file si rilegge a ogni ricerca: cambiare i tetti non richiede di riavviare i bot.
+_RISERVATE = ("giorno", "tetti")
+TETTO_MAX = 100000
+
+
+def _leggi_stato(path=None) -> dict:
+    try:
+        d = json.loads(Path(path or STATO).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _scrivi_stato(d: dict, path=None):
+    path = Path(path or STATO)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(d), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _intero(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _tetti_validi(d: dict) -> dict:
+    t = d.get("tetti")
+    return {k: v for k, v in t.items() if isinstance(k, str) and _intero(v) and 0 <= v <= TETTO_MAX} \
+        if isinstance(t, dict) else {}
+
+
+def tetto_per(provider: str, d: dict | None = None) -> int:
+    """Tetto giornaliero di un provider (0 = nessun tetto)."""
+    t = _tetti_validi(_leggi_stato() if d is None else d)
+    if provider in t:
+        return t[provider]
+    if "*" in t:
+        return t["*"]
+    return _int_env("GRAVES_MAX_GIORNO", 80)
+
+
 def _conta(provider: str):
-    massimo = _int_env("GRAVES_MAX_GIORNO", 80)
     oggi = datetime.date.today().isoformat()
     with _lock:
-        try:
-            d = json.loads(STATO.read_text(encoding="utf-8"))
-        except Exception:
-            d = {}
+        d = _leggi_stato()
         if d.get("giorno") != oggi:
-            d = {"giorno": oggi}
-        n = int(d.get(provider, 0))
+            t = _tetti_validi(d)
+            d = {"giorno": oggi, **({"tetti": t} if t else {})}
+        massimo = tetto_per(provider, d)
+        n = d.get(provider, 0)
+        n = n if _intero(n) else 0
         if massimo and n >= massimo:
             raise GravesErrore(f"Graves: raggiunto il tetto di {massimo} ricerche per oggi "
-                               "(si cambia con GRAVES_MAX_GIORNO, 0 = nessun tetto).")
+                               "(si cambia da IMPOSTAZIONI \u2192 Tetto, o con GRAVES_MAX_GIORNO; 0 = nessun tetto).")
         d[provider] = n + 1
         try:
-            tmp = STATO.with_name(f"{STATO.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(d), encoding="utf-8")
-            os.replace(tmp, STATO)
+            _scrivi_stato(d)
         except OSError as e:
             log(f"  Graves: contatore non salvato ({e})")
+
+
+def uso_leggi(path=None) -> dict:
+    """Per le interfacce: contatori di oggi e tetti, provider per provider."""
+    d = _leggi_stato(path)
+    oggi = datetime.date.today().isoformat()
+    usi = {k: v for k, v in d.items() if k not in _RISERVATE and _intero(v)} if d.get("giorno") == oggi else {}
+    nomi = [f"booru-{s}" for s in _SITI] + list(_PROVIDER)
+    nomi += [k for k in usi if k not in nomi]
+    t = _tetti_validi(d)
+    return {"giorno": oggi, "base": _int_env("GRAVES_MAX_GIORNO", 80), "predefinito": t.get("*"),
+            "providers": [{"nome": n, "usate": usi.get(n, 0), "tetto": t.get(n), "effettivo": tetto_per(n, d)}
+                          for n in nomi]}
+
+
+def tetti_imposta(tetti: dict, path=None):
+    """tetti: {'*': 200, 'booru-r34': 80, 'booru-redgifs': None}. None toglie l'impostazione; 0 = nessun tetto."""
+    if not isinstance(tetti, dict):
+        raise ValueError("tetti non valido")
+    for k, v in tetti.items():
+        if not isinstance(k, str) or not k or len(k) > 60 or not (v is None or (_intero(v) and 0 <= v <= TETTO_MAX)):
+            raise ValueError(f"tetto non valido per {str(k)[:40]!r} (serve un intero da 0 a {TETTO_MAX})")
+    with _lock:
+        d = _leggi_stato(path)
+        t = _tetti_validi(d)
+        for k, v in tetti.items():
+            if v is None:
+                t.pop(k, None)
+            else:
+                t[k] = v
+        if t:
+            d["tetti"] = t
+        else:
+            d.pop("tetti", None)
+        d.setdefault("giorno", datetime.date.today().isoformat())
+        _scrivi_stato(d, path)
+
+
+def uso_azzera(provider: str | None = None, path=None):
+    """Azzera il conteggio di oggi (di un provider, o di tutti). I tetti restano."""
+    oggi = datetime.date.today().isoformat()
+    with _lock:
+        d = _leggi_stato(path)
+        t = _tetti_validi(d)
+        if provider and d.get("giorno") == oggi:
+            d.pop(provider, None)
+        else:
+            d = {"giorno": oggi}
+        if t:
+            d["tetti"] = t
+        _scrivi_stato(d, path)
 
 
 # ---------- provider ----------
