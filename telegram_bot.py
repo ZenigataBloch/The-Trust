@@ -438,7 +438,8 @@ _SEGNI_LOGIN = ("log in for access", "login required", "log in to", "sign in to 
                 "you need to log in", "need to log in", "requires authentication",
                 "authentication required", "authrequired", "authenticationerror",
                 "authenticated cookies", "--cookies", "registered users", "nsfw",
-                "401 unauthorized", "http error 401")
+                "401 unauthorized", "http error 401",
+                "redirect to login", "login page", "accounts/login")
 
 
 def _esito_cookie(dettagli: str) -> str | None:
