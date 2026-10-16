@@ -111,6 +111,8 @@ Log
 ---
 Avviato con pythonw (GUI senza console) scrive in org_bot.log accanto allo script; il file
 ruota da solo sopra i 2 MB (restano org_bot.log.1 e .2, vedi bot_log.py). Quando è caricato da discord_bot.py usa il log di quest'ultimo.
+Si leggono dalla scheda LOG (dopo IMPOSTAZIONI): tutti i .log dei bot + le cronologie degli invii,
+con aggiornamento automatico solo quando la scheda è visibile.
 """
 import sys
 from pathlib import Path
@@ -1895,10 +1897,6 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
     for txt, cmd in (("Incolla dagli appunti", incolla), ("Incolla in 1 riga", lambda: incolla(True)),
                      ("Salva", salva), ("Svuota", svuota), ("Apri cartella", apri_cartella)):
         tk.Button(riga1, text=txt, command=cmd).pack(side="left", padx=(0, 4))
-    ico_log = icona_log(tk)
-    bt_log = tk.Button(riga2, image=ico_log, command=lambda: apri_log(root, tk, ttk, "telegram"))
-    bt_log.image = ico_log                     # senza riferimento Tk perde l'immagine
-    bt_log.pack(side="right", padx=(8, 0))
     bt_invia = tk.Button(riga2, text="Invia ora", command=invia, font=("Segoe UI", 9, "bold"))
     bt_invia.pack(side="right")
     bt_ferma = tk.Button(riga2, text="Ferma", command=ferma, state="disabled")
@@ -2157,45 +2155,16 @@ def installa_scala(root, tk, ttk, dopo=None, k_min=0.85, k_max=1.8):
     root.after(2000, ciclo)
 
 
-# ---------------------------------------------------------------- log: icona e finestra di lettura
-def icona_log(tk):
-    """Icona «documento con righe» 14x18 disegnata a pixel (nessun file immagine da portarsi dietro)."""
-    colore = getattr(T, "FG", "#e8e8e8")
-    w, h = 14, 18
-    img = tk.PhotoImage(width=w, height=h)
-
-    def r(x0, y0, x1, y1):
-        img.put(colore, to=(x0, y0, x1, y1))
-    r(0, 0, 9, 1)
-    r(0, 0, 1, h)
-    r(0, h - 1, w, h)
-    r(w - 1, 4, w, h)                          # contorno
-    for i in range(5):
-        r(9 + i, i, 10 + i, i + 1)            # angolo tagliato
-    r(9, 0, 10, 5)
-    r(9, 4, w, 5)                             # piega
-    for y in (8, 11, 14):
-        r(3, y, w - 3, y + 1)                 # righe di testo
-    return img
-
-
-_LOG_APERTI: dict = {}
+# ---------------------------------------------------------------- log: scheda di lettura
 _LOG_RE = re.compile(r"[\w.\-]+\.log(\.\d+)?")
 _LOG_ERR = re.compile(r"errore|error|traceback|exception|fallit", re.IGNORECASE)
 LOG_TAIL = 200 * 1024                          # leggo solo la coda: i log ruotano a 2 MB
+_LOG_PREFERITI = ["discord_bot.log", "telegram_bot.log", "org_bot.log"]
 
 
-def apri_log(root, tk, ttk, tab: str):
-    """Finestra di sola lettura con i log della scheda: «discord» o «telegram». Si aggiorna da sola."""
-    esistente = _LOG_APERTI.get(tab)
-    if esistente is not None and esistente.winfo_exists():
-        esistente.deiconify()
-        esistente.lift()
-        return
-    nome_tab = "Discord" if tab == "discord" else "Telegram"
-    preferiti = ["discord_bot.log", "org_bot.log"] if tab == "discord" else ["telegram_bot.log", "org_bot.log"]
-    cron_dir = INVII_DIR if tab == "discord" else TG_DIR
-
+def crea_scheda_log(root, nb, scheda, tk, ttk):
+    """Scheda LOG (sola lettura): tutti i file .log dei bot e le cronologie degli invii. Si aggiorna da sola
+    ogni 2 s, ma solo mentre la scheda è quella visibile."""
     def mt(p: Path) -> float:
         try:
             return p.stat().st_mtime
@@ -2207,25 +2176,21 @@ def apri_log(root, tk, ttk, tab: str):
             logs = [p for p in BM.BASE.iterdir() if p.is_file() and _LOG_RE.fullmatch(p.name)]
         except OSError:
             logs = []
-        logs.sort(key=lambda p: (p.name not in preferiti, preferiti.index(p.name) if p.name in preferiti else 0,
-                                 -mt(p)))
+        logs.sort(key=lambda p: (p.name not in _LOG_PREFERITI,
+                                 _LOG_PREFERITI.index(p.name) if p.name in _LOG_PREFERITI else 0, -mt(p)))
         voci = {p.name: p for p in logs}
-        try:
-            cron = sorted(cron_dir.glob("*.inviati.log"), key=lambda p: -mt(p))
-        except OSError:
-            cron = []
-        for p in cron:
-            voci[f"{cron_dir.name}/{p.name}"] = p
+        for cron_dir in (INVII_DIR, TG_DIR):
+            try:
+                cron = sorted(cron_dir.glob("*.inviati.log"), key=lambda p: -mt(p))
+            except OSError:
+                cron = []
+            for p in cron:
+                voci[f"{cron_dir.name}/{p.name}"] = p
         return voci
 
     voci = elenco()
-    w = tk.Toplevel(root)
-    w.title(f"Log · {nome_tab}")
-    w.geometry("860x500")
-    w.minsize(520, 300)
-    _LOG_APERTI[tab] = w
-    alto = tk.Frame(w)
-    alto.pack(fill="x", padx=8, pady=(8, 4))
+    alto = tk.Frame(scheda)
+    alto.pack(fill="x", padx=10, pady=(10, 4))
     combo = ttk.Combobox(alto, state="readonly", width=38, values=list(voci))
     combo.pack(side="left")
     if voci:
@@ -2234,8 +2199,8 @@ def apri_log(root, tk, ttk, tab: str):
     tk.Checkbutton(alto, text="Segui in fondo", variable=segui).pack(side="left", padx=10)
     info = tk.Label(alto, text="", fg=T.MUTED, anchor="e")
     info.pack(side="right")
-    corpo = tk.Frame(w)
-    corpo.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    corpo = tk.Frame(scheda)
+    corpo.pack(fill="both", expand=True, padx=10, pady=(0, 10))
     sb = tk.Scrollbar(corpo)
     sb.pack(side="right", fill="y")
     txt = tk.Text(corpo, wrap="word", font=("Consolas", 9), state="disabled", yscrollcommand=sb.set,
@@ -2251,6 +2216,8 @@ def apri_log(root, tk, ttk, tab: str):
         if p is None:
             voci = elenco()
             combo.config(values=list(voci))
+            if voci and not combo.get():
+                combo.current(0)
             info.config(text="Nessun file di log trovato" if not voci else "")
             return
         try:
@@ -2287,24 +2254,33 @@ def apri_log(root, tk, ttk, tab: str):
         info.config(text=f"{stt.st_size / 1024:.0f} KB · {time.strftime('%H:%M:%S', time.localtime(stt.st_mtime))}"
                          + (f" · ultimi {LOG_TAIL // 1024} KB" if stt.st_size > LOG_TAIL else ""))
 
-    def ciclo():
-        if not w.winfo_exists():
-            return
+    def visibile() -> bool:
         try:
-            carica()
-        except Exception as e:
-            _log_gui(f"log: errore {e!r}")
-        w.after(2000, ciclo)
+            return nb.select() == str(scheda)
+        except tk.TclError:
+            return False
 
-    def chiudi_log():
-        _LOG_APERTI.pop(tab, None)
-        w.destroy()
+    def ciclo():
+        if not scheda.winfo_exists():
+            return
+        if visibile():
+            try:
+                carica()
+            except Exception as e:
+                _log_gui(f"log: errore {e!r}")
+        scheda.after(2000, ciclo)
+
+    def al_cambio_scheda(_=None):
+        if visibile():
+            try:
+                carica(True)
+            except Exception as e:
+                _log_gui(f"log: errore {e!r}")
 
     tk.Button(alto, text="Aggiorna", command=lambda: carica(True)).pack(side="right", padx=6)
     combo.bind("<<ComboboxSelected>>", lambda e: carica(True))
-    w.protocol("WM_DELETE_WINDOW", chiudi_log)
-    carica(True)
-    w.after(2000, ciclo)
+    nb.bind("<<NotebookTabChanged>>", al_cambio_scheda, add="+")
+    scheda.after(2000, ciclo)
 
 
 def crea_barra_bot(root, tk):
@@ -2858,10 +2834,13 @@ def avvia_gui():
     scheda_dc = tk.Frame(nb)
     scheda_tg = tk.Frame(nb)
     scheda_imp = tk.Frame(nb)
+    scheda_log = tk.Frame(nb)
     nb.add(scheda_dc, text="  Discord  ")
     nb.add(scheda_tg, text="  Telegram  ")
     nb.add(scheda_imp, text="  IMPOSTAZIONI  ")
+    nb.add(scheda_log, text="  LOG  ")
     crea_scheda_impostazioni(root, scheda_imp, tk, ttk, messagebox, barra_bot)
+    crea_scheda_log(root, nb, scheda_log, tk, ttk)
     tg = crea_scheda_telegram(root, scheda_tg, tk, ttk, messagebox, simpledialog, subprocess)
 
     st = {"nome": None, "mtime": 0.0, "nomi": [], "etichette": None}
@@ -3259,9 +3238,10 @@ def avvia_gui():
         root.after(1000, aggiorna_progresso)
 
     def salva_scheda_attiva(_=None):
-        if nb.index(nb.select()) == 1:
+        i = nb.index(nb.select())
+        if i == 1:
             tg["salva"]()
-        else:
+        elif i == 0:                            # IMPOSTAZIONI e LOG non hanno nulla da salvare qui
             salva()
 
     for txt, cmd in (("Nuova persona", nuova), ("Elimina chat", elimina)):
@@ -3272,10 +3252,6 @@ def avvia_gui():
         b.pack(side="left", padx=(0, 4))
         if cmd is not apri_cartella:
             bottoni_persona.append(b)
-    ico_log = icona_log(tk)
-    bt_log = tk.Button(bt_dx, image=ico_log, command=lambda: apri_log(root, tk, ttk, "discord"))
-    bt_log.image = ico_log
-    bt_log.pack(side="right")
 
     lista.bind("<<ListboxSelect>>", su_selezione)
     root.bind("<Control-s>", salva_scheda_attiva)
