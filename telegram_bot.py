@@ -439,7 +439,8 @@ _SEGNI_LOGIN = ("log in for access", "login required", "log in to", "sign in to 
                 "authentication required", "authrequired", "authenticationerror",
                 "authenticated cookies", "--cookies", "registered users", "nsfw",
                 "401 unauthorized", "http error 401",
-                "redirect to login", "login page", "accounts/login")
+                "redirect to login", "login page", "accounts/login",
+                "could not authenticate", "authenticate you")   # X/Twitter: codice 32
 
 
 def _esito_cookie(dettagli: str) -> str | None:
@@ -566,7 +567,58 @@ def _scarica(url: str, folder: str, sorgente: tuple[str, str] | None) -> list[Pa
         raise DownloadError(str(e), dettagli=f"{err_yt}\n{e}") from None
 
 
+_TW_ID_RE = re.compile(r"/status(?:es)?/(\d+)")
+_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
+
+
+def _is_twitter(url: str) -> bool:
+    return urlsplit(url).netloc.lower().removeprefix("www.") in _TW_HOSTS
+
+
+def download_fxtwitter(url: str, folder: str) -> list[Path]:
+    """Ripiego senza login per i tweet pubblici: l'API di fxtwitter restituisce gli indirizzi dei media."""
+    m = _TW_ID_RE.search(urlsplit(url).path)
+    if not m:
+        raise RuntimeError("link senza ID del tweet")
+    tid = m.group(1)
+    req = urllib.request.Request(f"https://api.fxtwitter.com/i/status/{tid}", headers=_UA)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        dati = json.load(r)
+    media = ((dati.get("tweet") or {}).get("media") or {}).get("all") or []
+    if not media:
+        raise RuntimeError("fxtwitter: nessun media nel tweet (o tweet non pubblico)")
+    for i, mdl in enumerate(media, 1):
+        u = mdl.get("url")
+        if not u:
+            continue
+        ext = Path(urlsplit(u).path).suffix.lower()
+        if not ext:
+            ext = ".mp4" if mdl.get("type") in ("video", "gif") else ".jpg"
+        dest = Path(folder) / f"{tid}_{i}{ext}"
+        log(f"    fxtwitter: scarico media {i}/{len(media)}")
+        with urllib.request.urlopen(urllib.request.Request(u, headers=_UA), timeout=120) as r, open(dest, "wb") as f:
+            shutil.copyfileobj(r, f)
+    return collect_files(folder)
+
+
 def _download_cookie(url: str, folder: str) -> list[Path]:
+    """Come _download_cookie_base, ma per Twitter/X se yt-dlp e gallery-dl falliscono prova fxtwitter."""
+    try:
+        return _download_cookie_base(url, folder)
+    except (CookieError, DownloadError) as e:
+        if not _is_twitter(normalizza_url(url)):
+            raise
+        log("  Twitter/X: provo il ripiego fxtwitter…")
+        try:
+            files = download_fxtwitter(normalizza_url(url), folder)
+            if files:
+                return files
+        except Exception as e2:
+            log(f"  fxtwitter: {str(e2)[:200]}")
+        raise e
+
+
+def _download_cookie_base(url: str, folder: str) -> list[Path]:
     """Scarica provando le sorgenti di cookie in ordine (es. firefox, chrome, cookies.txt).
     Se tutte falliscono per colpa dei cookie solleva CookieError (MANCANTI / NON AGGIORNATI)."""
     nuovo = normalizza_url(url)
