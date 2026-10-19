@@ -24,13 +24,21 @@ Variabili d'ambiente:
   AUTO_CHANNEL_ID  (opzionale) canali in cui il bot funziona senza tag: ogni
               post con un link viene scaricato e il post originale cancellato.
 
-Ricerca immagini su Google (modulo Graves, file graves.py):  /ricerca <cosa cercare> [-n 1-10]
-Funziona solo per OWNER_ID, in chat privata e nei gruppi (non nei canali). Serve una chiave di un
-provider (GRAVES_SERPER_KEY, GRAVES_SERPAPI_KEY o GOOGLE_API_KEY+GOOGLE_CX in bots.env): vedi graves.py.
-GRAVES_ORIGINALE=1 manda le immagini come file (prima un album, poi uno per uno se l'album fallisce), senza
-Ricerca per tag (rule34.xxx e simili, sempre in graves.py):  /booru <tag> [-n 1-5] [-s r34|gb|db|e621|rg] [-r]
-Per ogni risultato prima l'anteprima, poi il file. Chiavi e variabili: vedi l'inizio di graves.py.
-la ricompressione che Telegram applica alle foto.
+DA FUORI, in qualsiasi chat o gruppo dove il bot NON è presente (modalità inline, solo OWNER_ID):
+  @nomedelbot /url <link>              poi tocca «Scarica qui»
+  @nomedelbot /ricerca <cosa cercare>  poi tocca «Cerca qui» (1 immagine)
+Un messaggio inline contiene un solo file. Serve /setinline e /setinlinefeedback = Enabled su @BotFather.
+
+Comandi classici (solo se il bot è nella chat; solo OWNER_ID):
+  /url <link>      scarica e pubblica nella chat (o rispondi a un messaggio con un link e scrivi /url)
+  /ricerca <cosa cercare> [-n 1-10]
+  /booru <tag> [-n 1-5] [-s r34|gb|db|e621|rg] [-r]
+Un admin che scrive "in modo anonimo" arriva al bot come GroupAnonymousBot e viene ignorato.
+
+/ricerca usa il modulo Graves (graves.py): serve la chiave di un provider (GRAVES_SERPER_KEY,
+GRAVES_SERPAPI_KEY o GOOGLE_API_KEY+GOOGLE_CX in bots.env). GRAVES_ORIGINALE=1 manda le immagini come
+file (prima un album, poi uno per uno se l'album fallisce), senza la ricompressione che Telegram applica
+alle foto. /booru mostra prima l'anteprima, poi il file. Chiavi e variabili: vedi l'inizio di graves.py.
 
 Protezione Instagram (opzionale; 0 = disattivato). Troppe richieste ravvicinate fanno scattare
 «attività sospetta» sull'account dei cookie: il bot le conta (tutti i moduli, anche dopo un riavvio),
@@ -42,20 +50,23 @@ ti avvisa, aspetta tra un download e l'altro e si ferma al raggiungimento di un 
   IG_STATO_FILE                      contatore (default: instagram_uso.json accanto allo script)
 Sono stime prudenti, non limiti ufficiali di Instagram: regolale in base a ciò che vedi.
 
+Aggiornamento automatico di yt-dlp e gallery-dl (desktop e Android): all'avvio e poi ogni N ore il bot
+esegue "pip install -U yt-dlp gallery-dl" in background e ricarica yt-dlp senza riavviarsi. Aspetta la
+fine del download in corso. Se pip risponde "externally-managed" (Termux) riprova con
+--break-system-packages. /aggiorna lo forza subito.
+  AUTOUPDATE_ORE          ogni quante ore (default 24; 0 = disattivato)
+  AUTOUPDATE_STATO_FILE   dove ricorda l'ultimo controllo (default: autoupdate.json accanto allo script)
+
 Nei gruppi e nei canali il bot deve essere amministratore con i permessi
 "Pubblica messaggi" ed "Elimina messaggi".
 """
-import sys
-from pathlib import Path
-
-# Senza console (pythonw) stdout/stderr sono None: li giro su un file .log con rotazione.
-from bot_log import attiva_log_su_file
-attiva_log_su_file()
-
 import asyncio
 import atexit
+import contextvars
 import datetime
+import functools
 import html
+import importlib
 import json
 import logging
 import os
@@ -65,11 +76,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import struct
 import time
 import urllib.error
 import urllib.request
 import uuid
 import traceback
+import zlib
 from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -79,6 +92,10 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
+    InlineQueryResultCachedMpeg4Gif,
+    InlineQueryResultCachedPhoto,
+    InlineQueryResultCachedVideo,
+    InputMediaAnimation,
     InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
@@ -89,12 +106,19 @@ from telegram.constants import ChatType
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
+    ChosenInlineResultHandler,
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
+
+from bot_log import attiva_log_su_file
+
+# Senza console (pythonw) stdout/stderr sono None: li giro su un file .log con rotazione.
+attiva_log_su_file()
 
 # httpx (usato da python-telegram-bot) a livello INFO scrive nel log gli URL delle richieste,
 # che per la Bot API contengono il token: lo tengo a WARNING anche se qualcuno attiva i log
@@ -130,6 +154,15 @@ AUTO_CHANNELS = {
 # 1 = nel testo inviato dall'inline mode accoda anche "@bot" (vecchio comportamento).
 # Di default è 0: il bot riconosce da solo i messaggi inviati "via @bot".
 INLINE_TAG = os.environ.get("INLINE_TAG") == "1"
+
+# 1 = l'inline propone anche «Scarica e pubblica» / «ricerca …» come testo: funziona SOLO nelle chat dove
+# il bot è presente. Di default 0: si propone solo «Scarica qui», che funziona dappertutto.
+INLINE_PUBBLICA = os.environ.get("INLINE_PUBBLICA") == "1"
+
+# Inline con anteprima: appena incolli il link il bot scarica; se finisce entro INLINE_ATTESA secondi
+# l'elenco mostra già il file vero (miniatura compresa) e toccandolo parte direttamente, senza segnaposto.
+INLINE_SEGNAPOSTO = os.environ.get("INLINE_SEGNAPOSTO") == "1"   # 1 = mostra «SCARICA QUI» mentre prepara
+INLINE_ATTESA = float(os.environ.get("INLINE_ATTESA", "2"))
 
 # cookie per i siti che richiedono il login (Instagram, TikTok, X...). Si provano in ordine:
 #   COOKIES_BROWSER  uno o più browser separati da virgola, es. "firefox,chrome"
@@ -183,6 +216,120 @@ def mb(n: float) -> str:
     return f"{n / 1_000_000:.1f} MB"
 
 
+# ---------- aggiornamento automatico di yt-dlp e gallery-dl ----------
+# I siti cambiano di continuo: un estrattore vecchio è la causa più comune dei download che falliscono.
+try:
+    AUTOUPDATE_ORE = float(os.environ.get("AUTOUPDATE_ORE", "24"))   # 0 = disattivato
+except ValueError:
+    AUTOUPDATE_ORE = 24.0
+AUTOUPDATE_STATO = Path(os.environ.get("AUTOUPDATE_STATO_FILE")
+                        or Path(__file__).resolve().with_name("autoupdate.json"))
+PACCHETTI_DL = ("yt-dlp", "gallery-dl")
+
+# Chi scarica tiene questo lock (yt-dlp e gallery-dl); l'aggiornamento lo prende per tutta la durata di
+# pip e della ricarica, così non cambia i file sotto un download in corso.
+_LOCK_DL = threading.RLock()
+
+
+def _sotto_lock(fn):
+    @functools.wraps(fn)
+    def avvolta(*a, **k):
+        with _LOCK_DL:
+            return fn(*a, **k)
+    return avvolta
+
+
+def _versioni() -> dict:
+    importlib.invalidate_caches()
+    out = {}
+    for pacchetto in PACCHETTI_DL:
+        try:
+            out[pacchetto] = metadata.version(pacchetto)
+        except metadata.PackageNotFoundError:
+            out[pacchetto] = None
+    return out
+
+
+def _pip_aggiorna():
+    cmd = [_python_console(), "-m", "pip", "install", "-U", "--disable-pip-version-check", "--no-input",
+           *PACCHETTI_DL]
+    kw = dict(capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
+    r = run_nowin(cmd, **kw)
+    if r.returncode and "externally-managed" in (r.stdout + r.stderr).lower():   # Termux / Python di sistema
+        r = run_nowin(cmd + ["--break-system-packages"], **kw)
+    return r
+
+
+def _ricarica_yt_dlp():
+    """Rimpiazza yt_dlp nel processo con la versione appena installata (l'unico uso è download_ytdlp)."""
+    global yt_dlp
+    vecchio = yt_dlp
+    for nome in [n for n in sys.modules if n == "yt_dlp" or n.startswith("yt_dlp.")]:
+        del sys.modules[nome]
+    try:
+        importlib.invalidate_caches()
+        yt_dlp = importlib.import_module("yt_dlp")
+    except Exception:
+        yt_dlp = vecchio
+        raise
+
+
+def _au_ultimo() -> float:
+    try:
+        return float(json.loads(AUTOUPDATE_STATO.read_text(encoding="utf-8")).get("ultimo", 0))
+    except Exception:
+        return 0.0
+
+
+def _au_scrivi():
+    try:
+        AUTOUPDATE_STATO.write_text(json.dumps({"ultimo": time.time()}), encoding="utf-8")
+    except OSError as e:
+        log(f"Aggiornamento: non riesco a salvare lo stato ({e})")
+
+
+def aggiorna_downloader() -> tuple[bool, str]:
+    """pip install -U di yt-dlp e gallery-dl, poi ricarica yt-dlp senza riavviare il bot.
+    Aspetta la fine del download in corso. Ritorna (riuscito, riassunto)."""
+    with _LOCK_DL:
+        prima = _versioni()
+        log("Aggiornamento: pip install -U yt-dlp gallery-dl…")
+        try:
+            r = _pip_aggiorna()
+        except Exception as e:
+            log(f"Aggiornamento non riuscito: {e}")
+            return False, f"pip non è partito: {e}"
+        if r.returncode:
+            coda = " | ".join((r.stderr or r.stdout).strip().splitlines()[-3:])
+            log(f"Aggiornamento non riuscito (pip codice {r.returncode}): {coda}")
+            return False, f"pip ha fallito: {coda[:300]}"
+        dopo = _versioni()
+        cambiati = [f"{p} {prima[p]} → {dopo[p]}" for p in PACCHETTI_DL if prima[p] != dopo[p]]
+        in_uso = getattr(getattr(yt_dlp, "version", None), "__version__", None)
+        if dopo["yt-dlp"] and in_uso != dopo["yt-dlp"]:   # anche se l'aveva già aggiornato qualcun altro
+            try:
+                _ricarica_yt_dlp()
+            except Exception as e:
+                log(f"Ricarica di yt-dlp non riuscita ({e}): serve riavviare il bot")
+                cambiati.append("ricarica di yt-dlp fallita, riavvia il bot")
+    _au_scrivi()
+    esito = ("aggiornato: " + ", ".join(cambiati)) if cambiati else "già aggiornati"
+    log(f"Aggiornamento: {esito}")
+    return True, esito
+
+
+def _ciclo_aggiornamento():
+    time.sleep(20)   # lascio finire l'avvio
+    while True:
+        attesa = _au_ultimo() + AUTOUPDATE_ORE * 3600 - time.time()
+        if attesa > 0:
+            time.sleep(min(attesa, 6 * 3600))
+            continue
+        ok, _ = aggiorna_downloader()
+        if not ok:
+            time.sleep(1800)   # niente rete o pip bloccato: riprovo tra mezz'ora
+
+
 def log_versioni():
     """Scrive nel log le versioni di yt-dlp e gallery-dl: i siti cambiano di continuo e un
     estrattore vecchio è la causa più comune dei download che falliscono."""
@@ -200,12 +347,26 @@ def log_versioni():
             except ValueError:
                 giorni = 0
             if giorni > 60:
-                extra = f"  <-- vecchia di {giorni} giorni: aggiorna con  pip install -U yt-dlp gallery-dl"
+                extra = (f"  <-- vecchia di {giorni} giorni: la aggiorno tra poco" if AUTOUPDATE_ORE
+                         else f"  <-- vecchia di {giorni} giorni: aggiorna con  pip install -U yt-dlp gallery-dl")
         log(f"{pacchetto} {v}{extra}")
+
+
+# Avanzamento del download in corso ({"pct": 0-100, "n": file di gallery-dl, "fase": ...}): chi avvia il
+# download mette qui un dict, il thread (che eredita il contesto) lo aggiorna e l'inline lo legge.
+_AVANZ: contextvars.ContextVar = contextvars.ContextVar("avanzamento", default=None)
 
 
 def progress_hook(d: dict):
     """Barra di avanzamento di yt-dlp, su una sola riga."""
+    av = _AVANZ.get()
+    if av is not None:
+        if d["status"] == "downloading":
+            tot = d.get("total_bytes") or d.get("total_bytes_estimate")
+            if tot:
+                av["pct"] = min(100.0, (d.get("downloaded_bytes") or 0) / tot * 100)
+        elif d["status"] == "finished":
+            av["pct"] = 100.0
     if d["status"] == "downloading":
         if not sys.stdout.isatty():
             return   # senza console (pythonw/file di log) la barra sporcherebbe il log
@@ -474,6 +635,7 @@ def _messaggio_cookie(sito: str, fatti: list[tuple[str, str]], ultimo: "Download
     return testo
 
 
+@_sotto_lock
 def download_ytdlp(url: str, folder: str, sorgente: tuple[str, str] | None = None) -> list[Path]:
     opts = {
         "outtmpl": f"{folder}/%(id)s.%(ext)s",
@@ -500,6 +662,7 @@ def download_ytdlp(url: str, folder: str, sorgente: tuple[str, str] | None = Non
     return collect_files(folder)
 
 
+@_sotto_lock
 def download_gallerydl(url: str, folder: str, sorgente: tuple[str, str] | None = None) -> list[Path]:
     cmd = [_python_console(), "-m", "gallery_dl", "-d", folder]
     if sorgente:
@@ -524,6 +687,9 @@ def download_gallerydl(url: str, folder: str, sorgente: tuple[str, str] | None =
             last_err = line
         elif not line.startswith("#"):
             n += 1
+            av = _AVANZ.get()
+            if av is not None:
+                av["n"] = n
             log(f"    gallery-dl: file {n}: {Path(line).name}")
     proc.wait()
     files = collect_files(folder)
@@ -1287,7 +1453,7 @@ def _rendi_riproducibile(path: Path) -> Path:
     out = path.with_name(path.stem + "_dc.mp4")
     cmd = ["ffmpeg", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?"]
     cmd += (["-c:v", "copy"] if ok_v else
-            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+            ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p",
              "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"])
     cmd += ["-c:a", "copy"] if ok_a else ["-c:a", "aac", "-b:a", "128k"]
     cmd += ["-movflags", "+faststart", str(out)]
@@ -1384,8 +1550,12 @@ async def send_single(bot, chat_id, path: Path, cache: dict | None = None, **kw)
             cache[chiave] = info
 
 
-async def send_files(bot, chat_id, files: list[Path], cache: dict | None = None, **kw) -> list[str]:
-    """`cache` (facoltativa): vedi send_single. Chi la passa deve usare lo stesso dict per tutti i canali."""
+async def send_files(bot, chat_id, files: list[Path], cache: dict | None = None,
+                     caption: str | None = None, **kw) -> list[str]:
+    """`cache` (facoltativa): vedi send_single. Chi la passa deve usare lo stesso dict per tutti i canali.
+    `caption`: didascalia (es. il link di origine): su ogni messaggio, e nell'album sul primo file."""
+    caption = caption[:1024] if caption else None
+    kw_cap = {**kw, "caption": caption} if caption else kw
     errors = []
     groupable, singles = [], []
 
@@ -1414,29 +1584,21 @@ async def send_files(bot, chat_id, files: list[Path], cache: dict | None = None,
 
         try:
             for p in chunk:
+                didascalia = caption if not media else None     # nell'album la didascalia sta sul primo file
                 nota = cache.get(str(p)) if cache is not None else None
                 if nota and nota[0] in ("video", "photo"):      # già caricato su Telegram: uso il suo file_id
                     if nota[0] == "video":
-                        media.append(InputMediaVideo(media=nota[1], supports_streaming=True))
+                        media.append(InputMediaVideo(media=nota[1], supports_streaming=True, caption=didascalia))
                     else:
-                        media.append(InputMediaPhoto(media=nota[1]))
+                        media.append(InputMediaPhoto(media=nota[1], caption=didascalia))
                     continue
                 f = open(p, "rb")
                 handles.append(f)
 
                 if p.suffix.lower() in VIDEO_EXT:
-                    media.append(
-                        InputMediaVideo(
-                            media=f,
-                            supports_streaming=True,
-                        )
-                    )
+                    media.append(InputMediaVideo(media=f, supports_streaming=True, caption=didascalia))
                 else:
-                    media.append(
-                        InputMediaPhoto(
-                            media=f,
-                        )
-                    )
+                    media.append(InputMediaPhoto(media=f, caption=didascalia))
 
             inviati = await bot.send_media_group(chat_id, media, **kw)
             if cache is not None:
@@ -1462,7 +1624,7 @@ async def send_files(bot, chat_id, files: list[Path], cache: dict | None = None,
 
     for p in singles:
         try:
-            await send_single(bot, chat_id, p, cache=cache, **kw)
+            await send_single(bot, chat_id, p, cache=cache, **kw_cap)
         except Exception as e:
             log(f"    ERRORE invio {p.name}: {e}")
             errors.append(f"{p.name}: {e}")
@@ -1482,6 +1644,31 @@ async def report_from_channel(ctx: ContextTypes.DEFAULT_TYPE, channel_id: int, t
             pass
 
 
+# ---------- helper comuni ----------
+ANONYMOUS_ADMIN_ID = 1087968824   # mittente dei messaggi di un admin "anonimo" nei gruppi
+
+
+def kw_topic(msg) -> dict:
+    """Se il messaggio è in un topic (forum), le risposte vanno nello stesso topic."""
+    return {"message_thread_id": msg.message_thread_id} if msg.is_topic_message else {}
+
+
+def e_owner(user, cosa: str) -> bool:
+    """True se il mittente è OWNER_ID; altrimenti scrive il motivo nel log."""
+    if user and user.id == OWNER:
+        return True
+    if user and user.id == ANONYMOUS_ADMIN_ID:
+        log(f"Ignorato {cosa}: mittente anonimo (admin con «Resta anonimo»), non posso sapere chi sia")
+    else:
+        log(f"Ignorato {cosa} da {user.id if user else '?'}: non è OWNER_ID")
+    return False
+
+
+def chat_comandi(chat) -> bool:
+    """I comandi /xxx funzionano in privato e in qualsiasi gruppo (nei canali non arrivano)."""
+    return chat.type in (ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP)
+
+
 # ---------- handler ----------
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -1498,13 +1685,11 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         needs_tag = not auto   # nei canali automatici il tag non serve
     elif chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        if not user or user.id != OWNER:
-            log(f"Ignorato messaggio nel gruppo da {user.id if user else '?'}: non è OWNER_ID")
+        if not e_owner(user, "messaggio nel gruppo"):
             return
         needs_tag = True
     elif chat.type == ChatType.PRIVATE:
-        if not user or user.id != OWNER:
-            log(f"Ignorato messaggio privato da {user.id if user else '?'}: non è OWNER_ID")
+        if not e_owner(user, "messaggio privato"):
             return
         needs_tag = False
     else:
@@ -1515,13 +1700,41 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if needs_tag and not via_me and f"@{ctx.bot.username}".lower() not in text.lower():
         return
     urls = URL_RE.findall(text)
-    if not urls:
-        return
+    if urls:
+        await processa_link(ctx, msg, chat, urls)
 
+
+async def cmd_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/url <link> (oppure in risposta a un messaggio con un link): come incollare il link, ma
+    funziona in qualsiasi gruppo senza tag."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not chat or not chat_comandi(chat) or not e_owner(user, "/url"):
+        return
+    urls = URL_RE.findall(msg.text or "")
+    if not urls and msg.reply_to_message:
+        r = msg.reply_to_message
+        urls = URL_RE.findall(r.text or r.caption or "")
+    if not urls:
+        await msg.reply_text("Uso: /url <link>  (oppure rispondi a un messaggio con un link)", **kw_topic(msg))
+        return
+    await processa_link(ctx, msg, chat, urls)
+
+
+async def cmd_aggiorna(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/aggiorna: aggiorna subito yt-dlp e gallery-dl (di solito lo fa da solo ogni AUTOUPDATE_ORE)."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not chat or not chat_comandi(chat) or not e_owner(user, "/aggiorna"):
+        return
+    stato = await msg.reply_text("🔄 Aggiorno yt-dlp e gallery-dl…", **kw_topic(msg))
+    ok, esito = await asyncio.to_thread(aggiorna_downloader)
+    await stato.edit_text(("✅ " if ok else "⚠️ ") + esito)
+
+
+async def processa_link(ctx: ContextTypes.DEFAULT_TYPE, msg, chat, urls: list[str]):
+    """Scarica i link e pubblica i file in chat; poi cancella il messaggio di richiesta (tranne in privato)."""
     is_channel = chat.type == ChatType.CHANNEL
     is_private = chat.type == ChatType.PRIVATE
-    # se siamo in un topic (forum), rispondo nello stesso topic
-    kw = {"message_thread_id": msg.message_thread_id} if msg.is_topic_message else {}
+    kw = kw_topic(msg)
 
     where = chat.title or "chat privata"
     log(f"Richiesta da «{where}»: {len(urls)} link")
@@ -1547,7 +1760,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 continue
             files = [await rendi_riproducibile(p) for p in files]
             log(f"  trovati {len(files)} file, invio su Telegram…")
-            problems.extend(await send_files(ctx.bot, chat.id, files, **kw))
+            problems.extend(await send_files(ctx.bot, chat.id, files, caption=url, **kw))
         log(f"  completato in {time.time() - t0:.0f}s")
 
     if status:
@@ -1584,6 +1797,109 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log("  non riesco a cancellare il messaggio (manca il permesso?)")
 
 
+# ---------- inline con anteprima: il file è già pronto quando lo scegli ----------
+_PREPARATI: dict = {}      # url -> {"t": istante, "task": Task che dà [(tipo, file_id, nome, byte)]}
+_ULTIMA_INLINE: dict = {}  # utente -> id dell'ultima richiesta inline (serve ad aspettare che finisci di scrivere)
+PREP_VITA = 1800           # secondi di validità di un file preparato
+INLINE_PAUSA = 0.8         # attesa dopo l'ultimo carattere, prima di cominciare a scaricare
+
+
+async def _prepara_url(bot, url: str, av: dict) -> list:
+    """Scarica l'url e carica i file nella chat privata per ottenere i file_id (poi cancella la copia)."""
+    pronti = []
+    _AVANZ.set(av)
+    with tempfile.TemporaryDirectory() as d:
+        files = await asyncio.to_thread(download, url, d)
+        if not files:
+            raise ValueError("niente da scaricare")
+        av["fase"] = "carico"
+        for p in [await rendi_riproducibile(f) for f in files][:10]:
+            try:
+                dim = p.stat().st_size
+                _, privato = await _media_inline(bot, p)
+            except Exception as e:
+                log(f"  inline: salto {p.name} ({e})")
+                continue
+            info = _id_file(privato)
+            try:
+                await privato.delete()
+            except Exception:
+                pass
+            if info:
+                pronti.append((info[0], info[1], p.name, dim))
+    if not pronti:
+        raise ValueError("nessun file adatto a un messaggio inline")
+    return pronti
+
+
+def _avvia_preparazione(bot, url: str) -> dict:
+    ora = time.time()
+    for k in [k for k, v in _PREPARATI.items() if ora - v["t"] > PREP_VITA]:
+        del _PREPARATI[k]
+    e = _PREPARATI.get(url)
+    if e:
+        return e
+    av: dict = {}
+    e = {"t": ora, "av": av, "task": asyncio.create_task(_prepara_url(bot, url, av))}
+
+    def finito(t):
+        if t.cancelled() or t.exception():     # fallito: riprovabile dopo un minuto
+            e["t"] = time.time() - PREP_VITA + 60
+            if not t.cancelled():
+                log(f"  inline: preparazione non riuscita ({t.exception()})")
+    e["task"].add_done_callback(finito)
+    _PREPARATI[url] = e
+    return e
+
+
+def _testo_avanzamento(av: dict) -> str:
+    if av.get("fase") == "carico":
+        return "⬆️ UPLOAD…"
+    if av.get("pct") is not None:
+        pieni = int(av["pct"] / 10)
+        return f"⬇️ DOWNLOAD {'▓' * pieni}{'░' * (10 - pieni)} {int(av['pct'])}%"
+    if av.get("n"):
+        return f"⬇️ DOWNLOAD · {av['n']} file"
+    return "⬇️ DOWNLOAD…"
+
+
+async def _aggiorna_pulsante(bot, iid: str, av: dict):
+    """Finché scarica, riscrive il pulsante del messaggio inline con la barra di avanzamento."""
+    ultimo = "⬇️ DOWNLOAD…"
+    while True:
+        await asyncio.sleep(2.5)
+        testo = _testo_avanzamento(av)
+        if testo == ultimo:
+            continue
+        ultimo = testo
+        try:
+            await bot.edit_message_reply_markup(
+                inline_message_id=iid,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(testo, callback_data="ph")]]))
+        except Exception:
+            pass
+
+
+def _input_media(tipo: str, file_id: str, caption: str | None = None):
+    if tipo == "video":
+        return InputMediaVideo(media=file_id, supports_streaming=True, caption=caption)
+    if tipo == "animation":
+        return InputMediaAnimation(media=file_id, caption=caption)
+    return InputMediaPhoto(media=file_id, caption=caption)
+
+
+def _risultato_file(n: int, tipo: str, file_id: str, nome: str, dim: int, url: str):
+    """Risultato inline col file vero: l'elenco mostra la sua miniatura; il link va in didascalia."""
+    rid, titolo = f"f{n}:{uuid.uuid4().hex[:10]}", f"{nome[:45]} ({mb(dim)})"
+    if tipo == "video":
+        return InlineQueryResultCachedVideo(id=rid, video_file_id=file_id, title=titolo, caption=url,
+                                            description=url[:80])
+    if tipo == "animation":
+        return InlineQueryResultCachedMpeg4Gif(id=rid, mpeg4_file_id=file_id, title=titolo, caption=url)
+    return InlineQueryResultCachedPhoto(id=rid, photo_file_id=file_id, title=titolo, caption=url,
+                                        description=url[:80])
+
+
 async def handle_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """@nomedelbot <link>: propone un risultato che, toccato, invia
     "<link> @nomedelbot" nella chat; poi lo gestisce handle()."""
@@ -1591,6 +1907,10 @@ async def handle_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not q:
         return
     is_owner = q.from_user.id == OWNER
+    cmd = _inline_comando(q.query) if is_owner else None
+    if cmd:                      # "@bot ricerca ..." / "@bot booru ...": vedi _risposta_inline_comando
+        await _risposta_inline_comando(q, cmd)
+        return
     urls = URL_RE.findall(q.query or "") if is_owner else []
     if q.query:
         if not is_owner:
@@ -1603,6 +1923,29 @@ async def handle_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not urls:
         await q.answer([], cache_time=0, is_personal=True)
         return
+    # aspetto che tu finisca di scrivere/incollare, poi scarico subito in background
+    uid = q.from_user.id
+    _ULTIMA_INLINE[uid] = q.id
+    await asyncio.sleep(INLINE_PAUSA)
+    if _ULTIMA_INLINE.get(uid) != q.id:
+        return                      # nel frattempo hai scritto altro: risponderà quella richiesta
+    e = _avvia_preparazione(ctx.bot, urls[0])
+    ant = _ANTEPRIME.get(urls[0])
+    if ant is None and INLINE_SEGNAPOSTO:     # miniatura del post, in parallelo al download
+        if len(_ANTEPRIME) > 50:
+            _ANTEPRIME.clear()
+        ant = _ANTEPRIME[urls[0]] = asyncio.create_task(_anteprima(ctx.bot, urls[0]))
+    try:
+        pronti = await asyncio.wait_for(asyncio.shield(e["task"]), INLINE_ATTESA)
+    except Exception:       # non ancora pronto o fallito: nessuna barra, elenco vuoto
+        pass
+    else:
+        risultati = [_risultato_file(n, *f, urls[0]) for n, f in enumerate(pronti)]
+        try:
+            await q.answer(risultati, cache_time=0, is_personal=True)
+        except Exception as err2:
+            log(f"  inline: risposta non consegnata ({err2})")
+        return
     text = " ".join(urls) + (f" @{ctx.bot.username}" if INLINE_TAG else "")
     result = InlineQueryResultArticle(
         id=uuid.uuid4().hex,
@@ -1610,7 +1953,19 @@ async def handle_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         description=urls[0][:80],
         input_message_content=InputTextMessageContent(text),
     )
-    await q.answer([result], cache_time=0, is_personal=True)
+    fid = None
+    if ant:
+        try:
+            fid = await asyncio.wait_for(asyncio.shield(ant), 1)
+        except Exception:
+            pass
+    qui = _risultato_qui("dl", "📎 Scarica qui (il bot non serve nella chat)", urls[0][:80], fid)
+    # finché il file non è pronto l'elenco resta vuoto; il segnaposto torna con INLINE_SEGNAPOSTO=1
+    risultati = [r for r in (qui if INLINE_SEGNAPOSTO else None, result if INLINE_PUBBLICA else None) if r]
+    try:
+        await q.answer(risultati, cache_time=0, is_personal=True)
+    except Exception as err2:
+        log(f"  inline: risposta non consegnata ({err2})")
 
 
 # ---------- Graves: /ricerca <cosa cercare> [-n 1-10] ----------
@@ -1655,14 +2010,14 @@ async def _invia_come_file(bot, chat_id, files: list[Path], **kw) -> list[str]:
 
 async def cmd_ricerca(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not msg or not chat or not user:
+    if not msg or not chat or not chat_comandi(chat) or not e_owner(user, "/ricerca"):
         return
-    if chat.type not in (ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP):
-        return
-    if user.id != OWNER:
-        log(f"Ignorato /ricerca da {user.id}: non è OWNER_ID")
-        return
-    kw = {"message_thread_id": msg.message_thread_id} if msg.is_topic_message else {}
+    await _ricerca_core(ctx, msg, chat, list(ctx.args or []))
+
+
+async def _ricerca_core(ctx: ContextTypes.DEFAULT_TYPE, msg, chat, args: list, cancella: bool = False):
+    """Corpo di /ricerca: usato da cmd_ricerca e dal comando inline (cancella=True: toglie il messaggio)."""
+    kw = kw_topic(msg)
 
     async def avvisa(testo: str):
         # come per i link: gli errori vanno nella chat privata con il bot; se non è possibile, in questa
@@ -1676,7 +2031,7 @@ async def cmd_ricerca(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await avvisa("⚠️ Il modulo Graves non è caricato: manca graves.py accanto a telegram_bot.py.")
         return
     try:
-        query, n = graves.parse_richiesta(" ".join(ctx.args or []))
+        query, n = graves.parse_richiesta(" ".join(args))
     except graves.GravesErrore as e:
         await avvisa(f"ℹ️ {e}")
         return
@@ -1703,6 +2058,11 @@ async def cmd_ricerca(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status.delete()
     except Exception:
         pass
+    if cancella and not problems:
+        try:
+            await msg.delete()
+        except Exception:
+            log("  non riesco a cancellare il messaggio del comando (manca il permesso?)")
     if problems:
         err = "⚠️ " + "\n⚠️ ".join(problems)
         if chat.type != ChatType.PRIVATE:
@@ -1734,14 +2094,14 @@ async def _booru_manda_anteprima(bot, path, testo: str, tastiera):
 async def cmd_booru(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/booru <tag> [-n 1-5] [-s r34|gb|db|e621|rg] [-r]: anteprime PRIVATE (chat col bot) con Invia/Scarta; il file parte nella chat solo se scegli Invia."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not msg or not chat or not user:
+    if not msg or not chat or not chat_comandi(chat) or not e_owner(user, "/booru"):
         return
-    if chat.type not in (ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP):
-        return
-    if user.id != OWNER:
-        log(f"Ignorato /booru da {user.id}: non è OWNER_ID")
-        return
-    kw = {"message_thread_id": msg.message_thread_id} if msg.is_topic_message else {}
+    await _booru_core(ctx, msg, chat, list(ctx.args or []))
+
+
+async def _booru_core(ctx: ContextTypes.DEFAULT_TYPE, msg, chat, args: list):
+    """Corpo di /booru: usato da cmd_booru e dal comando inline (anche nei canali)."""
+    kw = kw_topic(msg)
 
     async def avvisa(testo: str):
         try:
@@ -1754,7 +2114,7 @@ async def cmd_booru(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await avvisa("⚠️ Il modulo Graves non è caricato: manca graves.py accanto a telegram_bot.py.")
         return
     try:
-        rich = graves.parse_booru(" ".join(ctx.args or []))
+        rich = graves.parse_booru(" ".join(args))
     except graves.GravesErrore as e:
         await avvisa(f"ℹ️ {e}")
         return
@@ -1895,6 +2255,338 @@ async def on_booru_scelta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await scrivi(base + f"\n⚠️ Invio non riuscito: {str(e)[:200]}", _booru_tastiera(token, "📤 Riprova"))
 
 
+# ---------- /ricerca e /booru via @bot (inline): gruppi e canali ----------
+# Nei canali i comandi /xxx non arrivano (i post non hanno un mittente): si scrive
+#   @nomedelbot ricerca <cosa cercare> [-n 1-10]      @nomedelbot booru <tag> [-n 1-5] [-s sito] [-r]
+# handle_inline propone un risultato; toccandolo parte nella chat "ricerca ..." o "booru ..." (senza
+# barra, così non lo prende anche CommandHandler) e handle_comando_inline lo esegue.
+_INLINE_CMD_RE = re.compile(r"\s*/?(ricerca|booru)(?:\s+(.*))?$", re.I | re.S)
+
+
+def _inline_comando(testo: str):
+    """('ricerca'|'booru', argomenti) se il testo è un comando inline, altrimenti None."""
+    m = _INLINE_CMD_RE.match(testo or "")
+    if not m:
+        return None
+    return m.group(1).lower(), " ".join((m.group(2) or "").split())
+
+
+async def _risposta_inline_comando(q, cmd):
+    """Risultato inline di un comando; con argomenti non validi non propone niente."""
+    nome, args = cmd
+    try:
+        if graves is None:
+            raise RuntimeError("graves.py non caricato")
+        if nome == "ricerca":
+            query, n = graves.parse_richiesta(args)
+            titolo = f"🔎 Cerca immagini: {query[:50]}"
+            desc = f"{n} immagini" if n else "numero di immagini di default"
+        else:
+            rich = graves.parse_booru(args)
+            titolo = f"🏷 Booru ({rich.sito}): {' '.join(rich.tags)[:50]}"
+            desc = f"{rich.n} risultati" + (" · casuali" if rich.casuale else "") + " · anteprime in privato"
+    except Exception as e:
+        if args:   # senza argomenti è solo la parola digitata a metà: niente da segnalare
+            log(f"Inline /{nome}: non propongo il risultato ({str(e)[:100]})")
+        await q.answer([], cache_time=0, is_personal=True)
+        return
+    result = InlineQueryResultArticle(
+        id=uuid.uuid4().hex,
+        title=titolo,
+        description=desc,
+        input_message_content=InputTextMessageContent(f"{nome} {args}"),
+    )
+    risultati = [result]
+    if nome == "ricerca":
+        qui = _risultato_qui("rc", titolo.replace("Cerca immagini", "Cerca qui, senza bot nella chat", 1),
+                             "1 immagine · funziona anche dove il bot non c'è")
+        if qui:
+            risultati = [qui] if not INLINE_PUBBLICA else [qui, result]
+    await q.answer(risultati, cache_time=0, is_personal=True)
+
+
+async def handle_comando_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Messaggio "ricerca ..." / "booru ..." inviato via @bot (inline) in un gruppo, canale o chat privata."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not chat or not msg.via_bot or msg.via_bot.id != ctx.bot.id:
+        return
+    cmd = _inline_comando(msg.text or "")
+    if not cmd:
+        return
+    # stesse regole di handle(): dove e per chi (il risultato inline lo propone comunque solo a OWNER)
+    if chat.type == ChatType.CHANNEL:
+        if CHANNELS and chat.id not in CHANNELS and chat.id not in AUTO_CHANNELS:
+            log(f"Ignorato comando inline nel canale {chat.id}: non è in CHANNEL_ID")
+            return
+    elif chat_comandi(chat):
+        if not e_owner(user, "comando inline"):
+            return
+    else:
+        return
+    nome, args = cmd
+    if nome == "ricerca":
+        await _ricerca_core(ctx, msg, chat, args.split(), cancella=True)
+    else:
+        await _booru_core(ctx, msg, chat, args.split())
+
+
+# ---------- /url e /ricerca via @bot anche dove il bot NON è nella chat ----------
+# Il risultato inline è un segnaposto (immagine grigia + pulsante) che, una volta toccato, il bot
+# sostituisce col file vero con editMessageMedia. Richiede /setinlinefeedback = Enabled su @BotFather.
+_PLACEHOLDER_IDS: dict = {}   # tipo ("dl"/"rc") -> file_id del segnaposto (vuoto = funzione non disponibile)
+_SEGNAPOSTO_FILE = Path(__file__).resolve().with_name("inline_segnaposto.json")
+
+# Nell'elenco inline Telegram NON mostra titolo e descrizione dei risultati-foto, solo l'immagine:
+# il testo che spiega cosa fa il risultato sta quindi dentro l'immagine (righe: testo, grandezza).
+_SEGNAPOSTI = {
+    "dl": [("SCARICA", 8), ("QUI", 8), ("SENZA BOT NELLA CHAT", 3)],
+    "rc": [("CERCA", 8), ("QUI", 8), ("1 IMMAGINE", 3)],
+}
+
+# carattere 5x7 incorporato (solo le lettere che servono): niente Pillow
+_FONT = {
+    "A": ".###.|#...#|#...#|#####|#...#|#...#|#...#", "B": "####.|#...#|#...#|####.|#...#|#...#|####.",
+    "C": ".####|#....|#....|#....|#....|#....|.####", "D": "####.|#...#|#...#|#...#|#...#|#...#|####.",
+    "E": "#####|#....|#....|####.|#....|#....|#####", "G": ".####|#....|#....|#..##|#...#|#...#|.###.",
+    "H": "#...#|#...#|#...#|#####|#...#|#...#|#...#", "I": "#####|..#..|..#..|..#..|..#..|..#..|#####",
+    "L": "#....|#....|#....|#....|#....|#....|#####", "M": "#...#|##.##|#.#.#|#.#.#|#...#|#...#|#...#",
+    "N": "#...#|##..#|#.#.#|#..##|#...#|#...#|#...#", "O": ".###.|#...#|#...#|#...#|#...#|#...#|.###.",
+    "Q": ".###.|#...#|#...#|#...#|#.#.#|#..#.|.##.#", "R": "####.|#...#|#...#|####.|#.#..|#..#.|#...#",
+    "S": ".####|#....|#....|.###.|....#|....#|####.", "T": "#####|..#..|..#..|..#..|..#..|..#..|..#..",
+    "U": "#...#|#...#|#...#|#...#|#...#|#...#|.###.", "Z": "#####|....#|...#.|..#..|.#...|#....|#####",
+    "1": "..#..|.##..|..#..|..#..|..#..|..#..|.###.",
+}
+
+
+def _png(w: int, h: int, raw: bytes) -> bytes:
+    def blocco(tipo: bytes, dati: bytes) -> bytes:
+        return struct.pack(">I", len(dati)) + tipo + dati + struct.pack(">I", zlib.crc32(tipo + dati) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + blocco(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + blocco(b"IDAT", zlib.compress(raw, 9)) + blocco(b"IEND", b""))
+
+
+def _png_testo(righe, w: int = 480, h: int = 270, sfondo=(28, 28, 28), colore=(235, 235, 235)) -> bytes:
+    """PNG con le righe di testo centrate (righe = [(testo, scala), ...]), senza librerie esterne."""
+    pix = [bytearray(bytes(sfondo) * w) for _ in range(h)]
+    gap = 14
+    y = (h - (sum(7 * sc for _, sc in righe) + gap * (len(righe) - 1))) // 2
+    for testo, sc in righe:
+        x = (w - (len(testo) * 6 * sc - sc)) // 2
+        for ch in testo:
+            for r, bits in enumerate(_FONT.get(ch, "").split("|")):
+                for c, b in enumerate(bits):
+                    if b == "#":
+                        for dy in range(sc):
+                            for dx in range(sc):
+                                i = (x + c * sc + dx) * 3
+                                pix[y + r * sc + dy][i:i + 3] = bytes(colore)
+            x += 6 * sc
+        y += 7 * sc + gap
+    return _png(w, h, b"".join(b"\x00" + bytes(r) for r in pix))
+
+
+async def prepara_segnaposto(bot):
+    """Ricava (e ricorda) i file_id dei segnaposto: li manda una volta sola a OWNER e li cancella."""
+    try:
+        d = json.loads(_SEGNAPOSTO_FILE.read_text(encoding="utf-8"))
+        if d.get("bot") == bot.id and d.get("v") == 2 and set(d.get("ids", {})) >= set(_SEGNAPOSTI):
+            _PLACEHOLDER_IDS.update(d["ids"])
+            log("Inline «qui»: segnaposto pronto (ricordati di /setinlinefeedback su @BotFather)")
+            return
+    except Exception:
+        pass
+    try:
+        ids = {}
+        for tipo, righe in _SEGNAPOSTI.items():
+            m = await bot.send_photo(OWNER, _png_testo(righe), caption="Segnaposto per l'inline (si cancella da solo).")
+            ids[tipo] = m.photo[-1].file_id
+            try:
+                await m.delete()
+            except Exception:
+                pass
+        _PLACEHOLDER_IDS.update(ids)
+        _SEGNAPOSTO_FILE.write_text(json.dumps({"bot": bot.id, "v": 2, "ids": ids}), encoding="utf-8")
+        log("Inline «qui»: segnaposto creato (ricordati di /setinlinefeedback su @BotFather)")
+    except Exception as e:
+        log(f"Inline «qui» NON attivo: non riesco a creare il segnaposto ({e}). Apri il bot in privato e premi Start.")
+
+
+def _risultato_qui(tipo: str, titolo: str, descrizione: str, file_id: str | None = None):
+    """Risultato inline modificabile (segnaposto + pulsante), o None se il segnaposto non c'è.
+    Con file_id mostra quella immagine (anteprima del post) al posto del segnaposto grigio."""
+    if not (file_id or _PLACEHOLDER_IDS.get(tipo)):
+        return None
+    return InlineQueryResultCachedPhoto(
+        id=f"{tipo}:{uuid.uuid4().hex[:12]}",
+        photo_file_id=file_id or _PLACEHOLDER_IDS[tipo],
+        title=titolo[:100],
+        description=descrizione[:100],
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ DOWNLOAD…", callback_data="ph")]]),
+    )
+
+
+_ANTEPRIME: dict = {}   # url -> task che restituisce il file_id della miniatura del post (o None)
+
+
+def _miniatura_url(url: str) -> str | None:
+    """URL della miniatura del post dai metadati di yt-dlp, senza scaricare il video."""
+    for sorg in [None] + sorgenti_cookie():
+        opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+                "socket_timeout": 10}
+        if sorg:
+            if sorg[0] == "file":
+                opts["cookiefile"] = sorg[1]
+            else:
+                opts["cookiesfrombrowser"] = (sorg[1],)
+        try:
+            with yt_dlp.YoutubeDL(opts) as y:
+                info = y.extract_info(url, download=False) or {}
+        except Exception:
+            continue
+        cand = [t.get("url") for t in reversed(info.get("thumbnails") or []) if t.get("url")]
+        buone = [u for u in cand if u.split("?")[0].lower().endswith((".jpg", ".jpeg", ".png"))]
+        u = (buone or [info.get("thumbnail")])[0]
+        if u:
+            return u
+    return None
+
+
+def _scarica_bytes(u: str) -> bytes:
+    req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read(10_000_000)
+
+
+async def _anteprima(bot, url: str) -> str | None:
+    """file_id della miniatura del post (caricata una volta in privato e cancellata), o None."""
+    try:
+        u = await asyncio.to_thread(_miniatura_url, url)
+        if not u:
+            return None
+        m = await bot.send_photo(OWNER, await asyncio.to_thread(_scarica_bytes, u))
+        fid = m.photo[-1].file_id
+        try:
+            await m.delete()
+        except Exception:
+            pass
+        return fid
+    except Exception as e:
+        log(f"  inline: anteprima non disponibile ({e})")
+        return None
+
+
+async def on_segnaposto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q:
+        await q.answer("Sto scaricando…")
+
+
+async def _media_inline(bot, path: Path, caption: str | None = None):
+    """Carica il file nella chat privata per ottenere un file_id e restituisce (InputMedia, messaggio privato).
+    Un messaggio inline può essere modificato solo con un file_id (o un URL), non con un upload."""
+    ext, size = path.suffix.lower(), path.stat().st_size
+    gif = ext in ANIM_EXT
+    if gif and size > MAX_FILE:
+        nuovo = await asyncio.to_thread(gif_to_mp4, path, int(MAX_FILE * 0.9))
+        if nuovo == path:
+            raise ValueError(f"{path.name} supera i 50 MB")
+        path, ext, size = nuovo, nuovo.suffix.lower(), nuovo.stat().st_size
+    if ext in VIDEO_EXT and size > MAX_FILE:
+        path = await asyncio.to_thread(compress_video, path, limite_bytes=MAX_FILE)
+        ext, size = path.suffix.lower(), path.stat().st_size
+        if size > MAX_FILE:
+            raise ValueError(f"{path.name} è ancora sopra i 50 MB")
+    log(f"    inline: preparo {path.name} ({mb(size)})")
+    with open(path, "rb") as f:
+        if gif:
+            m = await bot.send_animation(OWNER, f)
+            fid = (m.animation or m.document).file_id
+            return InputMediaAnimation(media=fid, caption=caption), m
+        if ext in VIDEO_EXT:
+            m = await bot.send_video(OWNER, f, supports_streaming=True)
+            if m.video:
+                return InputMediaVideo(media=m.video.file_id, supports_streaming=True, caption=caption), m
+            return InputMediaAnimation(media=m.animation.file_id, caption=caption), m
+        if ext in IMAGE_EXT and size <= MAX_PHOTO:
+            m = await bot.send_photo(OWNER, f)
+            return InputMediaPhoto(media=m.photo[-1].file_id, caption=caption), m
+    raise ValueError(f"{path.name}: formato o dimensione non adatti a un messaggio inline (immagini max 10 MB)")
+
+
+async def on_inline_scelto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Hai toccato «Scarica qui» / «Cerca qui»: scarico e sostituisco il segnaposto col file."""
+    r = update.chosen_inline_result
+    if not r or r.from_user.id != OWNER or not r.inline_message_id:
+        return
+    tipo = r.result_id.split(":")[0]
+    if tipo not in ("dl", "rc"):
+        return
+    iid = r.inline_message_id
+    t0 = time.time()
+    url, extra, privato, media = "", 0, None, None
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            if tipo == "dl":
+                urls = URL_RE.findall(r.query or "")
+                if not urls:
+                    raise ValueError("nessun link nella richiesta")
+                url = urls[0]
+                log(f"Inline «qui»: {url}")
+                e = _avvia_preparazione(ctx.bot, url)   # già in corso/finita se l'anteprima l'aveva avviata
+                barra = asyncio.create_task(_aggiorna_pulsante(ctx.bot, iid, e["av"]))
+                try:
+                    pronti = await asyncio.shield(e["task"])
+                finally:
+                    barra.cancel()
+                media = _input_media(pronti[0][0], pronti[0][1], url)
+                extra = (len(pronti) - 1) + (len(urls) - 1)
+            else:
+                cmd = _inline_comando(r.query or "")
+                if graves is None or not cmd:
+                    raise ValueError("Graves non è caricato: manca graves.py accanto a telegram_bot.py")
+                query, _ = graves.parse_richiesta(cmd[1])
+                log("Inline «qui»: ricerca immagini")
+                files = await asyncio.to_thread(graves.cerca_e_scarica, query, d, 1)
+            if media is None:
+                media, privato = await _media_inline(ctx.bot, files[0], caption=url or None)
+            await ctx.bot.edit_message_media(media=media, inline_message_id=iid)
+            log(f"  segnaposto sostituito in {time.time() - t0:.0f}s")
+        if extra:
+            await ctx.bot.send_message(OWNER, f"ℹ️ Un messaggio inline contiene un solo file: ne ho inviato 1, "
+                                              f"gli altri {extra} non sono partiti.")
+    except Exception as e:
+        log(f"  ERRORE inline «qui»: {e}")
+        try:
+            await ctx.bot.edit_message_caption(inline_message_id=iid, caption="⚠️ Non riuscito (dettagli in privato)")
+        except Exception as e2:
+            log(f"  segnaposto non aggiornato: {e2}")
+        testo = f"🍪 {e}" if isinstance(e, CookieError) else f"⚠️ {e}"
+        try:
+            await ctx.bot.send_message(OWNER, (testo + (f"\n{url}" if url else ""))[:4000])
+        except Exception as e3:
+            log(f"  non riesco a scrivere in privato: {e3}")
+    finally:
+        if privato is not None:   # la copia privata serviva solo per il file_id
+            try:
+                await privato.delete()
+            except Exception:
+                pass
+    for avviso in prendi_avvisi():
+        try:
+            await ctx.bot.send_message(OWNER, "⚠️ " + avviso)
+        except Exception:
+            pass
+
+
+async def log_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Diagnostica: una riga per ogni messaggio/post che arriva al bot (prima di qualsiasi filtro)."""
+    m = update.effective_message
+    if not m:
+        return
+    u = update.effective_user
+    log(f"ARRIVATO: {m.chat.type} «{m.chat.title or 'privata'}» da {u.id if u else '-'}: {(m.text or m.caption or '')[:50]!r}")
+
+
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log(f"ERRORE: {ctx.error}")
 
@@ -1907,6 +2599,12 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app):
     log(f"Bot avviato: @{app.bot.username}. In attesa di link…")
+    if AUTOUPDATE_ORE > 0:
+        threading.Thread(target=_ciclo_aggiornamento, name="autoupdate", daemon=True).start()
+        log(f"Aggiornamento automatico di yt-dlp e gallery-dl: ogni {AUTOUPDATE_ORE:g} h")
+    else:
+        log("Aggiornamento automatico di yt-dlp e gallery-dl: disattivato (AUTOUPDATE_ORE=0)")
+    await prepara_segnaposto(app.bot)
 
 
 def main():
@@ -1924,10 +2622,20 @@ def main():
         .post_init(post_init)
         .build()
     )
-    app.add_handler(InlineQueryHandler(handle_inline))
+    app.add_handler(TypeHandler(Update, log_update), group=-1)
+    app.add_handler(InlineQueryHandler(handle_inline, block=False))   # non blocca gli altri aggiornamenti mentre aspetta
+    app.add_handler(CommandHandler("url", cmd_url))
+    app.add_handler(CommandHandler("aggiorna", cmd_aggiorna))
     app.add_handler(CommandHandler("ricerca", cmd_ricerca))
     app.add_handler(CommandHandler("booru", cmd_booru))
     app.add_handler(CallbackQueryHandler(on_booru_scelta, pattern=r"^bo:"))
+    app.add_handler(   # group=1: gira in aggiunta a handle() (group 0), che ignora questi messaggi senza link
+        MessageHandler((filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST) & filters.TEXT,
+                       handle_comando_inline),
+        group=1,
+    )
+    app.add_handler(ChosenInlineResultHandler(on_inline_scelto))
+    app.add_handler(CallbackQueryHandler(on_segnaposto, pattern=r"^ph$"))
     app.add_handler(
         MessageHandler(
             (filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST)
@@ -1937,7 +2645,7 @@ def main():
         )
     )
     app.add_error_handler(on_error)
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
