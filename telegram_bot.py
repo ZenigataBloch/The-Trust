@@ -50,6 +50,13 @@ ti avvisa, aspetta tra un download e l'altro e si ferma al raggiungimento di un 
   IG_STATO_FILE                      contatore (default: instagram_uso.json accanto allo script)
 Sono stime prudenti, non limiti ufficiali di Instagram: regolale in base a ciò che vedi.
 
+Cache dei download: dopo un invio riuscito il bot ricorda i file_id di Telegram del link. Se rimandi lo
+stesso link (anche con parametri di tracciamento diversi, es. ?igsh=...) li rimanda senza riscaricare né
+ricaricare: niente yt-dlp/gallery-dl, niente conteggio Instagram. /riscarica <link> ignora la cache.
+  TG_CACHE_GIORNI   validità di una voce (default 30; 0 = cache disattivata)
+  TG_CACHE_FILE     dove la salva (default: download_cache.json accanto allo script)
+Vale per chat, gruppi, canali, /url e inline. I file_id valgono solo per lo stesso bot (cambi token = cache ignorata).
+
 Aggiornamento automatico di yt-dlp e gallery-dl (desktop e Android): all'avvio e poi ogni N ore il bot
 esegue "pip install -U yt-dlp gallery-dl" in background e ricarica yt-dlp senza riavviarsi. Aspetta la
 fine del download in corso. Se pip risponde "externally-managed" (Termux) riprova con
@@ -65,6 +72,7 @@ import atexit
 import contextvars
 import datetime
 import functools
+import hashlib
 import html
 import importlib
 import json
@@ -85,7 +93,7 @@ import traceback
 import zlib
 from importlib import metadata
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yt_dlp
 from telegram import (
@@ -158,6 +166,11 @@ INLINE_TAG = os.environ.get("INLINE_TAG") == "1"
 # 1 = l'inline propone anche «Scarica e pubblica» / «ricerca …» come testo: funziona SOLO nelle chat dove
 # il bot è presente. Di default 0: si propone solo «Scarica qui», che funziona dappertutto.
 INLINE_PUBBLICA = os.environ.get("INLINE_PUBBLICA") == "1"
+
+# Un messaggio inline contiene UN SOLO file (limite di Telegram: niente album). Se il post ne ha più d'uno
+# l'elenco propone in cima anche «📚 Album», che manda tutti i file come galleria: funziona SOLO nelle chat
+# dove il bot è presente (li pubblica lui, dalla cache). 0 = non proporlo.
+INLINE_ALBUM = os.environ.get("INLINE_ALBUM", "1") != "0"
 
 # Inline con anteprima: appena incolli il link il bot scarica; se finisce entro INLINE_ATTESA secondi
 # l'elenco mostra già il file vero (miniatura compresa) e toccandolo parte direttamente, senza segnaposto.
@@ -1274,6 +1287,97 @@ def download(url: str, folder: str) -> list[Path]:
         raise
 
 
+# ---------- cache dei file già inviati (file_id di Telegram) ----------
+CACHE_GIORNI = _int_env("TG_CACHE_GIORNI", 30)       # 0 = disattivata
+CACHE_FILE = Path(os.environ.get("TG_CACHE_FILE") or Path(__file__).resolve().with_name("download_cache.json"))
+CACHE_MAX_VOCI = 2000
+_CACHE_LOCK = threading.Lock()
+# parametri di tracciamento che non cambiano il contenuto del link
+_TRACK = {"igsh", "igshid", "_t", "_r", "_d", "is_from_webapp", "sender_device", "sender_web_id",
+          "share_app_id", "share_author_id", "share_link_id", "share_item_id", "share_id",
+          "si", "feature", "rdt", "context", "ref", "ref_source"}
+_TIPI_CACHE = ("photo", "video", "animation", "document")
+
+
+def chiave_url(url: str) -> str:
+    """Identificativo stabile del link: stesso post condiviso in modi diversi = stessa chiave."""
+    u = urlsplit(normalizza_url(url).strip())
+    host = u.netloc.lower().removeprefix("www.")
+    q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+         if k.lower() not in _TRACK and not k.lower().startswith("utm_")]
+    norm = urlunsplit(("https", host, u.path.rstrip("/"), urlencode(sorted(q)), ""))
+    return hashlib.sha1(norm.encode()).hexdigest()[:16]
+
+
+def _cache_carica() -> dict:
+    """Voci valide del bot corrente (i file_id di un altro token non servono)."""
+    try:
+        d = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        if d.get("bot") != TOKEN.split(":")[0]:
+            return {}
+        return d.get("voci", {})
+    except Exception:
+        return {}
+
+
+def _cache_scrivi(voci: dict):
+    try:
+        if len(voci) > CACHE_MAX_VOCI:      # tengo le più recenti
+            voci = dict(sorted(voci.items(), key=lambda kv: kv[1].get("t", 0))[-CACHE_MAX_VOCI:])
+        tmp = CACHE_FILE.with_name(f"{CACHE_FILE.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"bot": TOKEN.split(":")[0], "voci": voci}), encoding="utf-8")
+        os.replace(tmp, CACHE_FILE)
+    except OSError as e:
+        log(f"  cache non salvata ({e})")
+
+
+def cache_leggi(url: str) -> list | None:
+    """[[tipo, file_id, nome, byte], ...] di un link già inviato, oppure None (assente o scaduto)."""
+    if not CACHE_GIORNI:
+        return None
+    with _CACHE_LOCK:
+        voci = _cache_carica()
+        e = voci.get(chiave_url(url))
+        if not e:
+            return None
+        if time.time() - e.get("t", 0) > CACHE_GIORNI * 86400:
+            voci.pop(chiave_url(url), None)
+            _cache_scrivi(voci)
+            return None
+        f = e.get("f") or []
+        return f if f and all(len(x) == 4 and x[0] in _TIPI_CACHE for x in f) else None
+
+
+def cache_salva(url: str, file_list: list):
+    if not CACHE_GIORNI or not file_list:
+        return
+    with _CACHE_LOCK:
+        voci = _cache_carica()
+        voci[chiave_url(url)] = {"t": time.time(), "f": file_list}
+        _cache_scrivi(voci)
+
+
+def cache_elimina(url: str):
+    with _CACHE_LOCK:
+        voci = _cache_carica()
+        if voci.pop(chiave_url(url), None) is not None:
+            _cache_scrivi(voci)
+
+
+def voci_da_cache_invio(files: list[Path], cache: dict) -> list | None:
+    """Dal dict riempito da send_files: la lista da salvare, solo se TUTTI i file hanno un file_id."""
+    try:
+        return [[*cache[str(p)], p.name, p.stat().st_size] for p in files]
+    except (KeyError, OSError):
+        return None
+
+
+class CacheFallita(Exception):
+    def __init__(self, msg: str, parziale: bool):
+        super().__init__(msg)
+        self.parziale = parziale     # True: qualcosa è già stato inviato
+
+
 # ---------- invio ----------
 def _ffmpeg(cmd: list[str], cosa: str):
     """Esegue ffmpeg; se fallisce solleva un errore con le ultime righe di stderr (non il solo codice di uscita)."""
@@ -1631,6 +1735,33 @@ async def send_files(bot, chat_id, files: list[Path], cache: dict | None = None,
 
     return errors
 
+async def invia_da_cache(bot, chat_id, voci: list, caption: str | None = None, **kw):
+    """Rimanda per file_id i file già inviati. Se qualcosa non va solleva CacheFallita
+    (parziale=True se almeno un messaggio è già partito: in quel caso non si riscarica, per non duplicare)."""
+    caption = caption[:1024] if caption else None
+    kw_cap = {**kw, "caption": caption} if caption else kw
+    inviati = 0
+    album = [v for v in voci if v[0] in ("photo", "video")]
+    singoli = [v for v in voci if v[0] not in ("photo", "video")]
+    try:
+        for i in range(0, len(album), 10):
+            chunk = album[i:i + 10]
+            if len(chunk) == 1:
+                singoli.append(chunk[0])
+                continue
+            media = [InputMediaVideo(media=v[1], supports_streaming=True, caption=caption if j == 0 else None)
+                     if v[0] == "video" else InputMediaPhoto(media=v[1], caption=caption if j == 0 else None)
+                     for j, v in enumerate(chunk)]
+            await bot.send_media_group(chat_id, media, **kw)
+            inviati += len(chunk)
+            await asyncio.sleep(0.3)
+        for v in singoli:
+            await _invia_per_id(bot, chat_id, v[0], v[1], **kw_cap)
+            inviati += 1
+    except Exception as e:
+        raise CacheFallita(str(e), inviati > 0) from e
+
+
 async def report_from_channel(ctx: ContextTypes.DEFAULT_TYPE, channel_id: int, text: str):
     """Avviso in privato; se non è possibile, messaggio nel canale che si cancella da solo."""
     try:
@@ -1720,6 +1851,21 @@ async def cmd_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await processa_link(ctx, msg, chat, urls)
 
 
+async def cmd_riscarica(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/riscarica <link> (o in risposta a un messaggio col link): come /url ma ignora la cache."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not chat or not chat_comandi(chat) or not e_owner(user, "/riscarica"):
+        return
+    urls = URL_RE.findall(msg.text or "")
+    if not urls and msg.reply_to_message:
+        r = msg.reply_to_message
+        urls = URL_RE.findall(r.text or r.caption or "")
+    if not urls:
+        await msg.reply_text("Uso: /riscarica <link>  (oppure rispondi a un messaggio con un link)", **kw_topic(msg))
+        return
+    await processa_link(ctx, msg, chat, urls, ricarica=True)
+
+
 async def cmd_aggiorna(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/aggiorna: aggiorna subito yt-dlp e gallery-dl (di solito lo fa da solo ogni AUTOUPDATE_ORE)."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
@@ -1730,7 +1876,7 @@ async def cmd_aggiorna(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await stato.edit_text(("✅ " if ok else "⚠️ ") + esito)
 
 
-async def processa_link(ctx: ContextTypes.DEFAULT_TYPE, msg, chat, urls: list[str]):
+async def processa_link(ctx: ContextTypes.DEFAULT_TYPE, msg, chat, urls: list[str], ricarica: bool = False):
     """Scarica i link e pubblica i file in chat; poi cancella il messaggio di richiesta (tranne in privato)."""
     is_channel = chat.type == ChatType.CHANNEL
     is_private = chat.type == ChatType.PRIVATE
@@ -1747,6 +1893,18 @@ async def processa_link(ctx: ContextTypes.DEFAULT_TYPE, msg, chat, urls: list[st
     for n, url in enumerate(urls, 1):
         t0 = time.time()
         log(f"[{n}/{len(urls)}] {url}")
+        voci = None if ricarica else cache_leggi(url)
+        if voci:
+            try:
+                await invia_da_cache(ctx.bot, chat.id, voci, caption=url, **kw)
+                log(f"  CACHE: rimandati {len(voci)} file senza riscaricare ({time.time() - t0:.0f}s)")
+                continue
+            except CacheFallita as e:
+                log(f"  cache non utilizzabile ({e})")
+                if e.parziale:
+                    problems.append(f"{url}\nInvio dalla cache interrotto a metà: {e}\nRiprova con /riscarica")
+                    continue
+                cache_elimina(url)      # file_id non più validi: scarico di nuovo
         with tempfile.TemporaryDirectory() as d:
             try:
                 files = await asyncio.to_thread(download, url, d)
@@ -1760,7 +1918,11 @@ async def processa_link(ctx: ContextTypes.DEFAULT_TYPE, msg, chat, urls: list[st
                 continue
             files = [await rendi_riproducibile(p) for p in files]
             log(f"  trovati {len(files)} file, invio su Telegram…")
-            problems.extend(await send_files(ctx.bot, chat.id, files, caption=url, **kw))
+            ids: dict = {}
+            errs = await send_files(ctx.bot, chat.id, files, cache=ids, caption=url, **kw)
+            problems.extend(errs)
+            if not errs:
+                cache_salva(url, voci_da_cache_invio(files, ids))
         log(f"  completato in {time.time() - t0:.0f}s")
 
     if status:
@@ -1808,6 +1970,10 @@ async def _prepara_url(bot, url: str, av: dict) -> list:
     """Scarica l'url e carica i file nella chat privata per ottenere i file_id (poi cancella la copia)."""
     pronti = []
     _AVANZ.set(av)
+    gia = cache_leggi(url)
+    if gia and len(gia) <= 10 and all(v[0] in ("photo", "video", "animation") for v in gia):
+        log("  inline: file già in cache, nessun download")
+        return [tuple(v) for v in gia]
     with tempfile.TemporaryDirectory() as d:
         files = await asyncio.to_thread(download, url, d)
         if not files:
@@ -1829,6 +1995,8 @@ async def _prepara_url(bot, url: str, av: dict) -> list:
                 pronti.append((info[0], info[1], p.name, dim))
     if not pronti:
         raise ValueError("nessun file adatto a un messaggio inline")
+    if len(pronti) == len(files):       # in cache solo se completo
+        cache_salva(url, [list(v) for v in pronti])
     return pronti
 
 
@@ -1941,6 +2109,13 @@ async def handle_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
     else:
         risultati = [_risultato_file(n, *f, urls[0]) for n, f in enumerate(pronti)]
+        if INLINE_ALBUM and len(pronti) > 1:
+            risultati.insert(0, InlineQueryResultArticle(
+                id=uuid.uuid4().hex,
+                title=f"📚 Album ({len(pronti)} file) · solo nelle chat col bot",
+                description=urls[0][:80],
+                input_message_content=InputTextMessageContent(
+                    " ".join(urls) + (f" @{ctx.bot.username}" if INLINE_TAG else ""))))
         try:
             await q.answer(risultati, cache_time=0, is_personal=True)
         except Exception as err2:
@@ -2625,6 +2800,7 @@ def main():
     app.add_handler(TypeHandler(Update, log_update), group=-1)
     app.add_handler(InlineQueryHandler(handle_inline, block=False))   # non blocca gli altri aggiornamenti mentre aspetta
     app.add_handler(CommandHandler("url", cmd_url))
+    app.add_handler(CommandHandler("riscarica", cmd_riscarica))
     app.add_handler(CommandHandler("aggiorna", cmd_aggiorna))
     app.add_handler(CommandHandler("ricerca", cmd_ricerca))
     app.add_handler(CommandHandler("booru", cmd_booru))
