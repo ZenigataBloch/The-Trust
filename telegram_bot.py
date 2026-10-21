@@ -171,6 +171,12 @@ INLINE_PUBBLICA = os.environ.get("INLINE_PUBBLICA") == "1"
 # l'elenco propone in cima anche «📚 Album», che manda tutti i file come galleria: funziona SOLO nelle chat
 # dove il bot è presente (li pubblica lui, dalla cache). 0 = non proporlo.
 INLINE_ALBUM = os.environ.get("INLINE_ALBUM", "1") != "0"
+# Se l'account personale (Telethon) è collegato, «📚 Album» funziona in QUALSIASI chat: il bot manda l'album
+# a te in privato e il tuo account lo INOLTRA nella chat di destinazione. Su Telegram compare quindi come
+# «Inoltrato da <nome del bot>»: si vede che l'ha pubblicato il bot, non tu. Il messaggio inline col link
+# (riconoscibile dal segno ALBUM_MARK) viene cancellato. Senza account personale resta il vecchio
+# comportamento (l'album parte solo nelle chat dove c'è il bot).
+ALBUM_MARK = "📚 "
 
 # Inline con anteprima: appena incolli il link il bot scarica; se finisce entro INLINE_ATTESA secondi
 # l'elenco mostra già il file vero (miniatura compresa) e toccandolo parte direttamente, senza segnaposto.
@@ -1041,9 +1047,9 @@ def _ig_cooldown(motivo: str):
 
 
 # ---------- fonte: canali privati, con il TUO account personale (Telethon) ----------
-# Tenuto separato dal bot: il bot (BOT_TOKEN) pubblica e basta; l'account personale viene usato SOLO
-# per LEGGERE un post di un canale/gruppo privato di cui sei membro (link t.me/c/<id>/<post>), mai per
-# scrivere. Ha sessione, contatore, pausa e righe di log proprie ("[account personale]").
+# Tenuto separato dal bot: il bot (BOT_TOKEN) pubblica; l'account personale LEGGE i post di canali/gruppi
+# privati di cui sei membro (link t.me/c/<id>/<post>) e, solo per «📚 Album» inline, INOLTRA nella chat
+# l'album già inviato dal bot (compare come «Inoltrato da <bot>»). Ha sessione, contatore, pausa e righe di log proprie ("[account personale]").
 # Setup: TG_API_ID e TG_API_HASH (da my.telegram.org) in bots.env, poi  python telegram_login.py  una volta.
 _TG_PRIV_RE = re.compile(r"^https?://(?:www\.)?(?:t|telegram)\.me/c/(\d+)(?:/\d+)?/(\d+)(?:[/?#].*)?$", re.I)
 TG_API_ID = int(os.environ.get("TG_API_ID") or 0)
@@ -1128,7 +1134,7 @@ async def _tg_utente_client():
     return client
 
 
-def _tg_utente_esegui(descrizione: str, fabbrica):
+def _tg_utente_esegui(descrizione: str, fabbrica, scrive: bool = False):
     """Controlli, lock, pausa minima e contatore comuni a tutte le richieste dell'account personale.
     `fabbrica` è una funzione senza argomenti che restituisce la coroutine da eseguire."""
     _tg_ricarica()
@@ -1147,7 +1153,8 @@ def _tg_utente_esegui(descrizione: str, fabbrica):
         if attesa > 0:
             time.sleep(attesa)
         n = _tg_utente_conta()
-        log(f"  [account personale] richiesta n. {n} di oggi: {descrizione} (sola lettura)")
+        log(f"  [account personale] richiesta n. {n} di oggi: {descrizione} "
+            f"({'inoltro di un album del bot' if scrive else 'sola lettura'})")
         try:
             return asyncio.run(fabbrica())
         finally:
@@ -1828,6 +1835,8 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = msg.text or msg.caption or ""
     via_me = bool(msg.via_bot and msg.via_bot.id == ctx.bot.id)   # inviato con l'inline mode di questo bot
+    if via_me and text.startswith(ALBUM_MARK) and _album_utente_attivo():
+        return                      # l'album lo inoltra l'account personale (vedi _album_scelto)
     if needs_tag and not via_me and f"@{ctx.bot.username}".lower() not in text.lower():
         return
     urls = URL_RE.findall(text)
@@ -2068,6 +2077,110 @@ def _risultato_file(n: int, tipo: str, file_id: str, nome: str, dim: int, url: s
                                         description=url[:80])
 
 
+_ALBUM_ATTIVO = [0.0, False]
+
+
+def _album_utente_attivo() -> bool:
+    """True se l'account personale è configurato e collegato (si ricontrolla al massimo ogni 30 s)."""
+    ora = time.time()
+    if ora - _ALBUM_ATTIVO[0] > 30:
+        _tg_ricarica()
+        try:
+            import telethon  # noqa: F401
+            ok = bool(TG_API_ID and TG_API_HASH and Path(TG_SESSION + ".session").exists())
+        except ImportError:
+            ok = False
+        _ALBUM_ATTIVO[:] = [ora, ok]
+    return _ALBUM_ATTIVO[1]
+
+
+async def _album_inoltra(bot_id: int, bot_username: str, n: int, url: str) -> str:
+    """Con l'account personale: trova il messaggio inline appena inviato (ultime chat), vi inoltra gli ultimi
+    `n` messaggi ricevuti dal bot (l'album) e cancella il messaggio col link. Restituisce il nome della chat.
+    Gli id vanno letti dal lato dell'account personale: in privato non coincidono con quelli del bot."""
+    client = await _tg_utente_client()
+    try:
+        ids: list[int] = []
+        for _ in range(10):                         # l'album può impiegare un attimo ad arrivare
+            ultimi = await client.get_messages(bot_username, limit=n + 5)
+            ids = sorted(m.id for m in ultimi if m and not m.out and m.media)[-n:]
+            if len(ids) == n:
+                break
+            await asyncio.sleep(1)
+        else:
+            raise RuntimeError(f"nella chat col bot trovo solo {len(ids)} file su {n}")
+        for _ in range(10):                         # il messaggio inline può impiegare un attimo ad apparire
+            async for d in client.iter_dialogs(limit=20):
+                m = d.message
+                if (m and m.out and getattr(m, "via_bot_id", None) == bot_id
+                        and (m.message or "").startswith(ALBUM_MARK.strip()) and url in (m.message or "")):
+                    fwd = await client.forward_messages(d.entity, ids, from_peer=bot_username)
+                    fwd = [x for x in (fwd if isinstance(fwd, list) else [fwd]) if x]
+                    if not fwd:
+                        raise RuntimeError("Telegram non ha inoltrato nulla (chat con inoltro bloccato o "
+                                           "senza permessi di scrittura?)")
+                    try:
+                        await client.delete_messages(d.entity, [m.id])
+                    except Exception as e:
+                        log(f"  album: messaggio col link non cancellato ({e})")
+                    return d.name or str(d.id)
+            await asyncio.sleep(1)
+        raise RuntimeError("non trovo il messaggio inline che hai appena inviato (controlla che la chat sia "
+                           "tra le prime 20 e non archiviata)")
+    finally:
+        await client.disconnect()
+
+
+async def _album_scelto(ctx, r):
+    """Hai toccato «📚 Album»: il bot manda l'album a te in privato, il tuo account lo inoltra nella chat."""
+    bot = ctx.bot
+    inviati: list[int] = []
+    url = ""
+    try:
+        urls = URL_RE.findall(r.query or "")
+        if not urls:
+            raise ValueError("nessun link nella richiesta")
+        url = urls[0]
+        log(f"Inline «album»: {url}")
+        pronti = await asyncio.shield(_avvia_preparazione(bot, url)["task"])
+        foto_video = [v for v in pronti if v[0] in ("photo", "video")]
+        altri = [v for v in pronti if v[0] not in ("photo", "video")]
+        primo = True
+        for i in range(0, len(foto_video), 10):
+            chunk = foto_video[i:i + 10]
+            if len(chunk) == 1:
+                altri.insert(0, chunk[0])
+                continue
+            media = [_input_media(v[0], v[1], url if (primo and j == 0) else None) for j, v in enumerate(chunk)]
+            primo = False
+            msgs = await bot.send_media_group(OWNER, media)
+            inviati += [m.message_id for m in msgs]
+        for v in altri:
+            if v[0] == "video":
+                m = await bot.send_video(OWNER, v[1], caption=url if primo else None, supports_streaming=True)
+            elif v[0] == "animation":
+                m = await bot.send_animation(OWNER, v[1], caption=url if primo else None)
+            else:
+                m = await bot.send_photo(OWNER, v[1], caption=url if primo else None)
+            primo = False
+            inviati.append(m.message_id)
+        chat = await asyncio.to_thread(_tg_utente_esegui, f"album di {len(inviati)} file", 
+                                       lambda: _album_inoltra(bot.id, bot.username, len(inviati), url),
+                                       True)
+        log(f"  album inoltrato in «{chat}»")
+        for mid in inviati:                         # le copie private non servono più
+            try:
+                await bot.delete_message(OWNER, mid)
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"  ERRORE album: {e}")
+        try:
+            await bot.send_message(OWNER, (f"⚠️ Album non inoltrato: {e}" + (f"\n{url}" if url else ""))[:4000])
+        except Exception as e2:
+            log(f"  non riesco a scrivere in privato: {e2}")
+
+
 async def handle_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """@nomedelbot <link>: propone un risultato che, toccato, invia
     "<link> @nomedelbot" nella chat; poi lo gestisce handle()."""
@@ -2110,12 +2223,19 @@ async def handle_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         risultati = [_risultato_file(n, *f, urls[0]) for n, f in enumerate(pronti)]
         if INLINE_ALBUM and len(pronti) > 1:
-            risultati.insert(0, InlineQueryResultArticle(
-                id=uuid.uuid4().hex,
-                title=f"📚 Album ({len(pronti)} file) · solo nelle chat col bot",
-                description=urls[0][:80],
-                input_message_content=InputTextMessageContent(
-                    " ".join(urls) + (f" @{ctx.bot.username}" if INLINE_TAG else ""))))
+            if _album_utente_attivo():          # inoltrato dal tuo account: funziona in ogni chat
+                risultati.insert(0, InlineQueryResultArticle(
+                    id="al:" + uuid.uuid4().hex[:12],
+                    title=f"📚 Album ({len(pronti)} file) · inoltrato dal bot",
+                    description=urls[0][:80],
+                    input_message_content=InputTextMessageContent(ALBUM_MARK + urls[0])))
+            else:
+                risultati.insert(0, InlineQueryResultArticle(
+                    id=uuid.uuid4().hex,
+                    title=f"📚 Album ({len(pronti)} file) · solo nelle chat col bot",
+                    description=urls[0][:80],
+                    input_message_content=InputTextMessageContent(
+                        " ".join(urls) + (f" @{ctx.bot.username}" if INLINE_TAG else ""))))
         try:
             await q.answer(risultati, cache_time=0, is_personal=True)
         except Exception as err2:
@@ -2691,6 +2811,9 @@ async def _media_inline(bot, path: Path, caption: str | None = None):
 async def on_inline_scelto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Hai toccato «Scarica qui» / «Cerca qui»: scarico e sostituisco il segnaposto col file."""
     r = update.chosen_inline_result
+    if r and r.from_user.id == OWNER and r.result_id.startswith("al:"):
+        ctx.application.create_task(_album_scelto(ctx, r))      # non blocca gli altri aggiornamenti
+        return
     if not r or r.from_user.id != OWNER or not r.inline_message_id:
         return
     tipo = r.result_id.split(":")[0]
