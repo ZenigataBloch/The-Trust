@@ -93,7 +93,7 @@ import traceback
 import zlib
 from importlib import metadata
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yt_dlp
 from telegram import (
@@ -620,12 +620,14 @@ _SEGNI_LOGIN = ("log in for access", "login required", "log in to", "sign in to 
                 "authenticated cookies", "--cookies", "registered users", "nsfw",
                 "401 unauthorized", "http error 401",
                 "redirect to login", "login page", "accounts/login",
-                "could not authenticate", "authenticate you")   # X/Twitter: codice 32
+                "could not authenticate", "authenticate you",   # X/Twitter: codice 32
+                "blocked by network security")                  # Reddit: blocco delle richieste anonime
 
 
 def _esito_cookie(dettagli: str) -> str | None:
     """'non leggibile', 'login richiesto' o None se l'errore non c'entra con i cookie."""
-    d = dettagli.lower()
+    # "Unsupported URL" (yt-dlp) vuol dire solo che non conosce il link: non c'entra con i cookie
+    d = "\n".join(r for r in dettagli.lower().splitlines() if "unsupported url" not in r)
     if any(k in d for k in _SEGNI_ILLEGGIBILE):
         return "non leggibile"
     if any(k in d for k in _SEGNI_LOGIN):
@@ -672,6 +674,16 @@ def download_ytdlp(url: str, folder: str, sorgente: tuple[str, str] | None = Non
         else:
             opts["cookiesfrombrowser"] = (valore,)
 
+    host = urlsplit(url.strip()).netloc.lower()
+    if host.endswith("reddit.com") or host.endswith("redd.it"):
+        # Reddit risponde 403 all'impronta TLS di Python: con curl_cffi yt-dlp si presenta come Chrome
+        try:
+            import curl_cffi  # noqa: F401
+            from yt_dlp.networking.impersonate import ImpersonateTarget
+            opts["impersonate"] = ImpersonateTarget("chrome")
+        except Exception:
+            log("  Reddit: per evitare il 403 installa  pip install curl_cffi  (poi riavvia il bot)")
+
     with yt_dlp.YoutubeDL(opts) as y:
         info = y.extract_info(url, download=True)
 
@@ -687,6 +699,20 @@ def download_gallerydl(url: str, folder: str, sorgente: tuple[str, str] | None =
     if sorgente:
         tipo, valore = sorgente
         cmd += ["--cookies", valore] if tipo == "file" else ["--cookies-from-browser", valore]
+    # Reddit blocca le richieste anonime: con un client-id OAuth proprio gallery-dl usa l'API ufficiale
+    # (app "installed" da reddit.com/prefs/apps; REDDIT_CLIENT_ID in bots.env)
+    host = urlsplit(url.strip()).netloc.lower()
+    if host.endswith("reddit.com") or host.endswith("redd.it"):
+        cid = (os.environ.get("REDDIT_CLIENT_ID") or "").strip()
+        if cid:
+            cmd += ["-o", f"extractor.reddit.client-id={cid}",
+                    "-o", "extractor.reddit.user-agent="
+                          + os.environ.get("REDDIT_USER_AGENT", "python:telegram-bot:v1.0 (by /u/utente)")]
+        else:
+            # senza OAuth: i cookie bastano solo se la richiesta sembra un browser, non "Python/gallery-dl"
+            cmd += ["-o", "user-agent=" + os.environ.get("REDDIT_BROWSER_UA", _UA["User-Agent"])]
+            log("  Reddit: uso i cookie con User-Agent da browser"
+                + ("" if sorgente else " (ATTENZIONE: nessuna sorgente di cookie)"))
     cmd.append(url)
     proc = popen_nowin(
         cmd,
@@ -704,6 +730,7 @@ def download_gallerydl(url: str, folder: str, sorgente: tuple[str, str] | None =
             continue
         if line.startswith("[") or "error" in line.lower():
             last_err = line
+            log(f"    gallery-dl: {line[:220]}")
         elif not line.startswith("#"):
             n += 1
             av = _AVANZ.get()
@@ -725,8 +752,14 @@ _TW_HOSTS = {"twitter.com", "mobile.twitter.com", "m.twitter.com", "x.com", "fxt
 def normalizza_url(url: str) -> str:
     """I link di Twitter/X (anche fxtwitter, vxtwitter...) diventano https://x.com/... senza tracciamento."""
     u = urlsplit(url.strip())
-    if u.netloc.lower().removeprefix("www.") in _TW_HOSTS:
+    host = u.netloc.lower().removeprefix("www.")
+    if host in _TW_HOSTS:
         return urlunsplit(("https", "x.com", u.path.rstrip("/"), "", ""))
+    # reddit.com/media?url=<link codificato>: è solo un involucro, il file vero è i.redd.it/... (pubblico)
+    if host.endswith("reddit.com") and u.path.rstrip("/") == "/media":
+        interno = parse_qs(u.query).get("url")
+        if interno and interno[0].startswith(("http://", "https://")):
+            return interno[0]
     return url
 
 
@@ -745,10 +778,22 @@ def _scarica(url: str, folder: str, sorgente: tuple[str, str] | None) -> list[Pa
         righe = str(e).strip().splitlines()
         err_yt = righe[-1] if righe else "errore"
         log(f"  yt-dlp: {err_yt[:200]}")
+        m = re.search(r"https?://(?:www\.)?reddit\.com/media\?\S+", err_yt)
+        if m:   # il post di Reddit è un'immagine/GIF: yt-dlp ha trovato il file ma non lo scarica
+            interno = normalizza_url(m.group(0))
+            if interno != m.group(0) and _is_reddit_diretto(interno):
+                log(f"  il post è un file di i.redd.it: scarico {interno}")
+                try:
+                    files = download_reddit_diretto(interno, folder)
+                    if files:
+                        return files
+                except Exception as e2:
+                    log(f"  i.redd.it: download diretto non riuscito ({str(e2)[:150]})")
     log("  provo con gallery-dl…")
     try:
         return download_gallerydl(url, folder, sorgente)
     except Exception as e:
+        log(f"  gallery-dl: {str(e)[:300]}")
         raise DownloadError(str(e), dettagli=f"{err_yt}\n{e}") from None
 
 
@@ -786,6 +831,51 @@ def download_fxtwitter(url: str, folder: str) -> list[Path]:
     return collect_files(folder)
 
 
+def _is_reddit_diretto(url: str) -> bool:
+    """File pubblico di i.redd.it (immagine/GIF): non serve né login né yt-dlp."""
+    return urlsplit(url.strip()).netloc.lower() == "i.redd.it"
+
+
+def download_reddit_diretto(url: str, folder: str) -> list[Path]:
+    """Scarica un file di i.redd.it con una richiesta da \"immagine\" (con i cookie di COOKIES_FILE se c'è).
+    yt-dlp lo apre come pagina e Reddit lo rimanda a reddit.com/media?url=... (HTML): da lì Unsupported URL.
+    Si usa curl_cffi (impronta TLS di Chrome) se installato, altrimenti urllib."""
+    import http.cookiejar
+    nome = Path(urlsplit(url).path).name or "reddit_file"
+    dest = Path(folder) / nome
+    jar = http.cookiejar.MozillaCookieJar()
+    if COOKIES_FILE and Path(COOKIES_FILE).is_file():
+        try:
+            jar.load(COOKIES_FILE, ignore_discard=True, ignore_expires=True)
+        except Exception as e:
+            log(f"    cookies.txt non letto dal download diretto: {str(e)[:120]}")
+    headers = {**_UA,
+               "Accept": "image/avif,image/webp,image/apng,image/*,video/*,*/*;q=0.8",
+               "Referer": "https://www.reddit.com/"}
+    try:
+        from curl_cffi import requests as cr
+    except Exception:
+        cr = None
+    if cr is not None:
+        r = cr.get(url, headers=headers, impersonate="chrome", timeout=60, allow_redirects=True,
+                   cookies={c.name: c.value for c in jar if "redd" in c.domain} or None)
+        tipo = (r.headers.get("Content-Type") or "").lower()
+        log(f"    i.redd.it (curl_cffi): HTTP {r.status_code}, {tipo or 'tipo sconosciuto'}, url finale {str(r.url)[:100]}")
+        if r.status_code != 200 or tipo.startswith("text/html"):
+            raise RuntimeError(f"i.redd.it: HTTP {r.status_code}, {tipo or 'senza tipo'}")
+        dest.write_bytes(r.content)
+        return collect_files(folder)
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    with opener.open(urllib.request.Request(url, headers=headers), timeout=60) as r:
+        tipo = (r.headers.get("Content-Type") or "").lower()
+        log(f"    i.redd.it: HTTP {r.status}, {tipo or 'tipo sconosciuto'}, url finale {r.geturl()[:100]}")
+        if tipo.startswith("text/html"):
+            raise RuntimeError(f"i.redd.it ha risposto con una pagina HTML ({r.geturl()[:120]})")
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(r, f)
+    return collect_files(folder)
+
+
 def _download_cookie(url: str, folder: str) -> list[Path]:
     """Come _download_cookie_base, ma per Twitter/X se yt-dlp e gallery-dl falliscono prova fxtwitter."""
     try:
@@ -808,8 +898,18 @@ def _download_cookie_base(url: str, folder: str) -> list[Path]:
     Se tutte falliscono per colpa dei cookie solleva CookieError (MANCANTI / NON AGGIORNATI)."""
     nuovo = normalizza_url(url)
     if nuovo != url:
-        log(f"  link Twitter/X normalizzato: {nuovo}")
+        log(f"  link normalizzato: {nuovo}")
         url = nuovo
+
+    if _is_reddit_diretto(url):          # i.redd.it è pubblico: prima un download diretto, senza cookie
+        log("  i.redd.it: scarico direttamente il file…")
+        try:
+            files = download_reddit_diretto(url, folder)
+            if files:
+                return files
+            log("  i.redd.it: nessun file riconosciuto")
+        except Exception as e:
+            log(f"  i.redd.it: download diretto non riuscito ({str(e)[:150]}), provo yt-dlp/gallery-dl")
 
     sorgenti = sorgenti_cookie()
     fatti, ultimo = [], None

@@ -170,6 +170,10 @@ PAUSA_MAX = max(PAUSA_MIN, float(os.environ.get("INVII_PAUSA_MAX", "7")))
 EXTRA_OGNI = max(1, int(os.environ.get("INVII_EXTRA_OGNI", "10")))
 EXTRA_MIN, EXTRA_MAX = 15.0, 25.0          # pausa più lunga ogni EXTRA_OGNI messaggi
 LIMITE_SEC = 13 * 60                       # i token delle interazioni durano 15 minuti
+# Discord accetta al massimo 6 messaggi per comando: il primo (che sostituisce «sta pensando…») + 5 follow-up
+# (errore 40094). Il riepilogo finale è uno di questi, quindi ai link ne restano 5. Si può cambiare con
+# DISCORD_MAX_MSG in bots.env.
+MAX_MSG = max(1, int(os.environ.get("DISCORD_MAX_MSG", "5") or 5))
 RICONTROLLA = os.environ.get("INVII_RICONTROLLA", "1").strip() != "0"   # /invia ricontrolla la lista a fine giro
 AUTOSAVE_SEC = max(0.0, float(os.environ.get("INVII_AUTOSAVE_SEC", "30")))   # 0 = disattivato
 BACKUP_DIR = INVII_DIR / "backup"
@@ -1201,6 +1205,7 @@ def registra(client, owner: int, fit, batches):
         falliti: list[str] = []
         errore = None
         fermato = False
+        limite_msg = False                  # raggiunto il tetto di messaggi per comando
         stop_ig = None
         completato = False                  # True solo se il ciclo arriva in fondo senza interrompersi
 
@@ -1229,6 +1234,9 @@ def registra(client, owner: int, fit, batches):
                 for n, (riga, tipo, valori) in enumerate(coda, 1):
                     if time.time() - t0 > LIMITE_SEC:
                         fermato = True
+                        break
+                    if stat["pub"] >= MAX_MSG:     # Discord non accetta altri messaggi da questo comando
+                        limite_msg = True
                         break
                     scrivi_prog(n=n - 1, occupato=True,
                                 msg="messaggio di testo" if tipo == "testo"
@@ -1323,6 +1331,9 @@ def registra(client, owner: int, fit, batches):
             righe.append(f"⚠️ Interrotto da Discord: {errore}")
         if fermato:
             righe.append("⏸ Fermato per il limite di 15 minuti di Discord.")
+        if limite_msg:
+            righe.append(f"⏸ Fermato dopo {stat['pub']} messaggi: Discord ne accetta pochi per comando. "
+                         "Rilancia /invia per continuare.")
         if stop_ig:
             righe.append("⏸ " + stop_ig)
         avviso_ig = ig_avviso()
@@ -1334,9 +1345,10 @@ def registra(client, owner: int, fit, batches):
             righe.append(f"🔗 Questa chat è collegata a «{nome}»: la prossima volta basta /invia.")
         log(f"/invia «{nome}»: finito ({stat['pub']} messaggi, {len(falliti)} falliti)"
             + (f", interrotto da Discord: {errore}" if errore else "")
-            + (", fermato per il limite dei 15 minuti" if fermato else ""))
+            + (", fermato per il limite dei 15 minuti" if fermato else "")
+            + (", fermato per il limite di messaggi per comando" if limite_msg else ""))
 
-        tutto_ok = stat["pub"] > 0 and not (falliti or errore or fermato or stop_ig or avviso_ig)
+        tutto_ok = stat["pub"] > 0 and not (falliti or errore or fermato or limite_msg or stop_ig or avviso_ig)
         if tutto_ok:
             return   # è partito tutto: nessun messaggio di conferma (resta nel log)
 
@@ -1346,7 +1358,10 @@ def registra(client, owner: int, fit, batches):
                 await interaction.delete_original_response()
             except Exception:
                 pass
-        await interaction.followup.send("\n".join(righe)[:1900], ephemeral=True)
+        try:
+            await interaction.followup.send("\n".join(righe)[:1900], ephemeral=True)
+        except discord.DiscordException as e:
+            log(f"/invia «{nome}»: riepilogo non inviabile ({e}); resta nel log:\n" + "\n".join(righe))
 
 
     @client.tree.command(name="collega", description="Collega questa chat a una persona (poi basta /invia)")
