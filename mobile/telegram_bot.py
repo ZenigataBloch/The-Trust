@@ -454,7 +454,7 @@ def _scarica(url: str, folder: str, sorgente: tuple[str, str] | None) -> list[Pa
         raise DownloadError(str(e), dettagli=f"{err_yt}\n{e}") from None
 
 
-def download(url: str, folder: str) -> list[Path]:
+def _download_reale(url: str, folder: str) -> list[Path]:
     """Scarica provando le sorgenti di cookie in ordine (es. firefox, chrome, cookies.txt).
     Se tutte falliscono per colpa dei cookie solleva CookieError (MANCANTI / NON AGGIORNATI)."""
     nuovo = normalizza_url(url)
@@ -483,6 +483,33 @@ def download(url: str, folder: str) -> list[Path]:
                 fatti.append((nome, esito))
     sito = urlsplit(url).netloc.lower().removeprefix("www.")
     raise CookieError(_messaggio_cookie(sito, fatti, ultimo))
+
+
+_TRACK = {"igsh", "igshid", "_t", "_r", "_d", "is_from_webapp", "sender_device", "sender_web_id",
+          "share_app_id", "share_author_id", "share_link_id", "share_item_id", "share_id",
+          "si", "feature", "rdt", "context", "ref", "ref_source"}
+
+
+def chiave_url(url: str) -> str:
+    """Identificativo stabile del link: stesso post condiviso in modi diversi = stessa chiave."""
+    import hashlib
+    from urllib.parse import parse_qsl, urlencode
+    u = urlsplit(normalizza_url(url).strip())
+    host = u.netloc.lower().removeprefix("www.")
+    q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+         if k.lower() not in _TRACK and not k.lower().startswith("utm_")]
+    norm = urlunsplit(("https", host, u.path.rstrip("/"), urlencode(sorted(q)), ""))
+    return hashlib.sha1(norm.encode()).hexdigest()[:16]
+
+
+def download(url: str, folder: str, ricarica: bool = False) -> list[Path]:
+    """Punto d'ingresso dei download: cache condivisa + coda FIFO (coda_dl.py), poi _download_reale.
+    Stesso link già scaricato o in scarico da un'altra persona/bot: niente nuovo download."""
+    try:
+        import coda_dl
+    except ImportError:             # senza coda_dl.py si scarica come prima
+        return _download_reale(url, folder)
+    return coda_dl.scarica(url, folder, _download_reale, chiave_url(url), ricarica, log)
 
 
 # ---------- invio ----------

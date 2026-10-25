@@ -244,7 +244,7 @@ async def cmd_url(interaction: discord.Interaction, link: str, ricarica: bool = 
         with tempfile.TemporaryDirectory() as d:
             if not ready:
                 try:
-                    files = await asyncio.to_thread(download, url, d)
+                    files = await asyncio.to_thread(download, url, d, ricarica)
                 except Exception as e:
                     log(f"  ERRORE download: {e}")
                     problems.append(f"🍪 {e}\n{url}" if isinstance(e, CookieError) else f"{url}\n{e}")

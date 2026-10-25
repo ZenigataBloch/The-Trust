@@ -74,13 +74,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime
+import hashlib
 import ipaddress
 import json
 import os
 import random
 import re
+import shutil
 import socket
 import struct
+import tempfile
 import threading
 import time
 import urllib.error
@@ -653,14 +656,34 @@ class PostBooru:
     def scarica(self, cartella: Path, i: int = 0) -> Path:
         """Scarica il file completo (SSRF e redirect controllati come per le immagini di Google)."""
         mb = _int_env("GRAVES_BOORU_MAX_MB", 100) or 100
-        base, ref = Path(cartella) / f"booru_{i:02d}", _SITI[self.sito]["referer"]
+        cartella = Path(cartella)
+        base, ref = cartella / f"booru_{i:02d}", _SITI[self.sito]["referer"]
+
+        def reale(_url, folder) -> list[Path]:
+            b = Path(folder) / base.name
+            try:
+                return [_scarica_media(self.url, b, ref, mb * 1024 * 1024, solo_immagini=False)]
+            except Exception as e:
+                if not self.alt:
+                    raise
+                log(f"    Graves: {self.etichetta()}: file principale non scaricato ({e}), provo la versione ridotta")
+                return [_scarica_media(self.alt, b, ref, mb * 1024 * 1024, solo_immagini=False)]
+
         try:
-            return _scarica_media(self.url, base, ref, mb * 1024 * 1024, solo_immagini=False)
-        except Exception as e:
-            if not self.alt:
-                raise
-            log(f"    Graves: {self.etichetta()}: file principale non scaricato ({e}), provo la versione ridotta")
-            return _scarica_media(self.alt, base, ref, mb * 1024 * 1024, solo_immagini=False)
+            import coda_dl
+        except ImportError:                 # senza coda_dl.py si scarica come prima
+            return reale(None, cartella)[0]
+        # cache condivisa (stesso post già scaricato da /booru, anche da un altro bot): niente nuova richiesta.
+        # Niente coda FIFO: i file booru partono in parallelo all'anteprima, non devono aspettare yt-dlp.
+        tmp = Path(tempfile.mkdtemp(dir=cartella))
+        try:
+            chiave = hashlib.sha1(("booru:" + self.url).encode()).hexdigest()[:16]
+            f = coda_dl.scarica(self.url, str(tmp), reale, chiave, False, log, coda=False)[0]
+            dest = cartella / (base.name + f.suffix)
+            os.replace(f, dest)
+            return dest
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _post(sito, id_, url, anteprime, tags, score, alt=""):

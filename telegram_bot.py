@@ -1367,8 +1367,8 @@ def download_telegram_storia(url: str, folder: str) -> list[Path]:
     return files
 
 
-def download(url: str, folder: str) -> list[Path]:
-    """Punto d'ingresso dei download. Per i link Instagram aggiunge la protezione (conteggio, avviso,
+def _download_reale(url: str, folder: str) -> list[Path]:
+    """Download vero e proprio (usato da download()). Per i link Instagram aggiunge la protezione (conteggio, avviso,
     pausa minima, tetti e pausa dopo una segnalazione); poi scarica con _download_cookie."""
     if _is_telegram_storia(url):        # storia di Telegram: account personale, in sola lettura
         return download_telegram_storia(url, folder)
@@ -1392,6 +1392,16 @@ def download(url: str, folder: str) -> list[Path]:
                 raise IgLimite(f"Instagram ha segnalato troppe richieste o attività sospetta: lo metto in pausa "
                                f"per {IG_COOLDOWN_MIN} min. Dettaglio: {riga[:150]}") from e
         raise
+
+
+def download(url: str, folder: str, ricarica: bool = False) -> list[Path]:
+    """Punto d'ingresso dei download: cache condivisa + coda FIFO (coda_dl.py), poi _download_reale.
+    Stesso link già scaricato o in scarico da un'altra persona/bot: niente nuovo download."""
+    try:
+        import coda_dl
+    except ImportError:             # senza coda_dl.py si scarica come prima
+        return _download_reale(url, folder)
+    return coda_dl.scarica(url, folder, _download_reale, chiave_url(url), ricarica, log)
 
 
 # ---------- cache dei file già inviati (file_id di Telegram) ----------
@@ -2016,7 +2026,7 @@ async def processa_link(ctx: ContextTypes.DEFAULT_TYPE, msg, chat, urls: list[st
                 cache_elimina(url)      # file_id non più validi: scarico di nuovo
         with tempfile.TemporaryDirectory() as d:
             try:
-                files = await asyncio.to_thread(download, url, d)
+                files = await asyncio.to_thread(download, url, d, ricarica)
             except Exception as e:
                 log(f"  ERRORE download: {e}")
                 problems.append(f"🍪 {e}\n{url}" if isinstance(e, CookieError) else f"{url}\n{e}")
