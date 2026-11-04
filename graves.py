@@ -908,9 +908,10 @@ def _redgifs(tags: list, quanti: int, casuale: bool) -> list:
     nomi = [t.replace("_", " ") for t in positivi]
     if not nomi:
         raise GravesErrore("RedGifs: serve almeno un tag in positivo (le sole esclusioni -tag non bastano).")
-    varianti = [{"search_text": " ".join("#" + n for n in nomi)},
-                {"search_text": " ".join(nomi)},
-                {"search_text": " ".join(nomi), "tags": ",".join(n.title() for n in nomi)}]
+    # Il sito usa il parametro "query" (verificato dalle richieste del browser): "search_text" viene ignorato.
+    varianti = [{"query": " ".join("#" + n for n in nomi)},
+                {"query": " ".join(nomi)},
+                {"query": " ".join(nomi), "type": "g"}]
     o = _env("GRAVES_RG_ORDINE", "trending").lower()
     ordine = o if o in _RG_ORDINI else "trending"
     max_pag = max(1, min(8, _int_env("GRAVES_RG_PAGINE", 3) or 3))
