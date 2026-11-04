@@ -37,30 +37,32 @@ Altre variabili (tutte opzionali):
                       (default 80; 0 = nessun tetto). I tetti scelti dalle interfacce (IMPOSTAZIONI -> Tetto,
                       salvati in graves_uso.json sotto "tetti") hanno la precedenza e valgono subito
   GRAVES_STATO_FILE   contatore (default: graves_uso.json accanto allo script)
+  GRAVES_CA_FILE      certificato radice (.pem o .crt) da fidarsi per l'HTTPS. Serve solo se un antivirus
+                      o un proxy intercetta le connessioni con un certificato proprio (errore
+                      CERTIFICATE_VERIFY_FAILED). La verifica resta sempre attiva
 
 Sicurezza: gli URL delle immagini arrivano da pagine web qualsiasi. Prima di scaricarli (e a ogni
 redirect) controllo che l'indirizzo sia pubblico: niente localhost, rete di casa o indirizzi interni.
 Le chiavi API non finiscono mai nei messaggi di errore né nel log.
 
 BOORU (modulo per tag su rule34.xxx e siti simili)
-  telegram_bot.py   /booru <tag> [-n 1-5] [-s r34|gb|db|e621|rg] [-r]
+  telegram_bot.py   /booru <tag> [-n 1-5] [-s r34|db|e621|rg] [-r]
   discord_bot.py    /booru tag:<tag> sito:<...> quante:<1-5> casuale:<si/no>
 Per ogni risultato arriva prima l'ANTEPRIMA (immagine leggera con sito, id, tipo, punteggio e link al post)
 e poi il file completo (immagine, gif o video). L'anteprima e il file si scaricano in parallelo.
 Tag: separati da spazio (hatsune_miku solo -cat) oppure da virgola se hanno spazi (hatsune miku, solo).
--n quanti risultati (default 3, max 5), -s il sito, -r risultati casuali invece dei più recenti.
+-n quanti risultati (default 3, max 5), -s il sito (senza -s: tutti i siti, a turno), -r risultati casuali invece dei più recenti.
 RedGifs (-s rg): nessuna chiave. I tag sono testo libero (hatsune_miku diventa 'hatsune miku') e le
 esclusioni -tag vengono applicate in locale ai risultati. Il token ospite resta in graves_redgifs_token.json.
 Variabili RedGifs (opzionali): GRAVES_RG_ORDINE = trending (default), latest, top, top28, best, oldest;
 GRAVES_RG_PAGINE = quante pagine di risultati scorrere per trovare abbastanza post con tutti i tag (default 3,
 massimo 8). Le risposte dell'API restano in memoria 5 minuti (il tasto «altro» non rifà le richieste).
-Chiavi in bots.env (rule34.xxx e Gelbooru NON funzionano senza: l'API vuole account e chiave):
+Chiavi in bots.env (rule34.xxx NON funziona senza: l'API vuole account e chiave):
   GRAVES_R34_KEY, GRAVES_R34_USER            rule34.xxx (Account -> Options -> API Access Credentials)
-  GRAVES_GELBOORU_KEY, GRAVES_GELBOORU_USER  Gelbooru
   GRAVES_DANBOORU_USER, GRAVES_DANBOORU_KEY  Danbooru (facoltative; senza, max 2 tag per ricerca)
   GRAVES_E621_USER, GRAVES_E621_KEY          e621 (facoltative; GRAVES_E621_UA per lo user-agent)
 Altre variabili (opzionali):
-  GRAVES_BOORU_SITO        sito di default (default r34)
+  GRAVES_BOORU_SITO        sito di default (default tutti: cerca su tutti i siti; oppure r34, db, e621, rg)
   GRAVES_BOORU_RISULTATI   quanti di default (default 3, massimo 5)
   GRAVES_BOORU_MAX_MB      non scarica file più grandi di così (default 100; poi i bot comprimono)
   GRAVES_BOORU_ANTEPRIMA   0 = niente anteprima, manda solo il file
@@ -70,6 +72,13 @@ li hanno vengono scartati. Su Discord il comando gira solo in DM, gruppi privati
 Il tetto GRAVES_MAX_GIORNO vale anche qui (contato a parte per ogni sito).
 """
 from __future__ import annotations
+
+# Usa i certificati fidati di Windows (incluso quello dell'antivirus): vedi HANDOVER_gelbooru_ssl.md
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
 
 import asyncio
 import base64
@@ -82,6 +91,7 @@ import random
 import re
 import shutil
 import socket
+import ssl
 import struct
 import tempfile
 import threading
@@ -292,11 +302,42 @@ def uso_azzera(provider: str | None = None, path=None):
 
 
 # ---------- provider ----------
+def _cf_bloccato(corpo: str) -> bool:
+    basso = (corpo or "").lower()
+    return "just a moment" in basso or "challenge-platform" in basso
+
+
+def _cloudflare_fallback(nome: str, req: urllib.request.Request, timeout: int, grezzo: bool):
+    """Cloudflare blocca urllib (pagina 'Just a moment...'). Con curl_cffi installato ripeto la richiesta
+    imitando Chrome (stesso TLS dei browser); senza, spiego cosa installare."""
+    try:
+        from curl_cffi import requests as cc
+    except ImportError:
+        raise GravesErrore(f"{nome}: bloccato dalla protezione Cloudflare. Installa curl_cffi "
+                           "(pip install curl_cffi) e riavvia i bot.") from None
+    intestazioni = {k: v for k, v in req.headers.items() if k.lower() != "user-agent"}
+    try:
+        r = cc.get(req.full_url, headers=intestazioni, impersonate="chrome", timeout=timeout)
+    except Exception as e:
+        raise GravesErrore(f"{nome}: servizio non raggiungibile ({e})") from None
+    if _cf_bloccato(r.text):
+        raise GravesErrore(f"{nome}: bloccato da Cloudflare anche con curl_cffi (HTTP {r.status_code}). "
+                           "Riprova più tardi o da un'altra rete.")
+    if r.status_code != 200:
+        raise GravesErrore(f"{nome}: errore HTTP {r.status_code}.")
+    if grezzo:
+        return r.text
+    try:
+        return json.loads(r.text)
+    except json.JSONDecodeError:
+        raise GravesErrore(f"{nome}: risposta non valida") from None
+
+
 def _http_json(nome: str, req: urllib.request.Request, timeout: int = 20, grezzo: bool = False):
     """Esegue la richiesta e restituisce il JSON. Gli errori non contengono mai l'URL (che per alcuni
     provider include la chiave API)."""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as r:
             testo = r.read().decode("utf-8", "replace")
             return testo if grezzo else json.loads(testo)
     except urllib.error.HTTPError as e:
@@ -308,13 +349,20 @@ def _http_json(nome: str, req: urllib.request.Request, timeout: int = 20, grezzo
         basso = corpo.lower()
         if e.code == 429 or "limitexceeded" in basso or "quota" in basso or "credits" in basso:
             raise GravesErrore(f"{nome}: quota o limite di richieste esaurito. {dett}".strip()) from None
+        if _cf_bloccato(corpo):
+            return _cloudflare_fallback(nome, req, timeout, grezzo)
         if e.code in (401, 403):
             raise GravesErrore(f"{nome}: chiave rifiutata (HTTP {e.code}). {dett}".strip()) from None
         raise GravesErrore(f"{nome}: errore HTTP {e.code}. {dett}".strip()) from None
     except json.JSONDecodeError:
         raise GravesErrore(f"{nome}: risposta non valida") from None
     except OSError as e:     # URLError, timeout, rete assente
-        raise GravesErrore(f"{nome}: servizio non raggiungibile ({getattr(e, 'reason', e)})") from None
+        motivo = getattr(e, 'reason', e)
+        if 'CERTIFICATE_VERIFY_FAILED' in str(motivo):
+            raise GravesErrore(f"{nome}: certificato HTTPS non riconosciuto (probabile antivirus o proxy che "
+                               "intercetta le connessioni). Metti in bots.env GRAVES_CA_FILE con il certificato "
+                               "radice di quel programma e riavvia i bot.") from None
+        raise GravesErrore(f"{nome}: servizio non raggiungibile ({motivo})") from None
 
 
 def _serper(query: str, quanti: int) -> list[Risultato]:
@@ -439,7 +487,19 @@ class _Redirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_OPENER = urllib.request.build_opener(_Redirect)
+def _ssl_context():
+    """Contesto TLS: di default quello di sistema; con GRAVES_CA_FILE si fida anche di quel certificato."""
+    ca = _env("GRAVES_CA_FILE")
+    if not ca:
+        return None
+    try:
+        return ssl.create_default_context(cafile=ca)
+    except (OSError, ssl.SSLError) as e:
+        log(f"  Graves: GRAVES_CA_FILE non utilizzabile ({e}), uso i certificati di sistema")
+        return None
+
+
+_OPENER = urllib.request.build_opener(_Redirect, urllib.request.HTTPSHandler(context=_ssl_context()))
 
 
 def _estensione(testa: bytes) -> str | None:
@@ -585,7 +645,7 @@ def cerca_e_scarica(query: str, cartella: str | Path, n: int | None = None) -> l
 _IMG_EXT = {"jpg", "jpeg", "png", "gif", "webp"}
 _VID_EXT = {"mp4", "webm"}
 MAX_BOORU = 5
-USO_BOORU = "Uso: /booru <tag> [-n 1-5] [-s r34|gb|db|e621|rg] [-r]"
+USO_BOORU = "Uso: /booru <tag> [-n 1-5] [-s tutti|r34|db|e621|rg] [-r]"
 
 # Tag che riguardano minori. Elenco FISSO e non disattivabile: una ricerca che li contiene viene rifiutata
 # e i post che li hanno vengono scartati dai risultati (si può solo ampliare con GRAVES_BOORU_BLACKLIST).
@@ -628,6 +688,7 @@ class RichiestaBooru:
     n: int
     sito: str
     casuale: bool = False
+    frase: bool = False         # parole senza virgola: su RedGifs sono un nome solo
 
 
 @dataclass
@@ -734,7 +795,7 @@ def _credenziali(k: str, u: str) -> tuple:
 
 
 def _dapi(nome: str, base: str, k: str, u: str, tags: list, quanti: int, casuale: bool) -> list:
-    """API 'dapi' (rule34.xxx e Gelbooru). Prima chiede con le esclusioni dei tag vietati lato server; se non
+    """API 'dapi' (rule34.xxx). Prima chiede con le esclusioni dei tag vietati lato server; se non
     esce niente (alcuni siti rispondono vuoto con troppi tag) riprova senza: il filtro locale resta sempre."""
     k, u = _credenziali(k, u)
 
@@ -761,16 +822,6 @@ def _r34(tags: list, quanti: int, casuale: bool) -> list:
     return [_post("r34", i.get("id"), i.get("file_url"), (i.get("sample_url"), i.get("preview_url")),
                   i.get("tags"), i.get("score"))
             for i in _dapi("rule34.xxx", "https://api.rule34.xxx/index.php", k, u, tags, quanti, casuale)]
-
-
-def _gelbooru(tags: list, quanti: int, casuale: bool) -> list:
-    k, u = _env("GRAVES_GELBOORU_KEY"), _env("GRAVES_GELBOORU_USER")
-    if not (k and u):
-        raise GravesErrore("Gelbooru vuole una chiave API: metti GRAVES_GELBOORU_KEY e GRAVES_GELBOORU_USER "
-                           "in bots.env (dal sito: Account → Options) e riavvia i bot.")
-    return [_post("gelbooru", i.get("id"), i.get("file_url"), (i.get("sample_url"), i.get("preview_url")),
-                  i.get("tags"), i.get("score"))
-            for i in _dapi("Gelbooru", "https://gelbooru.com/index.php", k, u, tags, quanti, casuale)]
 
 
 def _danbooru(tags: list, quanti: int, casuale: bool) -> list:
@@ -896,9 +947,27 @@ def _redgifs(tags: list, quanti: int, casuale: bool) -> list:
             _RG_CACHE[chiave] = (time.time(), gifs, pagine)
         return gifs, pagine
 
+    budget = [60]      # richieste di dettaglio per ricerca: la lista di ricerca spesso non ha tag e descrizione
+
+    def completa(gif: dict) -> dict:
+        """Se la lista di ricerca non porta tag, niche, creator o descrizione, chiedo il dettaglio del singolo video."""
+        if gif.get("tags") or gif.get("niches") or gif.get("description") or budget[0] <= 0:
+            return gif
+        budget[0] -= 1
+        time.sleep(0.15)                       # il limite di RedGifs e' al secondo
+        try:
+            d = _http_json("RedGifs", urllib.request.Request(
+                "https://api.redgifs.com/v2/gifs/" + urllib.parse.quote(str(gif.get("id") or "")),
+                headers={**_RG_H, "Authorization": "Bearer " + _rg_token()}), 25)
+        except GravesErrore:
+            return gif
+        dett = d.get("gif") if isinstance(d, dict) else None
+        return {**gif, **dett} if isinstance(dett, dict) else gif
+
     def filtra(gifs: list) -> list:
         out = []
         for gif in gifs:
+            gif = completa(gif)
             u = gif.get("urls") or {}
             tag = [str(x).lower().replace(" ", "_") for x in gif.get("tags") or []]
             niche = [str(x).lower().replace(" ", "_") for x in gif.get("niches") or [] if isinstance(x, str)]
@@ -935,7 +1004,8 @@ def _redgifs(tags: list, quanti: int, casuale: bool) -> list:
                 break
             pagina += 1
         riuscite += ok
-        log(f"    Graves: RedGifs variante {i}/{len(varianti)}: {letti} risultati letti, {len(out)} con tutti i tag")
+        log(f"    Graves: RedGifs variante {i}/{len(varianti)}: {letti} risultati letti, {len(out)} con tutti i tag, "
+            f"dettagli richiesti {60 - budget[0]}")
         if out:
             break
     if not riuscite and ultimo:
@@ -948,8 +1018,6 @@ def _redgifs(tags: list, quanti: int, casuale: bool) -> list:
 _SITI = {
     "r34": {"nome": "rule34", "cerca": _r34, "referer": "https://rule34.xxx/",
             "link": "https://rule34.xxx/index.php?page=post&s=view&id={id}"},
-    "gelbooru": {"nome": "gelbooru", "cerca": _gelbooru, "referer": "https://gelbooru.com/",
-                 "link": "https://gelbooru.com/index.php?page=post&s=view&id={id}"},
     "danbooru": {"nome": "danbooru", "cerca": _danbooru, "referer": "https://danbooru.donmai.us/",
                  "link": "https://danbooru.donmai.us/posts/{id}"},
     "redgifs": {"nome": "redgifs", "cerca": _redgifs, "referer": "https://www.redgifs.com/",
@@ -957,14 +1025,14 @@ _SITI = {
     "e621": {"nome": "e621", "cerca": _e621, "referer": "https://e621.net/",
              "link": "https://e621.net/posts/{id}"},
 }
-_ALIAS_SITI = {"r34": "r34", "rule34": "r34", "gb": "gelbooru", "gelbooru": "gelbooru",
+_ALIAS_SITI = {"r34": "r34", "rule34": "r34",
                "db": "danbooru", "danbooru": "danbooru", "e621": "e621", "e6": "e621",
                "rg": "redgifs", "redgifs": "redgifs", "redgif": "redgifs"}
 
 
 # ---------- richiesta ----------
 def parse_booru(testo: str, n: int | None = None, sito: str | None = None, casuale: bool = False) -> RichiestaBooru:
-    """'hatsune_miku solo -n 2 -s gb -r' -> tag, 2 risultati, gelbooru, casuali. Se c'è una virgola i tag
+    """'hatsune_miku solo -n 2 -s db -r' -> tag, 2 risultati, danbooru, casuali. Se c'è una virgola i tag
     sono separati da virgole e gli spazi diventano _ ('hatsune miku, solo'). Solleva GravesErrore."""
     toks = "".join(c for c in (testo or "") if c.isprintable() or c.isspace()).split()
     resto, i = [], 0
@@ -996,19 +1064,51 @@ def parse_booru(testo: str, n: int | None = None, sito: str | None = None, casua
         raise GravesErrore(USO_BOORU)
     if any(tag_vietato(t) for t in tags if not t.startswith("-")):
         raise GravesErrore("Ricerca non eseguita: contiene tag che riguardano minori.")
-    nome = _ALIAS_SITI.get((sito or _env("GRAVES_BOORU_SITO", "r34")).strip().lower())
+    scelto = (sito or _env("GRAVES_BOORU_SITO", "tutti")).strip().lower()
+    nome = "tutti" if scelto in ("tutti", "tutto", "all", "*") else _ALIAS_SITI.get(scelto)
     if not nome:
-        raise GravesErrore("Sito non valido: usa r34, gelbooru (gb), danbooru (db), e621 o redgifs (rg).")
+        raise GravesErrore("Sito non valido: usa tutti, r34, danbooru (db), e621 o redgifs (rg).")
     if nome == "redgifs" and "," not in riga:       # su RedGifs "lisa ann" e' un nome solo, non due tag
         pos = [t.lstrip("~") for t in tags if not t.startswith("-")]
         if len(pos) > 1:
             tags = ["_".join(pos)] + [t for t in tags if t.startswith("-")]
     n = max(1, min(MAX_BOORU, n or _int_env("GRAVES_BOORU_RISULTATI", 3) or 3))
-    return RichiestaBooru(tags=tags, n=n, sito=nome, casuale=bool(casuale))
+    frase = nome == "tutti" and "," not in riga and len([t for t in tags if not t.startswith("-")]) > 1
+    return RichiestaBooru(tags=tags, n=n, sito=nome, casuale=bool(casuale), frase=frase)
+
+
+_TUTTI_SITI = ("r34", "danbooru", "e621", "redgifs")
+
+
+def _cerca_tutti(rich: RichiestaBooru) -> list:
+    """Sito non specificato: cerca su tutti i siti e alterna i risultati (uno per sito a turno). Un sito che
+    fallisce (chiavi mancanti, tetto, rete) viene saltato e non blocca gli altri."""
+    liste, errori = [], []
+    for s in _TUTTI_SITI:
+        try:
+            tags = list(rich.tags)
+            if s == "redgifs" and rich.frase:      # stesso trattamento della ricerca solo su RedGifs
+                pos = [t for t in tags if not t.startswith("-")]
+                tags = ["_".join(pos)] + [t for t in tags if t.startswith("-")]
+            liste.append(booru_cerca(RichiestaBooru(tags=tags, n=rich.n, sito=s, casuale=rich.casuale)))
+        except GravesErrore as e:
+            errori.append(str(e))
+            log(f"  Graves: {_SITI[s]['nome']} saltato: {e}")
+    if not liste:
+        raise GravesErrore("Nessun sito ha dato risultati: " + " | ".join(errori))
+    out, visti = [], set()
+    for giro in range(max(len(x) for x in liste)):
+        for lista in liste:
+            if giro < len(lista) and (lista[giro].sito, lista[giro].id) not in visti:
+                visti.add((lista[giro].sito, lista[giro].id))
+                out.append(lista[giro])
+    return out
 
 
 def booru_cerca(rich: RichiestaBooru) -> list:
     """Candidati (circa 4 volte n: alcuni file non si scaricheranno), senza i post con tag vietati."""
+    if rich.sito == "tutti":
+        return _cerca_tutti(rich)
     _conta(f"booru-{rich.sito}")
     quanti = min(40, max(rich.n * 4, 10))
     log(f"  Graves: cerco su {_SITI[rich.sito]['nome']} (voglio {rich.n}"
