@@ -27,7 +27,7 @@ Variabili d'ambiente:
   COOKIES_FILE       (opzionale) cookies.txt, provato per ultimo
   DISCORD_MAX_MB     (opzionale) limite upload, default 20
   DISCORD_CACHE_DIR  (opzionale) cartella della cache, default ~/.cache/discord_bot
-  DISCORD_CACHE_MAX_MB (opzionale) tetto della cache, default 500
+  DISCORD_CACHE_MAX_MB (opzionale) tetto della cache, default 1536 (1.5 GB); sopra, la cache viene svuotata
 
 Ricerca immagini su Google (modulo Graves, graves.py): /ricerca query:<testo> quante:<1-10>
 Serve una chiave di un provider in bots.env (GRAVES_SERPER_KEY, GRAVES_SERPAPI_KEY o
@@ -93,7 +93,7 @@ LIMITE_SEC = 13 * 60   # il token di una risposta slash dura 15 minuti: mi fermo
 
 # cache su disco dei file già pronti (separata da tmp: non viene svuotata dalla pulizia)
 CACHE_DIR = Path(os.environ.get("DISCORD_CACHE_DIR") or Path.home() / ".cache" / "discord_bot")
-CACHE_MAX = int(float(os.environ.get("DISCORD_CACHE_MAX_MB", "500")) * 1024 * 1024)
+CACHE_MAX = int(float(os.environ.get("DISCORD_CACHE_MAX_MB", "1536")) * 1024 * 1024)   # 1.5 GB
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 for _t in CACHE_DIR.glob("*.tmp"):          # resti di salvataggi interrotti
     shutil.rmtree(_t, ignore_errors=True)
@@ -228,8 +228,22 @@ def cache_leggi(key: str) -> list[Path]:
     return files
 
 
+def cache_dimensione() -> int:
+    """Byte occupati da tutta la cache."""
+    return sum(p.stat().st_size for p in CACHE_DIR.rglob("*") if p.is_file())
+
+
+def svuota_cache():
+    """Cancella tutta la cache. I file dei download in corso sono ancora nella cartella temporanea del link."""
+    for x in CACHE_DIR.iterdir():
+        if x.is_dir():
+            shutil.rmtree(x, ignore_errors=True)
+        else:
+            x.unlink(missing_ok=True)
+
+
 def cache_salva(key: str, files: list[Path]) -> list[Path]:
-    """Copia i file pronti in cache; restituisce i percorsi in cache (o gli originali se fallisce)."""
+    """Copia i file pronti in cache; restituisce i percorsi in cache (o gli originali se non si salva)."""
     d, tmp = CACHE_DIR / key, CACHE_DIR / f"{key}.tmp"
     try:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -238,27 +252,15 @@ def cache_salva(key: str, files: list[Path]) -> list[Path]:
         for p in files:
             shutil.copy2(p, tmp / p.name)
         tmp.rename(d)
-        pulisci_cache(d)
+        if cache_dimensione() > CACHE_MAX:
+            log(f"  cache sopra {mb(CACHE_MAX)}: la svuoto")
+            svuota_cache()
+            return files          # gli originali esistono ancora: l'invio va comunque a buon fine
         return sorted(p for p in d.iterdir() if p.is_file())
     except Exception as e:
         log(f"  cache non salvata: {e}")
         shutil.rmtree(tmp, ignore_errors=True)
         return files
-
-
-def pulisci_cache(tieni: Path):
-    """Se la cache supera il tetto, elimina le voci usate meno di recente."""
-    dirs = [x for x in CACHE_DIR.iterdir() if x.is_dir() and not x.name.endswith(".tmp")]
-    peso = lambda x: sum(f.stat().st_size for f in x.iterdir() if f.is_file())
-    tot = sum(peso(x) for x in dirs)
-    for x in sorted(dirs, key=lambda x: x.stat().st_mtime):
-        if tot <= CACHE_MAX:
-            break
-        if x == tieni:
-            continue
-        tot -= peso(x)
-        shutil.rmtree(x, ignore_errors=True)
-        log(f"  cache piena: eliminata la voce più vecchia {x.name}")
 
 
 def _riduci_immagine(path: Path, target: int) -> Path:

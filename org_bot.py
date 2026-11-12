@@ -141,6 +141,7 @@ import os
 import queue
 import random
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -162,6 +163,28 @@ def avatar_persona(nome: str) -> Path:
 
 def avatar_tg(chat_id: int) -> Path:
     return AVATAR_DIR / f"tg_{chat_id}.jpg"
+
+
+# cache dei file di discord_bot.py: stessa cartella e stessa variabile d'ambiente
+DISCORD_CACHE_DIR = Path(os.environ.get("DISCORD_CACHE_DIR") or Path.home() / ".cache" / "discord_bot")
+
+
+def svuota_cache_discord() -> int:
+    """Cancella la cache dei file di discord_bot. Restituisce quante voci sono state eliminate."""
+    if not DISCORD_CACHE_DIR.is_dir():
+        return 0
+    eliminate = 0
+    for x in DISCORD_CACHE_DIR.iterdir():
+        try:
+            if x.is_dir():
+                shutil.rmtree(x)
+            else:
+                x.unlink()
+            eliminate += 1
+        except OSError as e:
+            _log_gui(f"cache Discord: non eliminato {x.name} ({e})")
+    _log_gui(f"cache Discord svuotata ({eliminate} voci)")
+    return eliminate
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 
@@ -3227,6 +3250,10 @@ def avvia_gui():
 
     def chiudi():
         if prepara_chiusura():
+            if not any(barra_bot["gestore"].stato().values()):
+                svuota_cache_discord()          # bot fermi: la cache non serve più
+            else:
+                _log_gui("bot ancora attivi: la cache Discord resta")
             root.destroy()
 
     def riavvia():
