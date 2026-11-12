@@ -129,20 +129,36 @@ class DiscordBot(discord.Client):
         return hashlib.sha256(blob.encode()).hexdigest()
 
     async def setup_hook(self):
-        # tree.sync() ha un rate limit severo (429): con riavvii ripetuti il bot restava bloccato.
-        # Registro i comandi solo se sono cambiati (per forzarlo: cancella discord_comandi.hash).
+        # tree.sync() ha un rate limit severo (429): lo evito se i comandi su Discord sono già giusti.
+        # Il confronto è con quello che Discord ha davvero (fetch_commands, una semplice lettura),
+        # non solo con il file locale: un'altra istanza può aver sovrascritto i comandi.
+        # Per forzare la registrazione: cancella discord_comandi.hash.
         try:
             impronta = self._impronta_comandi()
         except Exception as e:
             log(f"impronta comandi non calcolabile ({e!r}): registro comunque")
             impronta = None
+
+        locali = sorted((c.name, c.description) for c in self.tree.get_commands())
+        try:
+            su_discord = await self.tree.fetch_commands()
+            remoti = sorted((c.name, c.description) for c in su_discord)
+        except Exception as e:
+            log(f"lettura comandi da Discord non riuscita ({e!r}): registro comunque")
+            remoti = None
+
         try:
             salvata = HASH_FILE.read_text(encoding="utf-8").strip()
         except OSError:
             salvata = ""
-        if impronta and impronta == salvata:
-            log("Comandi slash invariati dall'ultimo avvio: registrazione saltata")
+
+        if impronta and impronta == salvata and remoti == locali:
+            log("Comandi slash invariati e presenti su Discord: registrazione saltata")
             return
+        if remoti is not None and remoti != locali:
+            log("Su Discord i comandi sono diversi da quelli locali "
+                f"({', '.join('/' + n for n, _ in remoti) or 'nessuno'}): registro di nuovo")
+
         log("Registro i comandi slash su Discord…")
         try:
             cmds = await self.tree.sync()   # registra /url globalmente
