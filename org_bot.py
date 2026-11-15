@@ -123,6 +123,7 @@ attiva_log_su_file()
 
 import branch_tema as T   # aspetto grafico, immagini e avatar (deve stare accanto a questo file)
 import bot_manager as BM   # avvio/arresto dei bot Telegram e Discord (deve stare accanto a questo file)
+import tray as TR   # icona nell'area di notifica (in basso a destra); senza pystray la GUI resta com'era
 try:
     import impostazioni as IMP   # cookie, chiavi API e tetto ricerche (la stessa logica del pannello web)
 except Exception as _e:
@@ -3297,7 +3298,37 @@ def avvia_gui():
 
     lista.bind("<<ListboxSelect>>", su_selezione)
     root.bind("<Control-s>", salva_scheda_attiva)
-    root.protocol("WM_DELETE_WINDOW", chiudi)
+    coda_tray, ferma_tray = TR.avvia(BASE)
+    if coda_tray is not None:
+        def nascondi_in_tray():
+            root.withdraw()
+
+        def mostra_da_tray():
+            root.deiconify()
+            root.lift()
+            root.focus_force()
+
+        def su_unmap(e):                        # ridotta a icona: sparisce dalla barra, resta nell'area di notifica
+            if e.widget is root and root.state() == "iconic":
+                root.withdraw()
+
+        def controlla_tray():
+            try:
+                while True:
+                    ev = coda_tray.get_nowait()
+                    if ev == "mostra":
+                        mostra_da_tray()
+                    elif ev == "esci":
+                        chiudi()
+            except queue.Empty:
+                pass
+            root.after(200, controlla_tray)
+
+        root.protocol("WM_DELETE_WINDOW", nascondi_in_tray)
+        root.bind("<Unmap>", su_unmap, add="+")
+        root.after(200, controlla_tray)
+    else:
+        root.protocol("WM_DELETE_WINDOW", chiudi)
     salva_job = {"j": None}
 
     def pianifica_salvataggio(e):               # anche durante l'uso, se il programma venisse chiuso male
@@ -3323,6 +3354,8 @@ def avvia_gui():
     if AUTOSAVE_SEC > 0:
         root.after(int(AUTOSAVE_SEC * 1000), autosalva)
     root.mainloop()
+    if ferma_tray is not None:
+        ferma_tray()
 
 
 if __name__ == "__main__":
