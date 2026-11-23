@@ -35,3 +35,4 @@ download_cache.json
 # varie
 __pycache__/
 *.zip
+/pulizia.ps1
