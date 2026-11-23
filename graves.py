@@ -365,6 +365,14 @@ def _http_json(nome: str, req: urllib.request.Request, timeout: int = 20, grezzo
         raise GravesErrore(f"{nome}: servizio non raggiungibile ({motivo})") from None
 
 
+def _http_dict(nome: str, req: urllib.request.Request, timeout: int = 20) -> dict:
+    """Come _http_json, ma richiede un oggetto JSON: un array o un valore semplice diventa un errore leggibile."""
+    dati = _http_json(nome, req, timeout)
+    if not isinstance(dati, dict):
+        raise GravesErrore(f"{nome}: risposta inattesa ({type(dati).__name__}).")
+    return dati
+
+
 def _serper(query: str, quanti: int) -> list[Risultato]:
     corpo = {"q": query, "num": quanti, "hl": _env("GRAVES_LINGUA", "it"), "gl": _env("GRAVES_PAESE", "it")}
     if _safe():
@@ -372,7 +380,7 @@ def _serper(query: str, quanti: int) -> list[Risultato]:
     req = urllib.request.Request(
         "https://google.serper.dev/images", data=json.dumps(corpo).encode(), method="POST",
         headers={"X-API-KEY": _env("GRAVES_SERPER_KEY"), "Content-Type": "application/json", "User-Agent": UA})
-    dati = _http_json("Serper", req)
+    dati = _http_dict("Serper", req)
     return [Risultato(url=i.get("imageUrl") or "", titolo=i.get("title") or "",
                       pagina=i.get("link") or "", miniatura=i.get("thumbnailUrl") or "",
                       w=_px(i.get("imageWidth")), h=_px(i.get("imageHeight")))
@@ -385,7 +393,7 @@ def _serpapi(query: str, quanti: int) -> list[Risultato]:
          "safe": "active" if _safe() else "off"}
     req = urllib.request.Request("https://serpapi.com/search.json?" + urllib.parse.urlencode(q),
                                  headers={"User-Agent": UA})
-    dati = _http_json("SerpApi", req, timeout=40)
+    dati = _http_dict("SerpApi", req, timeout=40)
     if dati.get("error"):
         if "hasn't returned any results" in str(dati["error"]).lower():
             return []
@@ -402,7 +410,7 @@ def _cse(query: str, quanti: int) -> list[Risultato]:
          "safe": "active" if _safe() else "off"}
     req = urllib.request.Request("https://www.googleapis.com/customsearch/v1?" + urllib.parse.urlencode(q),
                                  headers={"User-Agent": UA})
-    dati = _http_json("Google CSE", req)
+    dati = _http_dict("Google CSE", req)
     out = []
     for i in dati.get("items") or []:
         if isinstance(i, dict):
@@ -842,8 +850,12 @@ def _e621(tags: list, quanti: int, casuale: bool) -> list:
     h = {"User-Agent": ua, **_basic(utente, _env("GRAVES_E621_KEY"))}
     dati = _json_o_vuoto("e621", urllib.request.Request(
         "https://e621.net/posts.json?" + urllib.parse.urlencode(p), headers=h))
+    if dati is None:                 # corpo vuoto: nessun risultato
+        return []
+    if not isinstance(dati, dict):
+        raise GravesErrore(f"e621: risposta inattesa ({type(dati).__name__}).")
     out = []
-    for i in (dati or {}).get("posts") or []:
+    for i in dati.get("posts") or []:
         if not isinstance(i, dict):
             continue
         t = i.get("tags") if isinstance(i.get("tags"), dict) else {}
@@ -1095,6 +1107,9 @@ def _cerca_tutti(rich: RichiestaBooru) -> list:
         except GravesErrore as e:
             errori.append(str(e))
             log(f"  Graves: {_SITI[s]['nome']} saltato: {e}")
+        except Exception as e:      # errore imprevisto di un sito: lo salto invece di bloccare tutta la ricerca
+            errori.append(f"{_SITI[s]['nome']}: errore imprevisto")
+            log(f"  Graves: {_SITI[s]['nome']} saltato per errore imprevisto: {type(e).__name__}: {e}")
     if not liste:
         raise GravesErrore("Nessun sito ha dato risultati: " + " | ".join(errori))
     out, visti = [], set()

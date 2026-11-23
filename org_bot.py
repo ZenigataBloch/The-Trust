@@ -259,11 +259,49 @@ def leggi_coda(nome: str, path: Optional[Path] = None) -> list[tuple[str, str, l
     return coda
 
 
+def analizza_righe(testo_lista: str) -> list[dict]:
+    """Una voce per riga della lista, con quello che /invia ne farà."""
+    voci = []
+    for n, riga in enumerate(testo_lista.splitlines(), 1):
+        c = classifica(riga)
+        if c is None:
+            r = riga.strip()
+            if not r:
+                tipo = "vuota"
+            elif r.startswith("#"):
+                tipo = "commento"
+            else:
+                tipo = "ignorata"            # nessun link: /invia la salta
+            voci.append({"n": n, "tipo": tipo, "riga": riga, "valori": []})
+        else:
+            tipo, valori = c
+            if tipo == "link" and len(valori) > 1:
+                tipo = "gruppo"              # più link = un solo messaggio
+            voci.append({"n": n, "tipo": tipo, "riga": riga, "valori": valori})
+    return voci
+
+
+def riepilogo_coda(voci: list[dict]) -> tuple[int, int, int]:
+    """(messaggi che partiranno, link totali, righe saltate)."""
+    msg = sum(1 for v in voci if v["tipo"] in ("testo", "link", "gruppo"))
+    link = sum(len(v["valori"]) for v in voci if v["tipo"] in ("link", "gruppo"))
+    ign = sum(1 for v in voci if v["tipo"] == "ignorata")
+    return msg, link, ign
+
+
 def conta(coda) -> tuple[int, int]:
     """(numero di link, numero di messaggi) di una coda."""
     link = sum(len(v) for _, t, v in coda if t == "link")
     testi = sum(1 for _, t, _ in coda if t == "testo")
     return link, testi
+
+
+def _mostra_esito(msg, motivo: str, contenuto: str):
+    """Scrive sotto la lista l'esito di un salvataggio: link, messaggi e righe ignorate."""
+    link, testi, ignorate = riassumi(contenuto)
+    extra = f", {ignorate} righe ignorate (senza link né >)" if ignorate else ""
+    msg.config(text=f"{motivo} ({time.strftime('%H:%M:%S')}): {link} link, {testi} messaggi{extra}.",
+               fg=T.WARN if ignorate else T.OK)
 
 
 def riassumi(contenuto: str) -> tuple[int, int, int]:
@@ -550,10 +588,7 @@ def salva_stato_tg(stato: dict):
     if stato:
         scrivi_atomico(TG_STATO, json.dumps(stato, ensure_ascii=False))
     else:
-        try:
-            TG_STATO.unlink()
-        except OSError:
-            pass
+        _rimuovi_file(TG_STATO)
 
 
 def _righe_file(path: Path) -> list[str]:
@@ -569,11 +604,28 @@ def _ripristina_senza_lock(lista: Path = TG_LISTA, nascosta: Path = TG_IN_INVIO,
     resto = [r for r in _righe_file(nascosta) if r.strip()]
     if resto and (crea or lista.exists()):
         scrivi_atomico(lista, "\n".join(resto + _righe_file(lista)) + "\n")
+    _rimuovi_file(nascosta)
+    return len(resto)
+
+
+def _rimuovi_file(p: Path):
+    """Cancella il file se si può. Se non si può (in uso, permessi, già sparito) non fa nulla."""
     try:
-        nascosta.unlink()
+        p.unlink()
     except OSError:
         pass
-    return len(resto)
+
+
+def _separa_coda(lista: Path) -> tuple[list[tuple[str, str, list[str]]], list[str]]:
+    """Divide le righe della lista in (da inviare, restano). Sola lettura: non tocca il file."""
+    coda, restano = [], []
+    for r in _righe_file(lista):
+        c = classifica(r)
+        if c:
+            coda.append((r, c[0], c[1]))
+        else:
+            restano.append(r)
+    return coda, restano
 
 
 def _prendi_da(lista: Path, nascosta: Path, nome_backup: str, crea: bool = True) -> list[tuple[str, str, list[str]]]:
@@ -584,13 +636,7 @@ def _prendi_da(lista: Path, nascosta: Path, nome_backup: str, crea: bool = True)
     if not lista.exists():
         return []
     fai_backup(nome_backup, forza=True, src=lista)
-    coda, restano = [], []
-    for r in _righe_file(lista):
-        c = classifica(r)
-        if c:
-            coda.append((r, c[0], c[1]))
-        else:
-            restano.append(r)
+    coda, restano = _separa_coda(lista)
     if not coda:
         return []
     scrivi_atomico(nascosta, "\n".join(r for r, _, _ in coda) + "\n")
@@ -602,10 +648,7 @@ def _togli_da(nascosta: Path, nome: str, riga: str, nuova: Optional[str]):
     """Un elemento è stato lavorato: lo tolgo dalla copia nascosta (o lo sostituisco con ciò che non è partito)."""
     aggiorna_riga(nome, riga, nuova, nascosta)
     if not _righe_file(nascosta):
-        try:
-            nascosta.unlink()
-        except OSError:
-            pass
+        _rimuovi_file(nascosta)
 
 
 # ---- lista condivisa Telegram ----
@@ -624,6 +667,14 @@ def tg_ripristina_se_orfana(minuti: float = 30.0) -> int:
     except OSError:
         return 0
     return tg_ripristina_in_lista()
+
+
+def tg_lista_conta() -> tuple[int, int]:
+    """(link, messaggi) in coda nella lista visibile. Se il file non si legge, (0, 0)."""
+    try:
+        return conta(leggi_coda(TG_NOME, TG_LISTA))
+    except Exception:
+        return 0, 0
 
 
 def tg_in_invio_conta() -> tuple[int, int]:
@@ -664,13 +715,7 @@ def _prendi_nuovi_da(lista: Path, nascosta: Path, nome_backup: str) -> list[tupl
     torna in lista insieme a quelli non partiti."""
     if not lista.exists():
         return []
-    coda, restano = [], []
-    for r in _righe_file(lista):
-        c = classifica(r)
-        if c:
-            coda.append((r, c[0], c[1]))
-        else:
-            restano.append(r)
+    coda, restano = _separa_coda(lista)
     if not coda:
         return []
     fai_backup(nome_backup, forza=True, src=lista)
@@ -1009,10 +1054,7 @@ def registra(client, owner: int, fit, batches):
     INVII_DIR.mkdir(parents=True, exist_ok=True)
     in_corso: set[str] = set()   # evita due invii contemporanei della stessa persona
     for vecchio in INVII_DIR.glob(".progresso.*.json"):   # stati rimasti da un'esecuzione interrotta
-        try:
-            vecchio.unlink()
-        except OSError:
-            pass
+        _rimuovi_file(vecchio)
     try:
         if persona_ripristina_orfane():
             log("avvio: link rimasti a metà di un invio interrotto rimessi nelle liste")
@@ -1122,10 +1164,7 @@ def registra(client, owner: int, fit, batches):
         while RICHIESTA.exists():
             if time.time() > limite:
                 log(f"  la GUI non ha risposto entro {ATTESA_GUI:g} s: uso la lista già salvata")
-                try:
-                    RICHIESTA.unlink()
-                except OSError:
-                    pass
+                _rimuovi_file(RICHIESTA)
                 return
             await asyncio.sleep(0.1)
 
@@ -1341,10 +1380,7 @@ def registra(client, owner: int, fit, batches):
             if completato:   # barra piena per qualche secondo; poi la GUI lo ignora da sola
                 scrivi_prog(n=len(coda), occupato=False, msg="Completato", fine=True)
             else:
-                try:
-                    file_progresso(nome).unlink()
-                except OSError:
-                    pass
+                _rimuovi_file(file_progresso(nome))
 
         rimasto = leggi_coda(nome)
         r_link, r_testi = conta(rimasto)
@@ -1576,10 +1612,7 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
         testo.edit_reset()
 
     def aggiorna_info():
-        try:
-            link, testi = conta(leggi_coda(TG_NOME, TG_LISTA))
-        except Exception:
-            link = testi = 0
+        link, testi = tg_lista_conta()
         att = sum(1 for c in st["canali"] if c["attivo"])
         in_l, in_t = tg_in_invio_conta() if st["invio"] is not None else (0, 0)
         invio_txt = f"in invio {in_l} link e {in_t} messaggi  |  " if (in_l or in_t) else ""
@@ -1605,10 +1638,7 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
             scrivi_atomico(TG_LISTA, contenuto)
             st["mtime"] = TG_LISTA.stat().st_mtime
         testo.edit_modified(False)
-        link, testi, ignorate = riassumi(contenuto)
-        extra = f", {ignorate} righe ignorate (senza link né >)" if ignorate else ""
-        msg.config(text=f"{motivo} ({time.strftime('%H:%M:%S')}): {link} link, {testi} messaggi{extra}.",
-                   fg=T.WARN if ignorate else T.OK)
+        _mostra_esito(msg, motivo, contenuto)
         aggiorna_info()
         return True
 
@@ -1795,10 +1825,7 @@ def crea_scheda_telegram(root, scheda, tk, ttk, messagebox, simpledialog, subpro
         if dirty() and not salva(auto=True, motivo="Salvato prima dell'invio"):
             messagebox.showwarning("Invia", "La lista è stata cambiata altrove: salvala (o ricaricala) e riprova.")
             return
-        try:
-            link, testi = conta(leggi_coda(TG_NOME, TG_LISTA))
-        except Exception:
-            link = testi = 0
+        link, testi = tg_lista_conta()
         if not (link or testi):
             messagebox.showinfo("Invia", "Niente in coda.")
             return
@@ -2511,9 +2538,25 @@ def crea_barra_bot(root, tk):
                                                                         ultimo["msg"])))
 
     # all'apertura: prima controlla GitHub, poi accende i bot che non girano già
+    def aggiorna_silenzioso():
+        """Git pull senza finestre: se sono cambiati file dei bot e sono accesi, li riavvia."""
+        try:
+            r = git_pull()
+        except Exception as e:
+            _log_gui(f"aggiornamento automatico: errore {e!r}")
+            return
+        if not r["ok"]:
+            _log_gui("aggiornamento automatico non riuscito: " + (r.get("output") or "")[:200])
+            return
+        if r["gui"]:
+            _log_gui("aggiornamento automatico: scaricati file della GUI, riavvia Branch per applicarli")
+        if r["bot"] and any(gestore.stato().values()):
+            gestore.ferma_tutti()
+            gestore.avvia_mancanti()
+
     def avvio_con_update():
         ricorda_head_avvio()
-        gestore.aggiorna()
+        aggiorna_silenzioso()
         if HB is not None:
             HB.LA.attendi(8)             # prima lettura da Telegram (o timeout se non risponde)
         if su_android():
@@ -2524,7 +2567,7 @@ def crea_barra_bot(root, tk):
 
     # controllo periodico (ogni 30 minuti); se un'operazione è in corso, in_thread salta il giro
     def controllo_periodico():
-        in_thread(gestore.aggiorna, "AGGIORNAMENTO…")
+        in_thread(aggiorna_silenzioso, "AGGIORNAMENTO…")
         root.after(30 * 60 * 1000, controllo_periodico)
     root.after(30 * 60 * 1000, controllo_periodico)
     root.after(1500, aggiorna)
@@ -2905,6 +2948,8 @@ def avvia_gui():
                   "Con /invia la lista si svuota subito; i link non partiti tornano qui a fine invio."
                   + (f" Salvataggio automatico ogni {AUTOSAVE_SEC:g} s." if AUTOSAVE_SEC else ""))
     hint.pack(fill="x", pady=(0, 4))
+    riepilogo = tk.Label(dx, anchor="w", justify="left", fg=T.MUTED, font=("Segoe UI", 9))
+    riepilogo.pack(fill="x", pady=(0, 4))
     cornice = tk.Frame(dx)
     cornice.pack(fill="both", expand=True)
     barra = tk.Scrollbar(cornice)
@@ -2912,6 +2957,35 @@ def avvia_gui():
     testo = tk.Text(cornice, wrap="word", undo=True, font=("Consolas", 10), yscrollcommand=barra.set)
     testo.pack(side="left", fill="both", expand=True)
     barra.config(command=testo.yview)
+
+    # ---- colori delle righe e riepilogo (vedi analizza_righe) ----
+    COLORI_RIGA = {
+        "gruppo":   {"background": "#1e3550"},
+        "testo":    {"foreground": "#c8a2ff"},
+        "commento": {"foreground": "#777777"},
+        "ignorata": {"background": "#4a1e1e", "underline": True},
+    }
+    for _t, _opz in COLORI_RIGA.items():
+        testo.tag_configure(f"riga_{_t}", **_opz)
+
+    def aggiorna_colori(_e=None):
+        for _t in COLORI_RIGA:
+            testo.tag_remove(f"riga_{_t}", "1.0", "end")
+        voci = analizza_righe(testo.get("1.0", "end-1c")) if st["nome"] else []
+        for v in voci:
+            if v["tipo"] in COLORI_RIGA:
+                testo.tag_add(f"riga_{v['tipo']}", f"{v['n']}.0", f"{v['n']}.end")
+        if not voci:
+            riepilogo.config(text="")
+            return
+        msg_n, link_n, ign = riepilogo_coda(voci)
+        t = f"Verranno inviati {msg_n} messaggi con {link_n} link"
+        if ign:
+            t += f"  ·  ⚠ {ign} righe senza link: saltate"
+        riepilogo.config(text=t, fg=T.WARN if ign else T.MUTED)
+
+    testo.bind("<KeyRelease>", aggiorna_colori, add="+")
+    testo.bind("<<Modified>>", aggiorna_colori, add="+")
     # senza una persona selezionata non c'è una lista in cui scrivere: l'editor resta spento
     segnaposto = T.SfondoVuoto(cornice, "Scegli una persona a sinistra\noppure creane una nuova.")
     msg = tk.Label(dx, text="", anchor="w", fg=T.OK)
@@ -2944,10 +3018,11 @@ def avvia_gui():
 
     def etichetta(nome: str) -> str:
         try:
-            link, _ = conta(leggi_coda(nome))
+            voci = analizza_righe(file_persona(nome).read_text(encoding="utf-8-sig"))
         except Exception:
             return nome
-        return f"{nome}  ({link} link)" if link else nome
+        msg_n, link_n, _ = riepilogo_coda(voci)
+        return f"{nome}  ({link_n} link in {msg_n} msg)" if msg_n else nome
 
     def riempi_lista(seleziona: Optional[str] = None, forza: bool = False):
         nomi = nomi_persone()
@@ -2990,6 +3065,7 @@ def avvia_gui():
         testo.insert("1.0", contenuto)
         testo.edit_modified(False)
         testo.edit_reset()
+        aggiorna_colori()
         msg.config(text="")
         aggiorna_info()
 
@@ -3015,10 +3091,7 @@ def avvia_gui():
         scrivi_atomico(p, contenuto)
         st["mtime"] = p.stat().st_mtime
         testo.edit_modified(False)
-        link, testi, ignorate = riassumi(contenuto)
-        extra = f", {ignorate} righe ignorate (senza link né >)" if ignorate else ""
-        msg.config(text=f"{motivo} ({time.strftime('%H:%M:%S')}): {link} link, {testi} messaggi{extra}.",
-                   fg=T.WARN if ignorate else T.OK)
+        _mostra_esito(msg, motivo, contenuto)
         riempi_lista()
         aggiorna_info()
         return True
@@ -3088,10 +3161,7 @@ def avvia_gui():
         if not messagebox.askyesno("Elimina chat", f"Eliminare la chat «{nome}», scollegarla e cancellare la sua lista?"):
             return
         fai_backup(nome, forza=True)    # la lista eliminata resta recuperabile in backup/
-        try:
-            file_persona(nome).unlink()
-        except OSError:
-            pass
+        _rimuovi_file(file_persona(nome))
         scollega(nome)
         st["nome"] = None
         testo.delete("1.0", "end")
@@ -3118,6 +3188,7 @@ def avvia_gui():
         testo.insert("end", "\n".join(nuove) + "\n")
         testo.see("end")
         msg.config(text=f"Aggiunte {len(nuove)} righe: ricorda di salvare.", fg=T.WARN)
+        aggiorna_colori()
 
     def svuota():
         nome = st["nome"]
@@ -3126,6 +3197,7 @@ def avvia_gui():
         if not messagebox.askyesno("Svuota", f"Svuotare la lista di «{nome}»?\n(Resta una copia in invii/backup/)"):
             return
         testo.delete("1.0", "end")
+        aggiorna_colori()
         salva(motivo="Lista svuotata")
 
     def apri_cartella():
@@ -3138,6 +3210,45 @@ def avvia_gui():
                 subprocess.Popen(["xdg-open", str(INVII_DIR)])
         except Exception as e:
             messagebox.showerror("Errore", str(e))
+
+    def anteprima():
+        """Finestra con l'ordine esatto di invio: messaggio per messaggio, link raggruppati."""
+        if st["nome"] is None:
+            return
+        voci = analizza_righe(testo.get("1.0", "end-1c"))
+        win = tk.Toplevel(root)
+        win.title(f"Anteprima invio: {st['nome']}")
+        win.geometry("660x520")
+        out = tk.Text(win, wrap="word", font=("Consolas", 10))
+        out.pack(fill="both", expand=True, padx=8, pady=8)
+        out.tag_configure("titolo", font=("Segoe UI", 10, "bold"))
+        out.tag_configure("testo", foreground="#c8a2ff")
+        out.tag_configure("link", foreground="#9ad1ff")
+        out.tag_configure("gruppo", foreground="#7fd1ff")
+        out.tag_configure("saltate", foreground="#ff8080")
+        n_msg, saltate = 0, []
+        for v in voci:
+            if v["tipo"] in ("testo", "link", "gruppo"):
+                n_msg += 1
+                if v["tipo"] == "testo":
+                    titolo = f"Messaggio {n_msg}: testo"
+                elif v["tipo"] == "link":
+                    titolo = f"Messaggio {n_msg}: 1 link"
+                else:
+                    titolo = (f"Messaggio {n_msg}: {len(v['valori'])} link insieme "
+                              "(un solo messaggio, allegati uniti)")
+                out.insert("end", titolo + "\n", "titolo")
+                for u in v["valori"]:
+                    out.insert("end", f"    {u}\n", v["tipo"])
+            elif v["tipo"] == "ignorata":
+                saltate.append(v["riga"].strip())
+        if not n_msg:
+            out.insert("end", "La lista è vuota: non c'è niente da inviare.\n")
+        if saltate:
+            out.insert("end", f"\nRighe saltate ({len(saltate)}, nessun link):\n", "titolo")
+            for r in saltate:
+                out.insert("end", f"    {r}\n", "saltate")
+        out.config(state="disabled")
 
     def tick():
         """Ogni 3 secondi: aggiorna conteggi e ricarica la lista se l'ha cambiata il bot."""
@@ -3192,10 +3303,7 @@ def avvia_gui():
                     ok = salva(auto=True, motivo="Salvato prima dell'invio")
                     _log_gui(f"/invia: salvataggio richiesto per «{chi}»: " + ("fatto" if ok else
                              "NON fatto (la lista è stata cambiata dal bot nel frattempo)"))
-                try:
-                    RICHIESTA.unlink()
-                except OSError:
-                    pass
+                _rimuovi_file(RICHIESTA)
         except Exception as e:
             _log_gui(f"richiesta di salvataggio: errore {e!r}")
         root.after(300, controlla_richiesta)
@@ -3242,10 +3350,7 @@ def avvia_gui():
                     "(quello che è già partito è già stato tolto dalla lista).\n\nChiudere comunque?"):
                 return False
             tg["ferma"]()
-        try:
-            GUI_VIVA.unlink()
-        except OSError:
-            pass
+        _rimuovi_file(GUI_VIVA)
         salva_finestra(root)
         return True
 
@@ -3290,7 +3395,7 @@ def avvia_gui():
     for txt, cmd in (("Nuova persona", nuova), ("Elimina chat", elimina)):
         tk.Button(bt_sx, text=txt, command=cmd).pack(side="left", expand=True, fill="x", padx=1)
     for txt, cmd in (("Incolla dagli appunti", incolla), ("Incolla in 1 riga", lambda: incolla(True)),
-                     ("Salva", salva), ("Svuota", svuota), ("Apri cartella", apri_cartella)):
+                     ("Anteprima", anteprima), ("Salva", salva), ("Svuota", svuota), ("Apri cartella", apri_cartella)):
         b = tk.Button(bt_dx, text=txt, command=cmd)
         b.pack(side="left", padx=(0, 4))
         if cmd is not apri_cartella:

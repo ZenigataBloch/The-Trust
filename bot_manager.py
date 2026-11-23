@@ -23,7 +23,6 @@ Se avvii Branch dal vecchio .bat non cambia nulla; altrimenti basta mettere i va
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -35,8 +34,6 @@ BASE = Path(__file__).resolve().parent
 PID_FILE = BASE / "bots_pid.json"
 ENV_FILE = BASE / "bots.env"
 BAT_FILE = BASE / "launch.bat"
-# bot che segnalano da soli di essere pronti scrivendo il proprio PID in questo file (vedi on_ready in discord_bot.py)
-PRONTO_FILES = {"discord": BASE / "discord_pronto.flag"}
 
 # nome interno -> (etichetta, script, variabili obbligatorie)
 MODULI = {
@@ -85,7 +82,6 @@ def carica_env() -> dict:
         env.setdefault(k, v)          # il .bat riempie solo ciò che manca
     env.update(_leggi_env(ENV_FILE))  # bots.env ha sempre l'ultima parola
     env["PYTHONUTF8"] = "1"
-    env["BOT_LOG_FILE"] = "1"      # i bot scrivono su <script>.log (vedi bot_log.py)
     return env
 
 
@@ -172,24 +168,6 @@ class GestoreBot:
     def stato(self) -> dict:
         return {n: self.attivo(n) for n in MODULI}
 
-    def pronto(self, nome: str) -> bool:
-        """Processo vivo E (se il bot lo segnala) collegato a Discord con i comandi registrati."""
-        if not self.attivo(nome):
-            return False
-        f = PRONTO_FILES.get(nome)
-        if f is None:                      # telegram: nessun segnale, vale "acceso"
-            return True
-        try:
-            return int(f.read_text(encoding="utf-8").strip()) == int(self._leggi().get(nome, {}).get("pid", -1))
-        except (OSError, ValueError):
-            return False
-
-    def secondi_da_avvio(self, nome: str) -> float:
-        try:
-            return max(0.0, time.time() - float(self._leggi().get(nome, {}).get("avviato", 0)))
-        except (TypeError, ValueError):
-            return 0.0
-
     # ---- avvio
     def avvia(self, nome: str) -> bool:
         with self._lock:
@@ -252,77 +230,10 @@ class GestoreBot:
                     self.log(f"{MODULI[n][0]}: già in esecuzione, lo riprendo senza riavviarlo")
                 else:
                     self.avvia(n)
-            self._heartbeat()
             time.sleep(2.5)           # un bot che crasha subito (token sbagliato…) si vede qui
             self.stato()
         finally:
             self.occupato = False
-
-    def _heartbeat(self):
-        """Fa partire (se manca) il mittente dell'heartbeat: sul PC pubblica «desktop», sul telefono «android» (vedi heartbeat.py)."""
-        try:
-            import heartbeat as HB
-            HB.assicura_sender(self.log)
-        except Exception as e:
-            self.log(f"heartbeat: {e!r}")
-
-    # ---- aggiornamento da GitHub
-    def _git(self, *args):
-        return subprocess.run(["git", *args], cwd=str(BASE), capture_output=True, text=True, timeout=90,
-                              creationflags=0x08000000 if _IS_WIN else 0)
-
-    def aggiorna(self, ramo: str = "main") -> str:
-        """git fetch + fast-forward; riavvia solo i bot i cui file sono cambiati.
-        Non tocca il flag 'occupato': lo gestisce chi lo chiama (in_thread in org_bot.py)."""
-        if not shutil.which("git"):
-            return "git non installato"
-        if not (BASE / ".git").exists():
-            return "la cartella non è un repository git"
-        try:
-            r = self._git("fetch", "origin", ramo)
-            if r.returncode:
-                msg = f"aggiornamento: fetch non riuscito: {r.stderr.strip()[:200]}"
-                self.log(msg)
-                return msg
-            locale = self._git("rev-parse", "HEAD").stdout.strip()
-            remoto = self._git("rev-parse", f"origin/{ramo}").stdout.strip()
-            if not remoto or locale == remoto:
-                return "già aggiornato"
-            cambiati = set(self._git("diff", "--name-only", "HEAD", f"origin/{ramo}").stdout.split())
-            r = self._git("merge", "--ff-only", f"origin/{ramo}")
-            if r.returncode:
-                msg = f"aggiornamento: merge non riuscito (modifiche locali?): {r.stderr.strip()[:200]}"
-                self.log(msg)
-                return msg
-        except Exception as e:
-            msg = f"aggiornamento non riuscito: {e}"
-            self.log(msg)
-            return msg
-
-        da_riavviare = set()
-        if cambiati & {"org_bot.py", "bot_log.py", "graves.py"}:      # org_bot e graves sono caricati anche dai bot
-            da_riavviare = set(MODULI)
-        if "telegram_bot.py" in cambiati:
-            da_riavviare.add("telegram")
-        if "discord_bot.py" in cambiati:
-            da_riavviare.add("discord")
-        for n in sorted(da_riavviare):
-            if self.attivo(n):
-                self.ferma(n)
-                self.avvia(n)
-        if "heartbeat.py" in cambiati:
-            try:
-                import heartbeat as HB
-                HB.riavvia_sender(self.log)
-            except Exception as e:
-                self.log(f"heartbeat: riavvio non riuscito: {e!r}")
-        msg = f"aggiornato a {remoto[:7]}"
-        if da_riavviare:
-            msg += ", riavviati: " + ", ".join(sorted(da_riavviare))
-        if cambiati & {"bot_manager.py", "branch_tema.py", "org_bot.py", "impostazioni.py"}:
-            msg += " (riavvia Branch per applicare le modifiche a Branch stesso)"
-        self.log(msg)
-        return msg
 
     # ---- arresto
     def ferma(self, nome: str):
@@ -358,9 +269,6 @@ class GestoreBot:
                         break
                     time.sleep(0.1)
                 self.log(f"{MODULI[nome][0]}: fermato (pid {pid})")
-            pf = PRONTO_FILES.get(nome)
-            if pf is not None:
-                pf.unlink(missing_ok=True)
             f = self._figli.pop(nome, None)
             if f is not None:
                 try:
